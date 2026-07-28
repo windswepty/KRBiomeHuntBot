@@ -46,7 +46,8 @@ async def checkin_user(user_id: int) -> tuple[bool, int]:
     if str_id not in data:
         data[str_id] = {
             "points": 0,
-            "last_checkin": ""
+            "last_checkin": "",
+            "chat_count": 0
         }
 
     user_info = data[str_id]
@@ -59,3 +60,37 @@ async def checkin_user(user_id: int) -> tuple[bool, int]:
     await save_data(data)
 
     return True, user_info["points"]
+
+async def process_chat_message(user_id: int) -> tuple[int, bool]:
+    """
+    Increments user chat count.
+    Every 10 messages, grants 5 points.
+    Returns (current_points, awarded_points_this_message: bool)
+    """
+    data = await load_data()
+    str_id = str(user_id)
+
+    if str_id not in data:
+        data[str_id] = {
+            "points": 0,
+            "last_checkin": "",
+            "chat_count": 0
+        }
+
+    user_info = data[str_id]
+    user_info["chat_count"] = user_info.get("chat_count", 0) + 1
+
+    awarded = False
+    if user_info["chat_count"] % 10 == 0:
+        user_info["points"] = user_info.get("points", 0) + 5
+        awarded = True
+
+    await save_data(data)
+    return user_info["points"], awarded
+
+async def get_user_points(user_id: int) -> int:
+    data = await load_data()
+    str_id = str(user_id)
+    if str_id in data:
+        return data[str_id].get("points", 0)
+    return 0

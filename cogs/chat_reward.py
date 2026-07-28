@@ -13,7 +13,7 @@ class ChatReward(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # 1. Exclude photos/files and stickers
+        # 1. Exclude photos/files/GIF attachments and stickers
         if message.attachments or message.stickers:
             return
 
@@ -21,14 +21,20 @@ class ChatReward(commands.Cog):
         if not content:
             return
 
-        # 2. Strip custom Discord emojis (<:name:id> or <a:name:id>)
-        without_custom_emojis = re.sub(r'<a?:[a-zA-Z0-9_]+:[0-9]+>', '', content)
+        # 2. Exclude GIF links (Tenor, Giphy, Gfycat, or .gif/.gifv URLs)
+        if re.search(r'https?://\S*(?:tenor\.com|giphy\.com|gfycat\.com|\.gif|\.gifv)', content, re.IGNORECASE):
+            return
 
-        # 3. Strip unicode emojis
-        without_emojis = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27ff\u2300-\u23ff\u200d\ufe0f]', '', without_custom_emojis).strip()
+        # 3. Strip all general URLs (http://, https://)
+        without_urls = re.sub(r'https?://\S+', '', content)
 
-        # If nothing remains after removing emojis, the message was ONLY emoji(s) -> Exclude.
-        # If text remains (even if emojis were present), it is ALLOWED -> Count it!
+        # 4. Strip custom Discord emojis (<:name:id> or <a:name:id>)
+        without_custom_emojis = re.sub(r'<a?:[a-zA-Z0-9_]+:[0-9]+>', '', without_urls)
+
+        # 5. Strip unicode emojis
+        without_emojis = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27ff\u2300-\u23ff\200d\ufe0f]', '', without_custom_emojis).strip()
+
+        # If nothing remains after removing URLs and emojis, ignore.
         if not without_emojis:
             return
 

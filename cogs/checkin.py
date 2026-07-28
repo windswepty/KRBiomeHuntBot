@@ -27,7 +27,7 @@ class CheckIn(commands.Cog):
         # ephemeral=True makes the response visible ONLY to the user!
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="포인트", description="현재 내가 보유한 총 포인트를 확인합니다.")
+    @app_commands.command(name="포인트확인", description="현재 내가 보유한 총 포인트를 확인합니다.")
     async def view_points(self, interaction: discord.Interaction):
         total_points = await get_user_points(interaction.user.id)
         embed = discord.Embed(

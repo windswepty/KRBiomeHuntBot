@@ -18,17 +18,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"==========================================")
-    print(f"Logged in as: {bot.user.name} (ID: {bot.user.id})")
-    print(f"Connected to {len(bot.guilds)} guild(s)")
-    print(f"==========================================")
+    print(f"==========================================", flush=True)
+    print(f"Logged in as: {bot.user.name} (ID: {bot.user.id})", flush=True)
+    print(f"Connected to {len(bot.guilds)} guild(s)", flush=True)
+    print(f"==========================================", flush=True)
     
     # Sync Slash Commands
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s).")
+        print(f"Synced {len(synced)} slash command(s).", flush=True)
     except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+        print(f"Failed to sync slash commands: {e}", flush=True)
 
 async def load_cogs():
     os.makedirs("cogs", exist_ok=True)
@@ -36,9 +36,9 @@ async def load_cogs():
         if filename.endswith(".py") and not filename.startswith("__"):
             try:
                 await bot.load_extension(f"cogs.{filename[:-3]}")
-                print(f"Loaded extension: cogs.{filename[:-3]}")
+                print(f"Loaded extension: cogs.{filename[:-3]}", flush=True)
             except Exception as e:
-                print(f"Failed to load extension cogs.{filename[:-3]}: {e}")
+                print(f"Failed to load extension cogs.{filename[:-3]}: {e}", flush=True)
 
 async def main():
     async with bot:

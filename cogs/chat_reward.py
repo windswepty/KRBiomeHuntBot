@@ -21,15 +21,18 @@ class ChatReward(commands.Cog):
         if not content:
             return
 
-        # 2. Clean custom Discord emojis (<:name:id> or <a:name:id>)
-        cleaned = re.sub(r'<a?:[a-zA-Z0-9_]+:[0-9]+>', '', content)
+        # 2. Strip custom Discord emojis (<:name:id> or <a:name:id>)
+        without_custom_emojis = re.sub(r'<a?:[a-zA-Z0-9_]+:[0-9]+>', '', content)
 
-        # 3. Must contain valid text characters (Korean, English, Numbers)
-        # Excludes pure emojis or empty symbol messages
-        if not re.search(r'[a-zA-Z0-9가-힣ㄱ-ㅎㅏ-ㅣ]', cleaned):
+        # 3. Strip unicode emojis
+        without_emojis = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27ff\u2300-\u23ff\u200d\ufe0f]', '', without_custom_emojis).strip()
+
+        # If nothing remains after removing emojis, the message was ONLY emoji(s) -> Exclude.
+        # If text remains (even if emojis were present), it is ALLOWED -> Count it!
+        if not without_emojis:
             return
 
-        # Cooldown removed per request -> process every valid text message immediately
+        # Process message for chat points
         await process_chat_message(message.author.id)
 
 async def setup(bot):

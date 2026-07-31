@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from utils.database import checkin_user, get_user_points
+from utils.database import checkin_user, get_user_points, get_top_users, get_user_rank
 
 class PointGuideSelect(discord.ui.Select):
     def __init__(self):
@@ -95,6 +95,54 @@ class CheckIn(commands.Cog):
             description=f"💰 **현재 총 보유 포인트**: **{total_points:,}** P",
             color=discord.Color.blue()
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="포인트랭킹", description="서버의 포인트 보유 순위 TOP 10을 확인합니다.")
+    async def point_ranking(self, interaction: discord.Interaction):
+        top_users = await get_top_users(limit=10)
+        my_rank, my_points = await get_user_rank(interaction.user.id)
+
+        if not top_users:
+            embed = discord.Embed(
+                title="🏆 포인트 랭킹 TOP 10",
+                description="아직 등록된 포인트 랭킹 정보가 없습니다.",
+                color=discord.Color.gold()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🏆 한바헌 포인트 랭킹 TOP 10",
+            description="서버에서 가장 많은 포인트를 보유한 상위 10명의 유저입니다!\n",
+            color=discord.Color.gold()
+        )
+
+        rank_medals = ["🥇", "🥈", "🥉"]
+
+        ranking_lines = []
+        for idx, u_info in enumerate(top_users, start=1):
+            uid = u_info["user_id"]
+            pts = u_info["points"]
+            member = interaction.guild.get_member(uid)
+            user_str = member.mention if member else f"<@{uid}>"
+
+            medal = rank_medals[idx - 1] if idx <= 3 else f"`{idx}위`"
+            ranking_lines.append(f"{medal} {user_str} — **{pts:,} P**")
+
+        embed.add_field(
+            name="📊 보유 포인트 순위",
+            value="\n".join(ranking_lines),
+            inline=False
+        )
+
+        my_medal = rank_medals[my_rank - 1] if my_rank <= 3 else f"`{my_rank}위`"
+        embed.add_field(
+            name="👤 내 랭킹 정보",
+            value=f"• **현재 순위**: {my_medal} (전체 유저 중 {my_rank}위)\n• **내 보유 포인트**: **{my_points:,} P**",
+            inline=False
+        )
+
+        embed.set_footer(text="포인트 랭킹은 시각/활동에 따라 실시간으로 갱신됩니다.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트얻는법", description="포인트를 획득하는 다양한 방법과 도움말을 확인합니다.")

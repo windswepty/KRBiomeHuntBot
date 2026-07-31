@@ -198,6 +198,45 @@ async def add_user_points(user_id: int, amount: int) -> int:
     await save_data(data)
     return new_points
 
+async def get_top_users(limit: int = 10) -> list[dict]:
+    if users_col is not None:
+        try:
+            cursor = users_col.find().sort("points", -1).limit(limit)
+            result = []
+            for doc in cursor:
+                result.append({
+                    "user_id": int(doc["_id"]),
+                    "points": doc.get("points", 0)
+                })
+            return result
+        except Exception as e:
+            print(f"MongoDB get_top_users error: {e}, using local file.", flush=True)
+
+    data = await load_data()
+    sorted_users = sorted(
+        [{"user_id": int(uid), "points": info.get("points", 0)} for uid, info in data.items()],
+        key=lambda x: x["points"],
+        reverse=True
+    )
+    return sorted_users[:limit]
+
+async def get_user_rank(user_id: int) -> tuple[int, int]:
+    """Returns (rank, points) for the specified user_id."""
+    str_id = str(user_id)
+    if users_col is not None:
+        try:
+            user_doc = users_col.find_one({"_id": str_id})
+            user_points = user_doc.get("points", 0) if user_doc else 0
+            count_higher = users_col.count_documents({"points": {"$gt": user_points}})
+            return count_higher + 1, user_points
+        except Exception as e:
+            print(f"MongoDB get_user_rank error: {e}, using local file.", flush=True)
+
+    data = await load_data()
+    user_points = data.get(str_id, {}).get("points", 0)
+    count_higher = sum(1 for info in data.values() if info.get("points", 0) > user_points)
+    return count_higher + 1, user_points
+
 
 # ── Report Settings (per-guild) ──────────────────────────────────────
 

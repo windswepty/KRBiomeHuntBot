@@ -6,57 +6,6 @@ from utils.database import add_user_points, get_report_settings, save_report_set
 
 # ── Modals ────────────────────────────────────────────────────────────
 
-class GivePointsModal(discord.ui.Modal, title="💰 제보 보상 포인트 지급"):
-    points_input = discord.ui.TextInput(
-        label="지급할 포인트 수량 (숫자만 입력)",
-        placeholder="예: 500",
-        default="500",
-        required=True,
-        max_length=10
-    )
-
-    def __init__(self, target_user_id: int, button: discord.ui.Button):
-        super().__init__()
-        self.target_user_id = target_user_id
-        self.button = button
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # 관리자 권한 확인
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("⚠️ 이 기능은 관리자만 사용할 수 있습니다.", ephemeral=True)
-            return
-
-        try:
-            amount = int(self.points_input.value.strip())
-            if amount <= 0:
-                raise ValueError()
-        except ValueError:
-            await interaction.response.send_message("⚠️ 올바른 수량의 숫자를 입력해 주세요. (예: 500)", ephemeral=True)
-            return
-
-        new_total = await add_user_points(self.target_user_id, amount)
-
-        target_user = interaction.guild.get_member(self.target_user_id)
-        target_mention = target_user.mention if target_user else f"<@{self.target_user_id}>"
-        target_name = target_user.display_name if target_user else "제보자"
-
-        # 먼저 ephemeral 응답을 보내서 Discord 3초 타임아웃 방지
-        await interaction.response.send_message(f"✅ {target_mention}님에게 {amount:,}포인트를 성공적으로 지급했습니다.", ephemeral=True)
-
-        # 티켓 채널에 성공 임베드 메시지 전송
-        embed = discord.Embed(
-            title="🎁 희귀 바이옴 제보 보상 지급 완료",
-            description=f"관리자 {interaction.user.mention} 님이 {target_mention} 님에게 **+{amount:,} P**를 지급했습니다!\n\n"
-                        f"💰 **{target_name}** 님의 현재 총 포인트: **{new_total:,} P**",
-            color=discord.Color.green()
-        )
-        await interaction.channel.send(embed=embed)
-
-        # 버튼 상태 업데이트 (포인트 중복 지급 방지)
-        self.button.disabled = True
-        self.button.label = f"포인트 지급 완료 (+{amount:,}P)"
-        self.button.style = discord.ButtonStyle.secondary
-        await interaction.message.edit(view=self.button.view)
 
 
 class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차 ( 희귀 바이옴 제보 티켓 )"):
@@ -193,13 +142,34 @@ class TicketControlView(discord.ui.View):
             await interaction.response.send_message("⚠️ 제보자 유저 정보를 찾을 수 없습니다.", ephemeral=True)
             return
 
-        # 설정에서 기본 포인트 불러와서 모달 기본값으로 사용
+        # 설정에서 기본 지급 포인트 불러오기
         settings = await get_report_settings(interaction.guild.id)
-        default_pts = str(settings.get("default_points", 500))
+        amount = settings.get("default_points", 500)
 
-        modal = GivePointsModal(target_user_id, button)
-        modal.points_input.default = default_pts
-        await interaction.response.send_modal(modal)
+        # DB에 포인트 추가
+        new_total = await add_user_points(target_user_id, amount)
+
+        target_user = interaction.guild.get_member(target_user_id)
+        target_mention = target_user.mention if target_user else f"<@{target_user_id}>"
+        target_name = target_user.display_name if target_user else "제보자"
+
+        # Ephemeral 응답 보내기
+        await interaction.response.send_message(f"✅ {target_mention}님에게 {amount:,}포인트를 성공적으로 지급했습니다.", ephemeral=True)
+
+        # 티켓 채널에 성공 임베드 메시지 전송
+        embed = discord.Embed(
+            title="🎁 희귀 바이옴 제보 보상 지급 완료",
+            description=f"관리자 {interaction.user.mention} 님이 {target_mention} 님에게 **+{amount:,} P**를 지급했습니다!\n\n"
+                        f"💰 **{target_name}** 님의 현재 총 포인트: **{new_total:,} P**",
+            color=discord.Color.green()
+        )
+        await interaction.channel.send(embed=embed)
+
+        # 버튼 상태 업데이트 (포인트 중복 지급 방지)
+        button.disabled = True
+        button.label = f"포인트 지급 완료 (+{amount:,}P)"
+        button.style = discord.ButtonStyle.secondary
+        await interaction.message.edit(view=button.view)
 
 
 class TicketLaunchView(discord.ui.View):

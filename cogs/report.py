@@ -139,14 +139,44 @@ class TicketControlView(discord.ui.View):
             await interaction.response.send_message("⚠️ 이 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
             return
 
-        await interaction.response.send_message("🔒 3초 후 이 티켓 채널을 삭제합니다...")
+        cid = button.custom_id
+        target_user_id = None
+        if ":" in cid:
+            try:
+                target_user_id = int(cid.split(":")[1])
+            except ValueError:
+                pass
 
-        import asyncio
-        await asyncio.sleep(3)
-        try:
-            await interaction.channel.delete(reason=f"티켓 닫기 - 관리자: {interaction.user.name}")
-        except Exception as e:
-            await interaction.followup.send(f"⚠️ 채널 삭제에 실패했습니다: {e}", ephemeral=True)
+        # 1. 이미 '티켓 삭제' 버튼 상태인 경우 -> 3초 후 채널 삭제
+        if button.label == "티켓 삭제" or cid.startswith("ticket_delete"):
+            await interaction.response.send_message("🔒 3초 후 이 티켓 채널을 완전히 삭제합니다...")
+            import asyncio
+            await asyncio.sleep(3)
+            try:
+                await interaction.channel.delete(reason=f"티켓 삭제 - 관리자: {interaction.user.name}")
+            except Exception as e:
+                await interaction.followup.send(f"⚠️ 채널 삭제에 실패했습니다: {e}", ephemeral=True)
+            return
+
+        # 2. '티켓 닫기' 상태인 경우 -> 유저를 채널 권한에서 제외
+        target_mention = "제보 유저"
+        if target_user_id:
+            target_user = interaction.guild.get_member(target_user_id)
+            if target_user:
+                target_mention = target_user.mention
+                await interaction.channel.set_permissions(target_user, view_channel=False)
+
+        await interaction.response.send_message("🔒 제보 유저를 채널에서 제외하고 티켓을 닫았습니다.", ephemeral=True)
+        await interaction.channel.send(f"🔒 {target_mention} 님이 티켓 채널에서 제외되었습니다.")
+
+        # 버튼을 '티켓 삭제' 상태로 변경
+        button.label = "티켓 삭제"
+        button.emoji = "🗑️"
+        button.style = discord.ButtonStyle.danger
+        if target_user_id:
+            button.custom_id = f"ticket_delete:{target_user_id}"
+
+        await interaction.message.edit(view=button.view)
 
     @discord.ui.button(label="포인트 지급", style=discord.ButtonStyle.success, emoji="💰", custom_id="ticket_give_points_default")
     async def give_points_btn(self, interaction: discord.Interaction, button: discord.ui.Button):

@@ -300,6 +300,8 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
 
 class DeleteGachaItemSelect(discord.ui.Select):
     def __init__(self, items: list[dict]):
+        # 낮은 확률 순으로 정렬
+        sorted_items = sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0))))
         options = [
             discord.SelectOption(
                 label=f"{item['name']} [{format_stock_str(item.get('stock', -1))}]",
@@ -307,7 +309,7 @@ class DeleteGachaItemSelect(discord.ui.Select):
                 description=f"확률: {item.get('percent', item.get('weight', 0))}% | 역할 ID: {item.get('reward_role_id', 0)}",
                 emoji="🗑️"
             )
-            for item in items
+            for item in sorted_items
         ]
         super().__init__(placeholder="삭제할 뽑기 항목을 선택하세요...", options=options)
 
@@ -424,7 +426,9 @@ class GachaSettingsSelect(discord.ui.Select):
                                 f"📊 **전체 확률 합계**: {status_str}",
                     color=discord.Color.green() if abs(total_pct - 100.0) < 0.001 else discord.Color.red()
                 )
-                for item in items:
+                # 확률 낮은 순으로 정렬 (오름차순)
+                sorted_items = sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0))))
+                for item in sorted_items:
                     pct = float(item.get("percent", item.get("weight", 0)))
                     stock_str = format_stock_str(item.get("stock", -1))
                     reward_pts = item.get("reward_points", 0)
@@ -498,7 +502,10 @@ class Gacha(commands.Cog):
                         f"{status_line}",
             color=discord.Color.gold() if is_ready else discord.Color.red()
         )
-        for item in items:
+
+        # 확률 낮은 순으로 정렬 (오름차순)
+        sorted_items = sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0))))
+        for item in sorted_items:
             pct = float(item.get("percent", item.get("weight", 0)))
             stock_str = format_stock_str(item.get("stock", -1))
             role_id = item.get("reward_role_id", 0)

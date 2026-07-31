@@ -20,9 +20,11 @@ def format_stock_str(stock: int) -> str:
 
 class ShopSelect(discord.ui.Select):
     def __init__(self, items: list[dict]):
-        self.items_dict = {str(item["id"]): item for item in items}
+        # 비싼 순으로 정렬 (내림차순)
+        sorted_items = sorted(items, key=lambda x: x.get("price", 0), reverse=True)
+        self.items_dict = {str(item["id"]): item for item in sorted_items}
         options = []
-        for item in items:
+        for item in sorted_items:
             stock = item.get("stock", -1)
             stock_label = format_stock_str(stock)
             options.append(
@@ -229,6 +231,8 @@ class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 및 역할 추
 
 class DeleteShopItemSelect(discord.ui.Select):
     def __init__(self, items: list[dict]):
+        # 비싼 순으로 정렬 (내림차순)
+        sorted_items = sorted(items, key=lambda x: x.get("price", 0), reverse=True)
         options = [
             discord.SelectOption(
                 label=f"{item['name']} [{format_stock_str(item.get('stock', -1))}]",
@@ -236,7 +240,7 @@ class DeleteShopItemSelect(discord.ui.Select):
                 description=f"가격: {item['price']:,}P | 역할 ID: {item.get('reward_role_id', 0)}",
                 emoji="🗑️"
             )
-            for item in items
+            for item in sorted_items
         ]
         super().__init__(placeholder="삭제할 상품을 선택하세요...", options=options)
 
@@ -334,7 +338,9 @@ class ShopSettingsSelect(discord.ui.Select):
                     description=f"총 **{len(items)}개**의 상품이 등록되어 있습니다.",
                     color=discord.Color.gold()
                 )
-                for item in items:
+                # 비싼 순으로 정렬 (내림차순)
+                sorted_items = sorted(items, key=lambda x: x.get("price", 0), reverse=True)
+                for item in sorted_items:
                     desc = item.get('description', '설명 없음')
                     stock_str = format_stock_str(item.get('stock', -1))
                     role_id = item.get('reward_role_id', 0)
@@ -393,7 +399,10 @@ class Shop(commands.Cog):
             description=f"원하시는 상품을 아래 메뉴에서 선택하여 구매해 보세요!\n\n💰 **현재 내 보유 포인트**: **{user_points:,} P**",
             color=discord.Color.purple() if is_enabled else discord.Color.red()
         )
-        for item in items:
+
+        # 비싼 순으로 정렬 (내림차순)
+        sorted_items = sorted(items, key=lambda x: x.get("price", 0), reverse=True)
+        for item in sorted_items:
             stock_str = format_stock_str(item.get('stock', -1))
             role_id = item.get('reward_role_id', 0)
 

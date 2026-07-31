@@ -115,7 +115,8 @@ class ShopSelect(discord.ui.Select):
         )
         if selected_item.get("description"):
             embed.add_field(name="📝 상품 설명", value=selected_item["description"], inline=False)
-        embed.set_footer(text="한바헌 포인트 상점 시스템")
+        shop_title = settings.get("title", "한바헌 포인트 상점")
+        embed.set_footer(text=f"{shop_title} 시스템")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -127,6 +128,30 @@ class ShopView(discord.ui.View):
 
 
 # ── Admin Shop Settings Modals & Views ────────────────────────────────
+
+class SetShopTitleModal(discord.ui.Modal, title="🏷️ 상점 이름/제목 변경"):
+    title_input = discord.ui.TextInput(
+        label="새로운 상점 이름/제목",
+        placeholder="예: 🛒 한바헌 특별 상점 또는 💎 헌터 포인트샵",
+        default="한바헌 포인트 상점",
+        required=True,
+        max_length=50
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_title = self.title_input.value.strip()
+        if not new_title:
+            await interaction.response.send_message("⚠️ 올바른 상점 이름을 입력해 주세요.", ephemeral=True)
+            return
+
+        await save_shop_settings(interaction.guild.id, {"title": new_title})
+        embed = discord.Embed(
+            title="🏷️ 상점 이름 변경 완료",
+            description=f"상점 이름이 **{new_title}**(으)로 변경되었습니다.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 및 역할 추가"):
     item_name = discord.ui.TextInput(
@@ -243,12 +268,19 @@ class ShopSettingsSelect(discord.ui.Select):
     def __init__(self, current_settings: dict):
         self.current_settings = current_settings
         is_enabled = current_settings.get("enabled", True)
+        shop_title = current_settings.get("title", "한바헌 포인트 상점")
         options = [
             discord.SelectOption(
                 label="시스템 활성화 / 비활성화",
                 value="toggle",
                 description=f"현재: {'✅ 활성화' if is_enabled else '❌ 비활성화'}",
                 emoji="⚡"
+            ),
+            discord.SelectOption(
+                label="상점 이름/제목 변경",
+                value="title",
+                description=f"현재 이름: {shop_title[:25]}",
+                emoji="🏷️"
             ),
             discord.SelectOption(label="상품 및 역할 추가", value="add", description="새로운 상점 상품, 가격, 지급 역할을 등록합니다.", emoji="➕"),
             discord.SelectOption(label="상품 삭제", value="delete", description="등록된 상점 상품을 삭제합니다.", emoji="🗑️"),
@@ -271,6 +303,11 @@ class ShopSettingsSelect(discord.ui.Select):
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
+        elif choice == "title":
+            modal = SetShopTitleModal()
+            modal.title_input.default = self.current_settings.get("title", "한바헌 포인트 상점")
+            await interaction.response.send_modal(modal)
+
         elif choice == "add":
             await interaction.response.send_modal(AddShopItemModal())
 
@@ -282,16 +319,18 @@ class ShopSettingsSelect(discord.ui.Select):
             await interaction.response.send_message("🗑️ 삭제할 상품을 아래 메뉴에서 선택하세요.", view=DeleteShopItemView(items), ephemeral=True)
 
         elif choice == "list":
-            items = await get_shop_items(interaction.guild.id)
+            settings = await get_shop_settings(interaction.guild.id)
+            shop_title = settings.get("title", "한바헌 포인트 상점")
+            items = settings.get("items", [])
             if not items:
                 embed = discord.Embed(
-                    title="🛒 등록된 상점 상품",
+                    title=f"🛒 {shop_title} 상품 목록",
                     description="현재 상점에 등록된 상품이 없습니다.",
                     color=discord.Color.gold()
                 )
             else:
                 embed = discord.Embed(
-                    title="🛒 등록된 상점 상품 및 재고 현황",
+                    title=f"🛒 {shop_title} 등록 상품 및 재고 현황",
                     description=f"총 **{len(items)}개**의 상품이 등록되어 있습니다.",
                     color=discord.Color.gold()
                 )
@@ -334,10 +373,11 @@ class Shop(commands.Cog):
             await interaction.response.send_message("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
             return
 
+        shop_title = settings.get("title", "한바헌 포인트 상점")
         items = settings.get("items", [])
         user_points = await get_user_points(interaction.user.id)
 
-        title_str = "🛒 [비활성화 상태] 한바헌 포인트 상점" if not is_enabled else "🛒 한바헌 포인트 상점"
+        title_str = f"🛒 [비활성화 상태] {shop_title}" if not is_enabled else f"🛒 {shop_title}"
 
         if not items:
             embed = discord.Embed(
@@ -370,22 +410,24 @@ class Shop(commands.Cog):
                 value="\n".join(info_lines),
                 inline=False
             )
-        embed.set_footer(text="선택 메뉴에서 항목을 고르면 즉시 포인트 차감 및 역할이 부여됩니다.")
+        embed.set_footer(text=f"선택 메뉴에서 항목을 고르면 포인트를 사용하여 즉시 구매하실 수 있습니다.")
 
         view = ShopView(items)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 상품, 가격, 재고, 역할을 관리합니다.")
+    @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 이름, 상품, 가격, 재고, 역할을 관리합니다.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def shop_settings(self, interaction: discord.Interaction):
         settings = await get_shop_settings(interaction.guild.id)
         enabled_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
+        shop_title = settings.get("title", "한바헌 포인트 상점")
         items = settings.get("items", [])
 
         embed = discord.Embed(
             title="⚙️ 상점 및 역할 설정 관리",
-            description=f"⚡ 상점 상태: **{enabled_text}** | 📦 등록 상품: **{len(items)}개**\n\n"
+            description=f"🏷️ 상점 이름: **{shop_title}**\n"
+                        f"⚡ 상점 상태: **{enabled_text}** | 📦 등록 상품: **{len(items)}개**\n\n"
                         "아래 드롭다운 메뉴에서 원하시는 상점 관리 기능을 선택하세요.",
             color=discord.Color.dark_purple()
         )

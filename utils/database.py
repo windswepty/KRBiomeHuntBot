@@ -309,6 +309,7 @@ async def deduct_user_points(user_id: int, amount: int) -> tuple[bool, int]:
 
 DEFAULT_SHOP_SETTINGS = {
     "enabled": True,
+    "title": "한바헌 포인트 상점",
     "items": []
 }
 
@@ -382,6 +383,7 @@ async def save_shop_items(guild_id: int, items: list[dict]) -> None:
 
 DEFAULT_GACHA_SETTINGS = {
     "enabled": True,
+    "title": "한바헌 럭키 뽑기",
     "price": 100,
     "items": []
 }

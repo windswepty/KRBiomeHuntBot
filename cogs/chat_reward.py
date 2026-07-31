@@ -1,7 +1,7 @@
 import re
 import discord
 from discord.ext import commands
-from utils.database import process_chat_message
+from utils.database import process_chat_message, is_user_blacklisted
 
 class ChatReward(commands.Cog):
     def __init__(self, bot):
@@ -11,6 +11,10 @@ class ChatReward(commands.Cog):
     async def on_message(self, message: discord.Message):
         # Ignore bot messages and direct messages
         if message.author.bot or not message.guild:
+            return
+
+        # Check if user is blacklisted from receiving points
+        if await is_user_blacklisted(message.guild.id, message.author.id):
             return
 
         # 1. Exclude photos/files/GIF attachments and stickers

@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from utils.database import checkin_user, get_user_points, get_top_users, get_user_rank
+from utils.database import checkin_user, get_user_points, get_top_users, get_user_rank, is_user_blacklisted
 
 class PointGuideSelect(discord.ui.Select):
     def __init__(self):
@@ -69,6 +69,17 @@ class CheckIn(commands.Cog):
 
     @app_commands.command(name="출석", description="하루에 한 번 출석체크를 하고 100포인트를 획득합니다.")
     async def check_in(self, interaction: discord.Interaction):
+        # 블랙리스트 유저 확인
+        if await is_user_blacklisted(interaction.guild.id, interaction.user.id):
+            embed = discord.Embed(
+                title="🚫 출석체크 불가",
+                description="귀하는 현재 **포인트 획득 제한(블랙리스트)** 상태로 설정되어 출석체크를 진행할 수 없습니다.\n\n"
+                            "이유 및 상세 문의는 서버 관리자에게 요청해 주세요.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
         success, total_points = await checkin_user(interaction.user.id)
 
         if success:

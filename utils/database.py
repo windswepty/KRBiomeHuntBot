@@ -12,6 +12,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "report_settings.json")
 SHOP_FILE = os.path.join(DATA_DIR, "shop_items.json")
 GACHA_FILE = os.path.join(DATA_DIR, "gacha_settings.json")
 LOGS_FILE = os.path.join(DATA_DIR, "activity_logs.json")
+BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 _lock = asyncio.Lock()
@@ -19,6 +20,7 @@ _settings_lock = asyncio.Lock()
 _shop_lock = asyncio.Lock()
 _gacha_lock = asyncio.Lock()
 _logs_lock = asyncio.Lock()
+_blacklist_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # MongoDB setup
@@ -28,6 +30,7 @@ settings_col = None
 shop_col = None
 gacha_col = None
 logs_col = None
+blacklist_col = None
 
 if MONGO_URI:
     try:
@@ -41,6 +44,7 @@ if MONGO_URI:
         shop_col = mongo_db["shop_items"]
         gacha_col = mongo_db["gacha_settings"]
         logs_col = mongo_db["activity_logs"]
+        blacklist_col = mongo_db["blacklist"]
         print("Connected to MongoDB successfully for permanent data storage!", flush=True)
     except Exception as e:
         print(f"MongoDB connection warning: {e}. Falling back to local JSON storage.", flush=True)
@@ -49,6 +53,7 @@ if MONGO_URI:
         shop_col = None
         gacha_col = None
         logs_col = None
+        blacklist_col = None
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -548,6 +553,137 @@ async def get_activity_logs(guild_id: int, log_type: str = "all", limit: int = 1
                 if log_type != "all":
                     logs = [l for l in logs if l.get("type") == log_type]
                 return logs[:limit]
+        except Exception:
+            pass
+    return []
+
+
+# ── Blacklist DB (per-guild) ──────────────────────────────────────────
+
+async def is_user_blacklisted(guild_id: int, user_id: int) -> bool:
+    str_gid = str(guild_id)
+    str_uid = str(user_id)
+
+    if blacklist_col is not None:
+        try:
+            doc = blacklist_col.find_one({"guild_id": str_gid, "user_id": str_uid})
+            return doc is not None
+        except Exception as e:
+            print(f"MongoDB is_user_blacklisted error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _blacklist_lock:
+        try:
+            if os.path.exists(BLACKLIST_FILE):
+                with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+                    all_bl = json.load(f)
+                guild_bl = all_bl.get(str_gid, {})
+                return str_uid in guild_bl
+        except Exception:
+            pass
+    return False
+
+async def add_blacklist_user(guild_id: int, user_id: int, reason: str = "") -> None:
+    str_gid = str(guild_id)
+    str_uid = str(user_id)
+    timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    entry = {
+        "guild_id": str_gid,
+        "user_id": str_uid,
+        "reason": reason if reason else "사유 미입력",
+        "timestamp": timestamp
+    }
+
+    if blacklist_col is not None:
+        try:
+            blacklist_col.update_one(
+                {"guild_id": str_gid, "user_id": str_uid},
+                {"$set": entry},
+                upsert=True
+            )
+            return
+        except Exception as e:
+            print(f"MongoDB add_blacklist_user error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _blacklist_lock:
+        all_bl = {}
+        try:
+            if os.path.exists(BLACKLIST_FILE):
+                with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+                    all_bl = json.load(f)
+        except Exception:
+            pass
+
+        if str_gid not in all_bl:
+            all_bl[str_gid] = {}
+        all_bl[str_gid][str_uid] = {
+            "reason": reason if reason else "사유 미입력",
+            "timestamp": timestamp
+        }
+
+        with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_bl, f, ensure_ascii=False, indent=2)
+
+async def remove_blacklist_user(guild_id: int, user_id: int) -> bool:
+    str_gid = str(guild_id)
+    str_uid = str(user_id)
+
+    if blacklist_col is not None:
+        try:
+            res = blacklist_col.delete_one({"guild_id": str_gid, "user_id": str_uid})
+            return res.deleted_count > 0
+        except Exception as e:
+            print(f"MongoDB remove_blacklist_user error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _blacklist_lock:
+        try:
+            if os.path.exists(BLACKLIST_FILE):
+                with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+                    all_bl = json.load(f)
+                if str_gid in all_bl and str_uid in all_bl[str_gid]:
+                    del all_bl[str_gid][str_uid]
+                    with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+                        json.dump(all_bl, f, ensure_ascii=False, indent=2)
+                    return True
+        except Exception:
+            pass
+    return False
+
+async def get_blacklist_users(guild_id: int) -> list[dict]:
+    str_gid = str(guild_id)
+
+    if blacklist_col is not None:
+        try:
+            cursor = blacklist_col.find({"guild_id": str_gid})
+            result = []
+            for doc in cursor:
+                result.append({
+                    "user_id": int(doc["user_id"]),
+                    "reason": doc.get("reason", "사유 미입력"),
+                    "timestamp": doc.get("timestamp", "")
+                })
+            return result
+        except Exception as e:
+            print(f"MongoDB get_blacklist_users error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _blacklist_lock:
+        try:
+            if os.path.exists(BLACKLIST_FILE):
+                with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+                    all_bl = json.load(f)
+                guild_bl = all_bl.get(str_gid, {})
+                result = []
+                for uid_str, info in guild_bl.items():
+                    result.append({
+                        "user_id": int(uid_str),
+                        "reason": info.get("reason", "사유 미입력"),
+                        "timestamp": info.get("timestamp", "")
+                    })
+                return result
         except Exception:
             pass
     return []

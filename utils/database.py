@@ -8,14 +8,17 @@ load_dotenv()
 
 DATA_DIR = "data"
 ECONOMY_FILE = os.path.join(DATA_DIR, "economy.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "report_settings.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 _lock = asyncio.Lock()
+_settings_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # MongoDB setup
 mongo_db = None
 users_col = None
+settings_col = None
 
 if MONGO_URI:
     try:
@@ -25,10 +28,12 @@ if MONGO_URI:
         client.admin.command('ping')
         mongo_db = client["krbiomehuntbot"]
         users_col = mongo_db["users"]
+        settings_col = mongo_db["report_settings"]
         print("Connected to MongoDB successfully for permanent data storage!", flush=True)
     except Exception as e:
         print(f"MongoDB connection warning: {e}. Falling back to local JSON storage.", flush=True)
         users_col = None
+        settings_col = None
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -150,3 +155,102 @@ async def get_user_points(user_id: int) -> int:
     if str_id in data:
         return data[str_id].get("points", 0)
     return 0
+
+async def add_user_points(user_id: int, amount: int) -> int:
+    str_id = str(user_id)
+
+    if users_col is not None:
+        try:
+            doc = users_col.find_one({"_id": str_id})
+            current_points = doc.get("points", 0) if doc else 0
+            new_points = max(0, current_points + amount)
+            users_col.update_one(
+                {"_id": str_id},
+                {"$set": {"points": new_points}},
+                upsert=True
+            )
+            return new_points
+        except Exception as e:
+            print(f"MongoDB add_user_points error: {e}, using local file.", flush=True)
+
+    data = await load_data()
+    if str_id not in data:
+        data[str_id] = {"points": 0, "last_checkin": "", "chat_count": 0}
+
+    current_points = data[str_id].get("points", 0)
+    new_points = max(0, current_points + amount)
+    data[str_id]["points"] = new_points
+    await save_data(data)
+    return new_points
+
+
+# ── Report Settings (per-guild) ──────────────────────────────────────
+
+DEFAULT_REPORT_SETTINGS = {
+    "enabled": True,
+    "default_points": 500,
+    "notify_role_id": None,
+    "report_channel_id": None,
+}
+
+async def get_report_settings(guild_id: int) -> dict:
+    """Get report settings for a guild. Returns defaults if not yet configured."""
+    str_gid = str(guild_id)
+
+    if settings_col is not None:
+        try:
+            doc = settings_col.find_one({"_id": str_gid})
+            if doc:
+                result = dict(DEFAULT_REPORT_SETTINGS)
+                result.update({k: v for k, v in doc.items() if k != "_id"})
+                return result
+        except Exception as e:
+            print(f"MongoDB get_report_settings error: {e}, using local file.", flush=True)
+
+    # Local JSON fallback
+    _ensure_data_dir()
+    async with _settings_lock:
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    all_settings = json.load(f)
+                if str_gid in all_settings:
+                    result = dict(DEFAULT_REPORT_SETTINGS)
+                    result.update(all_settings[str_gid])
+                    return result
+        except Exception:
+            pass
+    return dict(DEFAULT_REPORT_SETTINGS)
+
+async def save_report_settings(guild_id: int, settings: dict) -> None:
+    """Save report settings for a guild."""
+    str_gid = str(guild_id)
+
+    if settings_col is not None:
+        try:
+            settings_col.update_one(
+                {"_id": str_gid},
+                {"$set": settings},
+                upsert=True
+            )
+            return
+        except Exception as e:
+            print(f"MongoDB save_report_settings error: {e}, using local file.", flush=True)
+
+    # Local JSON fallback
+    _ensure_data_dir()
+    async with _settings_lock:
+        all_settings = {}
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    all_settings = json.load(f)
+        except Exception:
+            pass
+
+        if str_gid not in all_settings:
+            all_settings[str_gid] = {}
+        all_settings[str_gid].update(settings)
+
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_settings, f, ensure_ascii=False, indent=2)

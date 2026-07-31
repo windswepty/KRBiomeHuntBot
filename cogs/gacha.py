@@ -40,6 +40,10 @@ class GachaPlayView(discord.ui.View):
         user_id = interaction.user.id
 
         settings = await get_gacha_settings(guild_id)
+        if not settings.get("enabled", True):
+            await interaction.response.send_message("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다.", ephemeral=True)
+            return
+
         price = settings.get("price", 100)
         items = settings.get("items", [])
 
@@ -305,8 +309,16 @@ class DeleteGachaItemView(discord.ui.View):
 
 
 class GachaSettingsSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, current_settings: dict):
+        self.current_settings = current_settings
+        is_enabled = current_settings.get("enabled", True)
         options = [
+            discord.SelectOption(
+                label="시스템 활성화 / 비활성화",
+                value="toggle",
+                description=f"현재: {'✅ 활성화' if is_enabled else '❌ 비활성화'}",
+                emoji="⚡"
+            ),
             discord.SelectOption(label="1회 뽑기 가격 설정", value="price", description="뽑기 1회에 필요한 포인트를 변경합니다.", emoji="💰"),
             discord.SelectOption(label="당첨 항목 및 역할 추가", value="add", description="새로운 당첨 항목, 확률(%), 수량, 지급 역할을 추가합니다.", emoji="➕"),
             discord.SelectOption(label="당첨 항목 삭제", value="delete", description="등록된 뽑기 당첨 항목을 삭제합니다.", emoji="🗑️"),
@@ -317,7 +329,19 @@ class GachaSettingsSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         choice = self.values[0]
 
-        if choice == "price":
+        if choice == "toggle":
+            current = self.current_settings.get("enabled", True)
+            new_val = not current
+            await save_gacha_settings(interaction.guild.id, {"enabled": new_val})
+            status = "✅ 활성화" if new_val else "❌ 비활성화"
+            embed = discord.Embed(
+                title="⚡ 럭키 뽑기 시스템 상태 변경",
+                description=f"럭키 뽑기가 **{status}** 상태로 변경되었습니다.",
+                color=discord.Color.green() if new_val else discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif choice == "price":
             settings = await get_gacha_settings(interaction.guild.id)
             modal = SetGachaPriceModal()
             modal.price_input.default = str(settings.get("price", 100))
@@ -380,9 +404,9 @@ class GachaSettingsSelect(discord.ui.Select):
 
 
 class GachaSettingsView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, current_settings: dict):
         super().__init__(timeout=180)
-        self.add_item(GachaSettingsSelect())
+        self.add_item(GachaSettingsSelect(current_settings))
 
 
 # ── Cog ───────────────────────────────────────────────────────────────
@@ -394,6 +418,10 @@ class Gacha(commands.Cog):
     @app_commands.command(name="뽑기", description="포인트를 소비하여 무작위 보상 및 역할을 획득하는 럭키 뽑기를 진행합니다.")
     async def roll(self, interaction: discord.Interaction):
         settings = await get_gacha_settings(interaction.guild.id)
+        if not settings.get("enabled", True):
+            await interaction.response.send_message("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            return
+
         price = settings.get("price", 100)
         items = settings.get("items", [])
         user_points = await get_user_points(interaction.user.id)
@@ -443,6 +471,7 @@ class Gacha(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def gacha_settings(self, interaction: discord.Interaction):
         settings = await get_gacha_settings(interaction.guild.id)
+        enabled_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
         price = settings.get("price", 100)
         items = settings.get("items", [])
 
@@ -451,12 +480,12 @@ class Gacha(commands.Cog):
 
         embed = discord.Embed(
             title="⚙️ 럭키 뽑기, 역할 및 재고 설정 관리",
-            description=f"💰 1회 뽑기 가격: **{price:,} P** | 📦 항목 수: **{len(items)}개**\n"
+            description=f"⚡ 시스템 상태: **{enabled_text}** | 💰 1회 뽑기 가격: **{price:,} P** | 📦 항목 수: **{len(items)}개**\n"
                         f"📊 전체 확률 합계: {status_str}\n\n"
                         "아래 드롭다운 메뉴에서 설정할 관리 기능을 선택하세요.",
             color=discord.Color.dark_gold()
         )
-        view = GachaSettingsView()
+        view = GachaSettingsView(settings)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 

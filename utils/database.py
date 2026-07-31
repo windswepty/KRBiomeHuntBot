@@ -305,19 +305,25 @@ async def deduct_user_points(user_id: int, amount: int) -> tuple[bool, int]:
     return True, new_points
 
 
-# ── Shop Items DB (per-guild) ─────────────────────────────────────────
+# ── Shop Settings & Items DB (per-guild) ──────────────────────────────
 
-async def get_shop_items(guild_id: int) -> list[dict]:
+DEFAULT_SHOP_SETTINGS = {
+    "enabled": True,
+    "items": []
+}
+
+async def get_shop_settings(guild_id: int) -> dict:
     str_gid = str(guild_id)
 
     if shop_col is not None:
         try:
             doc = shop_col.find_one({"_id": str_gid})
-            if doc and "items" in doc:
-                return doc["items"]
-            return []
+            if doc:
+                res = dict(DEFAULT_SHOP_SETTINGS)
+                res.update({k: v for k, v in doc.items() if k != "_id"})
+                return res
         except Exception as e:
-            print(f"MongoDB get_shop_items error: {e}, using local file.", flush=True)
+            print(f"MongoDB get_shop_settings error: {e}, using local file.", flush=True)
 
     _ensure_data_dir()
     async with _shop_lock:
@@ -325,24 +331,27 @@ async def get_shop_items(guild_id: int) -> list[dict]:
             if os.path.exists(SHOP_FILE):
                 with open(SHOP_FILE, "r", encoding="utf-8") as f:
                     all_shop = json.load(f)
-                return all_shop.get(str_gid, [])
+                if str_gid in all_shop:
+                    res = dict(DEFAULT_SHOP_SETTINGS)
+                    res.update(all_shop[str_gid])
+                    return res
         except Exception:
             pass
-    return []
+    return dict(DEFAULT_SHOP_SETTINGS)
 
-async def save_shop_items(guild_id: int, items: list[dict]) -> None:
+async def save_shop_settings(guild_id: int, settings: dict) -> None:
     str_gid = str(guild_id)
 
     if shop_col is not None:
         try:
             shop_col.update_one(
                 {"_id": str_gid},
-                {"$set": {"items": items}},
+                {"$set": settings},
                 upsert=True
             )
             return
         except Exception as e:
-            print(f"MongoDB save_shop_items error: {e}, using local file.", flush=True)
+            print(f"MongoDB save_shop_settings error: {e}, using local file.", flush=True)
 
     _ensure_data_dir()
     async with _shop_lock:
@@ -354,16 +363,27 @@ async def save_shop_items(guild_id: int, items: list[dict]) -> None:
         except Exception:
             pass
 
-        all_shop[str_gid] = items
+        if str_gid not in all_shop:
+            all_shop[str_gid] = {}
+        all_shop[str_gid].update(settings)
+
         with open(SHOP_FILE, "w", encoding="utf-8") as f:
             json.dump(all_shop, f, ensure_ascii=False, indent=2)
+
+async def get_shop_items(guild_id: int) -> list[dict]:
+    settings = await get_shop_settings(guild_id)
+    return settings.get("items", [])
+
+async def save_shop_items(guild_id: int, items: list[dict]) -> None:
+    await save_shop_settings(guild_id, {"items": items})
 
 
 # ── Gacha Settings & Items DB (per-guild) ─────────────────────────────
 
 DEFAULT_GACHA_SETTINGS = {
+    "enabled": True,
     "price": 100,
-    "items": []  # list of {"name": str, "weight": int, "reward_points": int, "description": str}
+    "items": []
 }
 
 async def get_gacha_settings(guild_id: int) -> dict:

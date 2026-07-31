@@ -1,7 +1,10 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from utils.database import get_shop_items, save_shop_items, get_user_points, deduct_user_points, add_activity_log
+from utils.database import (
+    get_shop_items, save_shop_items, get_shop_settings, save_shop_settings,
+    get_user_points, deduct_user_points, add_activity_log
+)
 
 
 def format_stock_str(stock: int) -> str:
@@ -33,9 +36,14 @@ class ShopSelect(discord.ui.Select):
         super().__init__(placeholder="구매할 상품을 선택하세요...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        item_id = self.values[0]
         guild_id = interaction.guild.id
-        items = await get_shop_items(guild_id)
+        settings = await get_shop_settings(guild_id)
+        if not settings.get("enabled", True):
+            await interaction.response.send_message("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다.", ephemeral=True)
+            return
+
+        item_id = self.values[0]
+        items = settings.get("items", [])
 
         selected_item = next((item for item in items if str(item.get("id")) == item_id), None)
         if not selected_item:
@@ -229,8 +237,16 @@ class DeleteShopItemView(discord.ui.View):
 
 
 class ShopSettingsSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, current_settings: dict):
+        self.current_settings = current_settings
+        is_enabled = current_settings.get("enabled", True)
         options = [
+            discord.SelectOption(
+                label="시스템 활성화 / 비활성화",
+                value="toggle",
+                description=f"현재: {'✅ 활성화' if is_enabled else '❌ 비활성화'}",
+                emoji="⚡"
+            ),
             discord.SelectOption(label="상품 및 역할 추가", value="add", description="새로운 상점 상품, 가격, 지급 역할을 등록합니다.", emoji="➕"),
             discord.SelectOption(label="상품 삭제", value="delete", description="등록된 상점 상품을 삭제합니다.", emoji="🗑️"),
             discord.SelectOption(label="상품 목록 확인", value="list", description="현재 등록된 상점 상품 및 재고 현황을 확인합니다.", emoji="📜"),
@@ -240,7 +256,19 @@ class ShopSettingsSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         choice = self.values[0]
 
-        if choice == "add":
+        if choice == "toggle":
+            current = self.current_settings.get("enabled", True)
+            new_val = not current
+            await save_shop_settings(interaction.guild.id, {"enabled": new_val})
+            status = "✅ 활성화" if new_val else "❌ 비활성화"
+            embed = discord.Embed(
+                title="⚡ 상점 시스템 상태 변경",
+                description=f"포인트 상점이 **{status}** 상태로 변경되었습니다.",
+                color=discord.Color.green() if new_val else discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif choice == "add":
             await interaction.response.send_modal(AddShopItemModal())
 
         elif choice == "delete":
@@ -282,9 +310,9 @@ class ShopSettingsSelect(discord.ui.Select):
 
 
 class ShopSettingsView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, current_settings: dict):
         super().__init__(timeout=180)
-        self.add_item(ShopSettingsSelect())
+        self.add_item(ShopSettingsSelect(current_settings))
 
 
 # ── Cog ───────────────────────────────────────────────────────────────
@@ -295,7 +323,12 @@ class Shop(commands.Cog):
 
     @app_commands.command(name="상점", description="포인트로 다양한 상품이나 혜택, 역할을 구매합니다.")
     async def point_shop(self, interaction: discord.Interaction):
-        items = await get_shop_items(interaction.guild.id)
+        settings = await get_shop_settings(interaction.guild.id)
+        if not settings.get("enabled", True):
+            await interaction.response.send_message("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            return
+
+        items = settings.get("items", [])
         user_points = await get_user_points(interaction.user.id)
 
         if not items:
@@ -334,12 +367,17 @@ class Shop(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def shop_settings(self, interaction: discord.Interaction):
+        settings = await get_shop_settings(interaction.guild.id)
+        enabled_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
+        items = settings.get("items", [])
+
         embed = discord.Embed(
             title="⚙️ 상점 및 역할 설정 관리",
-            description="아래 드롭다운 메뉴에서 원하시는 상점 관리 기능을 선택하세요.",
+            description=f"⚡ 상점 상태: **{enabled_text}** | 📦 등록 상품: **{len(items)}개**\n\n"
+                        "아래 드롭다운 메뉴에서 원하시는 상점 관리 기능을 선택하세요.",
             color=discord.Color.dark_purple()
         )
-        view = ShopSettingsView()
+        view = ShopSettingsView(settings)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 

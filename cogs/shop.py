@@ -38,7 +38,10 @@ class ShopSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         guild_id = interaction.guild.id
         settings = await get_shop_settings(guild_id)
-        if not settings.get("enabled", True):
+        is_enabled = settings.get("enabled", True)
+        is_admin = interaction.user.guild_permissions.administrator
+
+        if not is_enabled and not is_admin:
             await interaction.response.send_message("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다.", ephemeral=True)
             return
 
@@ -324,26 +327,31 @@ class Shop(commands.Cog):
     @app_commands.command(name="상점", description="포인트로 다양한 상품이나 혜택, 역할을 구매합니다.")
     async def point_shop(self, interaction: discord.Interaction):
         settings = await get_shop_settings(interaction.guild.id)
-        if not settings.get("enabled", True):
+        is_enabled = settings.get("enabled", True)
+        is_admin = interaction.user.guild_permissions.administrator
+
+        if not is_enabled and not is_admin:
             await interaction.response.send_message("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
             return
 
         items = settings.get("items", [])
         user_points = await get_user_points(interaction.user.id)
 
+        title_str = "🛒 [비활성화 상태] 한바헌 포인트 상점" if not is_enabled else "🛒 한바헌 포인트 상점"
+
         if not items:
             embed = discord.Embed(
-                title="🛒 한바헌 포인트 상점",
+                title=title_str,
                 description=f"현재 준비된 상점 상품이 없습니다!\n\n💰 **내 보유 포인트**: **{user_points:,} P**",
-                color=discord.Color.purple()
+                color=discord.Color.purple() if is_enabled else discord.Color.red()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
         embed = discord.Embed(
-            title="🛒 한바헌 포인트 상점",
+            title=title_str,
             description=f"원하시는 상품을 아래 메뉴에서 선택하여 구매해 보세요!\n\n💰 **현재 내 보유 포인트**: **{user_points:,} P**",
-            color=discord.Color.purple()
+            color=discord.Color.purple() if is_enabled else discord.Color.red()
         )
         for item in items:
             stock_str = format_stock_str(item.get('stock', -1))

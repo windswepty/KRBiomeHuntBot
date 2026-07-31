@@ -248,9 +248,10 @@ class TicketLaunchView(discord.ui.View):
 
     @discord.ui.button(label="티켓 열기", style=discord.ButtonStyle.primary, emoji="🎫", custom_id="report_ticket_open")
     async def open_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 시스템 활성화 여부 확인
+        # 시스템 활성화 여부 확인 (관리자는 비활성화 상태여도 이용 가능)
         settings = await get_report_settings(interaction.guild.id)
-        if not settings.get("enabled", True):
+        is_admin = interaction.user.guild_permissions.administrator
+        if not settings.get("enabled", True) and not is_admin:
             await interaction.response.send_message(
                 "⚠️ 현재 바이옴 제보 시스템이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.",
                 ephemeral=True
@@ -463,22 +464,26 @@ class Report(commands.Cog):
 
     @app_commands.command(name="제보", description="희귀 바이옴 제보 안내를 확인하고 제보 티켓을 생성합니다.")
     async def report_biome(self, interaction: discord.Interaction):
-        # 시스템 활성화 여부 확인
+        # 시스템 활성화 여부 확인 (관리자는 비활성화 상태여도 이용 가능)
         settings = await get_report_settings(interaction.guild.id)
-        if not settings.get("enabled", True):
+        is_enabled = settings.get("enabled", True)
+        is_admin = interaction.user.guild_permissions.administrator
+
+        if not is_enabled and not is_admin:
             await interaction.response.send_message(
                 "⚠️ 현재 바이옴 제보 시스템이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.",
                 ephemeral=True
             )
             return
 
+        title_str = "🎫 [비활성화 상태] 희귀 바이옴 제보 안내" if not is_enabled else "🎫 희귀 바이옴 제보 안내"
         embed = discord.Embed(
-            title="🎫 희귀 바이옴 제보 안내",
+            title=title_str,
             description="해당 제보는 티켓을 통해 희귀바이옴을 인증하면 포인트를 주는 시스템입니다.\n\n"
                         "이 티켓은 매크로로 희귀바이옴을 생성한 시점부터 하루내에 사용해야 포인트를 지급해드립니다.\n\n"
                         "⚠️ **장난식으로 티켓사용 시 제재를 당할 수 있습니다.**\n\n"
                         "아래 **[티켓 열기]** 버튼을 눌러 제출 양식을 작성해 주세요.",
-            color=discord.Color.blue()
+            color=discord.Color.blue() if is_enabled else discord.Color.red()
         )
         view = TicketLaunchView()
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)

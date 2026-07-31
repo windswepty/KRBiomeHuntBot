@@ -40,7 +40,10 @@ class GachaPlayView(discord.ui.View):
         user_id = interaction.user.id
 
         settings = await get_gacha_settings(guild_id)
-        if not settings.get("enabled", True):
+        is_enabled = settings.get("enabled", True)
+        is_admin = interaction.user.guild_permissions.administrator
+
+        if not is_enabled and not is_admin:
             await interaction.response.send_message("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다.", ephemeral=True)
             return
 
@@ -418,7 +421,10 @@ class Gacha(commands.Cog):
     @app_commands.command(name="뽑기", description="포인트를 소비하여 무작위 보상 및 역할을 획득하는 럭키 뽑기를 진행합니다.")
     async def roll(self, interaction: discord.Interaction):
         settings = await get_gacha_settings(interaction.guild.id)
-        if not settings.get("enabled", True):
+        is_enabled = settings.get("enabled", True)
+        is_admin = interaction.user.guild_permissions.administrator
+
+        if not is_enabled and not is_admin:
             await interaction.response.send_message("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
             return
 
@@ -426,11 +432,13 @@ class Gacha(commands.Cog):
         items = settings.get("items", [])
         user_points = await get_user_points(interaction.user.id)
 
+        title_str = "🎰 [비활성화 상태] 한바헌 럭키 뽑기" if not is_enabled else "🎰 한바헌 럭키 뽑기"
+
         if not items:
             embed = discord.Embed(
-                title="🎰 한바헌 럭키 뽑기",
+                title=title_str,
                 description=f"현재 준비된 뽑기 항목이 없습니다!\n\n💰 **내 보유 포인트**: **{user_points:,} P**",
-                color=discord.Color.gold()
+                color=discord.Color.gold() if is_enabled else discord.Color.red()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
@@ -440,7 +448,7 @@ class Gacha(commands.Cog):
         status_line = "✅ 현재 뽑기를 플레이하실 수 있습니다." if is_ready else f"⚠️ 현재 전체 확률 합계가 **{total_pct:.2f}%**로 100%가 되지 않아 뽑기를 진행할 수 없습니다."
 
         embed = discord.Embed(
-            title="🎰 한바헌 럭키 뽑기",
+            title=title_str,
             description=f"아래 **[🎲 1회 뽑기 실행]** 버튼을 눌러 행운을 시험해 보세요!\n\n"
                         f"💳 **1회 뽑기 가격**: **{price:,} P**\n"
                         f"💰 **현재 내 보유 포인트**: **{user_points:,} P**\n\n"

@@ -273,56 +273,74 @@ async def get_top_users(guild_id: int, limit: int = 10) -> list[dict]:
 
     if users_col is not None:
         try:
-            # First, trigger migration for legacy docs if needed by finding all legacy docs without guild_id
-            legacy_cursor = users_col.find({"guild_id": {"$exists": False}})
-            for old_doc in legacy_cursor:
-                uid_str = old_doc["_id"]
-                target_key = f"{str_gid}:{uid_str}"
-                if not users_col.find_one({"_id": target_key}):
-                    users_col.replace_one(
-                        {"_id": target_key},
-                        {
-                            "_id": target_key,
-                            "guild_id": str_gid,
-                            "user_id": uid_str,
-                            "points": old_doc.get("points", 0),
-                            "last_checkin": old_doc.get("last_checkin", ""),
-                            "chat_count": old_doc.get("chat_count", 0)
-                        },
-                        upsert=True
-                    )
-
-            cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
+            # Query guild-specific docs
             result = []
+            cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
             for doc in cursor:
                 uid_val = doc.get("user_id") or doc["_id"].split(":")[-1]
                 result.append({
                     "user_id": int(uid_val),
                     "points": doc.get("points", 0)
                 })
+
+            # If no guild-specific docs found, try migrating legacy docs (one-time)
+            if not result:
+                legacy_cursor = users_col.find({"guild_id": {"$exists": False}})
+                for old_doc in legacy_cursor:
+                    uid_str = old_doc["_id"]
+                    # Skip non-numeric IDs
+                    if not uid_str.isdigit():
+                        continue
+                    target_key = f"{str_gid}:{uid_str}"
+                    if not users_col.find_one({"_id": target_key}):
+                        users_col.replace_one(
+                            {"_id": target_key},
+                            {
+                                "_id": target_key,
+                                "guild_id": str_gid,
+                                "user_id": uid_str,
+                                "points": old_doc.get("points", 0),
+                                "last_checkin": old_doc.get("last_checkin", ""),
+                                "chat_count": old_doc.get("chat_count", 0)
+                            },
+                            upsert=True
+                        )
+                # Re-query after migration
+                cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
+                for doc in cursor:
+                    uid_val = doc.get("user_id") or doc["_id"].split(":")[-1]
+                    result.append({
+                        "user_id": int(uid_val),
+                        "points": doc.get("points", 0)
+                    })
+
             return result
         except Exception as e:
             print(f"MongoDB get_top_users error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    # Local JSON migration for legacy keys
-    legacy_keys = [k for k in list(data.keys()) if ":" not in k]
-    for k in legacy_keys:
-        t_key = f"{str_gid}:{k}"
-        if t_key not in data:
-            data[t_key] = {
-                "points": data[k].get("points", 0),
-                "last_checkin": data[k].get("last_checkin", ""),
-                "chat_count": data[k].get("chat_count", 0)
-            }
-    await save_data(data)
-
+    # Local JSON: check for legacy keys only if no guild keys exist
     guild_items = []
+    has_guild_keys = False
     for key, info in data.items():
         if ":" in key:
             g_str, u_str = key.split(":", 1)
             if g_str == str_gid:
                 guild_items.append({"user_id": int(u_str), "points": info.get("points", 0)})
+                has_guild_keys = True
+
+    if not has_guild_keys:
+        legacy_keys = [k for k in list(data.keys()) if ":" not in k and k.isdigit()]
+        for k in legacy_keys:
+            t_key = f"{str_gid}:{k}"
+            data[t_key] = {
+                "points": data[k].get("points", 0),
+                "last_checkin": data[k].get("last_checkin", ""),
+                "chat_count": data[k].get("chat_count", 0)
+            }
+            guild_items.append({"user_id": int(k), "points": data[k].get("points", 0)})
+        if legacy_keys:
+            await save_data(data)
 
     sorted_users = sorted(guild_items, key=lambda x: x["points"], reverse=True)
     return sorted_users[:limit]
@@ -421,40 +439,6 @@ async def save_report_settings(guild_id: int, settings: dict) -> None:
 
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(all_settings, f, ensure_ascii=False, indent=2)
-
-
-async def deduct_user_points(guild_id: int, user_id: int, amount: int) -> tuple[bool, int]:
-    str_key = _get_user_key(guild_id, user_id)
-
-    if users_col is not None:
-        try:
-            doc = users_col.find_one({"_id": str_key})
-            current_points = doc.get("points", 0) if doc else 0
-            if current_points < amount:
-                return False, current_points
-
-            new_points = current_points - amount
-            users_col.update_one(
-                {"_id": str_key},
-                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "points": new_points}},
-                upsert=True
-            )
-            return True, new_points
-        except Exception as e:
-            print(f"MongoDB deduct_user_points error: {e}, using local file.", flush=True)
-
-    data = await load_data()
-    if str_key not in data:
-        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
-
-    current_points = data[str_key].get("points", 0)
-    if current_points < amount:
-        return False, current_points
-
-    new_points = current_points - amount
-    data[str_key]["points"] = new_points
-    await save_data(data)
-    return True, new_points
 
 
 # ── Shop Settings & Items DB (per-guild) ──────────────────────────────

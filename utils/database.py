@@ -82,16 +82,63 @@ async def save_data(data):
 def _get_user_key(guild_id: int, user_id: int) -> str:
     return f"{guild_id}:{user_id}"
 
+async def _migrate_old_user_if_needed(guild_id: int, user_id: int, data: dict = None) -> tuple[dict, bool]:
+    """Helper to fetch or migrate old user data seamlessly."""
+    str_key = _get_user_key(guild_id, user_id)
+    str_uid = str(user_id)
+    str_gid = str(guild_id)
+
+    # 1. MongoDB
+    if users_col is not None:
+        try:
+            doc = users_col.find_one({"_id": str_key})
+            if doc:
+                return doc, False
+
+            # Check for legacy doc without guild_id (with _id == user_id)
+            old_doc = users_col.find_one({"_id": str_uid})
+            if old_doc:
+                new_doc = {
+                    "_id": str_key,
+                    "guild_id": str_gid,
+                    "user_id": str_uid,
+                    "points": old_doc.get("points", 0),
+                    "last_checkin": old_doc.get("last_checkin", ""),
+                    "chat_count": old_doc.get("chat_count", 0)
+                }
+                users_col.replace_one({"_id": str_key}, new_doc, upsert=True)
+                return new_doc, True
+
+            new_doc = {"_id": str_key, "guild_id": str_gid, "user_id": str_uid, "points": 0, "last_checkin": "", "chat_count": 0}
+            return new_doc, False
+        except Exception as e:
+            print(f"MongoDB _migrate_old_user_if_needed error: {e}", flush=True)
+
+    # 2. Local JSON
+    if data is not None:
+        if str_key in data:
+            return data[str_key], False
+        if str_uid in data:
+            old_info = data[str_uid]
+            data[str_key] = {
+                "points": old_info.get("points", 0),
+                "last_checkin": old_info.get("last_checkin", ""),
+                "chat_count": old_info.get("chat_count", 0)
+            }
+            return data[str_key], True
+
+        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
+        return data[str_key], False
+
+    return {"points": 0, "last_checkin": "", "chat_count": 0}, False
+
 async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
     str_key = _get_user_key(guild_id, user_id)
     today = get_today_str()
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_key})
-            if not doc:
-                doc = {"_id": str_key, "guild_id": str(guild_id), "user_id": str(user_id), "points": 0, "last_checkin": "", "chat_count": 0}
-
+            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
             if doc.get("last_checkin") == today:
                 return False, doc.get("points", 0)
 
@@ -107,10 +154,7 @@ async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
 
     # Local JSON fallback
     data = await load_data()
-    if str_key not in data:
-        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
-
-    user_info = data[str_key]
+    user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
     if user_info.get("last_checkin") == today:
         return False, user_info.get("points", 0)
 
@@ -125,10 +169,7 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_key})
-            if not doc:
-                doc = {"_id": str_key, "guild_id": str(guild_id), "user_id": str(user_id), "points": 0, "last_checkin": "", "chat_count": 0}
-
+            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
             new_count = doc.get("chat_count", 0) + 1
             awarded = False
             new_points = doc.get("points", 0)
@@ -148,10 +189,7 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
 
     # Local JSON fallback
     data = await load_data()
-    if str_key not in data:
-        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
-
-    user_info = data[str_key]
+    user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
     user_info["chat_count"] = user_info.get("chat_count", 0) + 1
 
     awarded = False
@@ -163,29 +201,24 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
     return user_info["points"], awarded
 
 async def get_user_points(guild_id: int, user_id: int) -> int:
-    str_key = _get_user_key(guild_id, user_id)
-
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_key})
-            if doc:
-                return doc.get("points", 0)
-            return 0
+            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
+            return doc.get("points", 0)
         except Exception as e:
             print(f"MongoDB get points error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    if str_key in data:
-        return data[str_key].get("points", 0)
-    return 0
+    user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
+    return user_info.get("points", 0)
 
 async def add_user_points(guild_id: int, user_id: int, amount: int) -> int:
     str_key = _get_user_key(guild_id, user_id)
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_key})
-            current_points = doc.get("points", 0) if doc else 0
+            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
+            current_points = doc.get("points", 0)
             new_points = max(0, current_points + amount)
             users_col.update_one(
                 {"_id": str_key},
@@ -197,20 +230,68 @@ async def add_user_points(guild_id: int, user_id: int, amount: int) -> int:
             print(f"MongoDB add_user_points error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    if str_key not in data:
-        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
-
-    current_points = data[str_key].get("points", 0)
+    user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
+    current_points = user_info.get("points", 0)
     new_points = max(0, current_points + amount)
-    data[str_key]["points"] = new_points
+    user_info["points"] = new_points
     await save_data(data)
     return new_points
+
+async def deduct_user_points(guild_id: int, user_id: int, amount: int) -> tuple[bool, int]:
+    str_key = _get_user_key(guild_id, user_id)
+
+    if users_col is not None:
+        try:
+            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
+            current_points = doc.get("points", 0)
+            if current_points < amount:
+                return False, current_points
+
+            new_points = current_points - amount
+            users_col.update_one(
+                {"_id": str_key},
+                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "points": new_points}},
+                upsert=True
+            )
+            return True, new_points
+        except Exception as e:
+            print(f"MongoDB deduct_user_points error: {e}, using local file.", flush=True)
+
+    data = await load_data()
+    user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
+    current_points = user_info.get("points", 0)
+    if current_points < amount:
+        return False, current_points
+
+    new_points = current_points - amount
+    user_info["points"] = new_points
+    await save_data(data)
+    return True, new_points
 
 async def get_top_users(guild_id: int, limit: int = 10) -> list[dict]:
     str_gid = str(guild_id)
 
     if users_col is not None:
         try:
+            # First, trigger migration for legacy docs if needed by finding all legacy docs without guild_id
+            legacy_cursor = users_col.find({"guild_id": {"$exists": False}})
+            for old_doc in legacy_cursor:
+                uid_str = old_doc["_id"]
+                target_key = f"{str_gid}:{uid_str}"
+                if not users_col.find_one({"_id": target_key}):
+                    users_col.replace_one(
+                        {"_id": target_key},
+                        {
+                            "_id": target_key,
+                            "guild_id": str_gid,
+                            "user_id": uid_str,
+                            "points": old_doc.get("points", 0),
+                            "last_checkin": old_doc.get("last_checkin", ""),
+                            "chat_count": old_doc.get("chat_count", 0)
+                        },
+                        upsert=True
+                    )
+
             cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
             result = []
             for doc in cursor:
@@ -224,6 +305,18 @@ async def get_top_users(guild_id: int, limit: int = 10) -> list[dict]:
             print(f"MongoDB get_top_users error: {e}, using local file.", flush=True)
 
     data = await load_data()
+    # Local JSON migration for legacy keys
+    legacy_keys = [k for k in list(data.keys()) if ":" not in k]
+    for k in legacy_keys:
+        t_key = f"{str_gid}:{k}"
+        if t_key not in data:
+            data[t_key] = {
+                "points": data[k].get("points", 0),
+                "last_checkin": data[k].get("last_checkin", ""),
+                "chat_count": data[k].get("chat_count", 0)
+            }
+    await save_data(data)
+
     guild_items = []
     for key, info in data.items():
         if ":" in key:
@@ -241,15 +334,16 @@ async def get_user_rank(guild_id: int, user_id: int) -> tuple[int, int]:
 
     if users_col is not None:
         try:
-            user_doc = users_col.find_one({"_id": str_key})
-            user_points = user_doc.get("points", 0) if user_doc else 0
+            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
+            user_points = doc.get("points", 0)
             count_higher = users_col.count_documents({"guild_id": str_gid, "points": {"$gt": user_points}})
             return count_higher + 1, user_points
         except Exception as e:
             print(f"MongoDB get_user_rank error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    user_points = data.get(str_key, {}).get("points", 0)
+    user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
+    user_points = user_info.get("points", 0)
     count_higher = sum(
         1 for k, info in data.items()
         if ":" in k and k.split(":", 1)[0] == str_gid and info.get("points", 0) > user_points

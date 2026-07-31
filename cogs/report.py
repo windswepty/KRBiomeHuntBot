@@ -81,24 +81,38 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
         # 설정 불러오기
         settings = await get_report_settings(guild.id)
 
-        # 제보 채널 결정 (설정된 채널 or 현재 채널)
-        report_channel_id = settings.get("report_channel_id")
-        if report_channel_id:
-            target_channel = guild.get_channel(report_channel_id)
-            if not target_channel:
-                target_channel = interaction.channel
-        else:
-            target_channel = interaction.channel
+        # 카테고리 결정
+        category_id = settings.get("report_channel_id")
+        category = None
+        if category_id:
+            category = guild.get_channel(category_id)
+            if category and not isinstance(category, discord.CategoryChannel):
+                category = None
 
-        # 스레드 생성
-        thread_name = f"🎫-제보-{user.name}"
+        if not category:
+            await interaction.response.send_message(
+                "⚠️ 제보 카테고리가 설정되지 않았습니다. 관리자에게 `/제보설정`으로 카테고리를 설정해달라고 요청해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        # 비공개 채널 권한 설정 (제보자 + 관리자만 볼 수 있음)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+
+        # 티켓 채널 생성
+        channel_name = f"🎫-제보-{user.name}"
         try:
-            thread = await target_channel.create_thread(
-                name=thread_name,
-                type=discord.ChannelType.public_thread
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites
             )
         except Exception as e:
-            await interaction.response.send_message(f"⚠️ 티켓 스레드를 생성하지 못했습니다: {e}", ephemeral=True)
+            await interaction.response.send_message(f"⚠️ 티켓 채널을 생성하지 못했습니다: {e}", ephemeral=True)
             return
 
         # 알림 역할 멘션 생성
@@ -113,7 +127,7 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
             f"{user.mention} 님 안녕하세요! 용건을 보내주시고 관리자분들이 오실때까지 조금만 기다려주세요!\n"
             f"{role_mention}"
         ).strip()
-        await thread.send(welcome_msg)
+        await ticket_channel.send(welcome_msg)
 
         # 티켓 임베드
         embed = discord.Embed(
@@ -129,10 +143,10 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
         embed.set_footer(text="Vinceticket / KRBiomeHuntBot • Ticket System")
 
         view = TicketControlView(target_user_id=user.id)
-        await thread.send(embed=embed, view=view)
+        await ticket_channel.send(embed=embed, view=view)
 
         await interaction.response.send_message(
-            f"✅ **희귀 바이옴 제보 티켓이 생성되었습니다!**\n👉 {thread.mention} 스레드로 이동하여 인증 스크린샷을 첨부해 주세요.",
+            f"✅ **희귀 바이옴 제보 티켓이 생성되었습니다!**\n👉 {ticket_channel.mention} 채널로 이동하여 인증 스크린샷을 첨부해 주세요.",
             ephemeral=True
         )
 
@@ -152,12 +166,14 @@ class TicketControlView(discord.ui.View):
             await interaction.response.send_message("⚠️ 이 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
             return
 
-        await interaction.response.send_message("🔒 3초 후 티켓을 닫습니다...", ephemeral=True)
+        await interaction.response.send_message("🔒 3초 후 이 티켓 채널을 삭제합니다...")
 
-        if isinstance(interaction.channel, discord.Thread):
-            await interaction.channel.edit(archived=True, locked=True)
-        else:
-            await interaction.followup.send("⚠️ 티켓 스레드 채널에서만 티켓을 닫을 수 있습니다.", ephemeral=True)
+        import asyncio
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete(reason=f"티켓 닫기 - 관리자: {interaction.user.name}")
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ 채널 삭제에 실패했습니다: {e}", ephemeral=True)
 
     @discord.ui.button(label="포인트 지급", style=discord.ButtonStyle.success, emoji="💰", custom_id="ticket_give_points_default")
     async def give_points_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -228,9 +244,9 @@ class ReportSettingsSelect(discord.ui.Select):
                 emoji="🔔"
             ),
             discord.SelectOption(
-                label="제보 전용 채널 설정",
+                label="제보 카테고리 설정",
                 value="report_channel",
-                description="티켓 스레드가 생성될 채널을 지정합니다",
+                description="티켓 채널이 생성될 카테고리를 지정합니다",
                 emoji="📌"
             ),
             discord.SelectOption(
@@ -275,7 +291,7 @@ class ReportSettingsSelect(discord.ui.Select):
                             "• 시스템: ✅ 활성화\n"
                             "• 기본 포인트: 500P\n"
                             "• 알림 역할: 없음\n"
-                            "• 제보 채널: 없음 (현재 채널 사용)",
+                            "• 제보 카테고리: 없음",
                 color=discord.Color.blue()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -357,10 +373,10 @@ class NotifyRoleModal(discord.ui.Modal, title="🔔 알림 역할 설정"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-class ReportChannelModal(discord.ui.Modal, title="📌 제보 전용 채널 설정"):
+class ReportChannelModal(discord.ui.Modal, title="📌 제보 카테고리 설정"):
     channel_input = discord.ui.TextInput(
-        label="제보 스레드가 생성될 채널 ID를 입력하세요 (제거: 0)",
-        placeholder="예: 1234567890123456789  (채널 ID)",
+        label="티켓 채널이 생성될 카테고리 ID를 입력하세요 (제거: 0)",
+        placeholder="예: 1234567890123456789  (카테고리 ID)",
         required=True,
         max_length=25
     )
@@ -371,9 +387,9 @@ class ReportChannelModal(discord.ui.Modal, title="📌 제보 전용 채널 설�
         if raw == "0":
             await save_report_settings(interaction.guild.id, {"report_channel_id": None})
             embed = discord.Embed(
-                title="📌 제보 채널 해제 완료",
-                description="제보 전용 채널이 **해제**되었습니다.\n"
-                            "이제 `/제보` 명령어를 사용한 채널에 스레드가 생성됩니다.",
+                title="📌 제보 카테고리 해제 완료",
+                description="제보 카테고리가 **해제**되었습니다.\n"
+                            "카테고리를 다시 설정해야 티켓을 생성할 수 있습니다.",
                 color=discord.Color.orange()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -382,18 +398,18 @@ class ReportChannelModal(discord.ui.Modal, title="📌 제보 전용 채널 설�
         try:
             channel_id = int(raw)
         except ValueError:
-            await interaction.response.send_message("⚠️ 올바른 채널 ID(숫자)를 입력해 주세요.", ephemeral=True)
+            await interaction.response.send_message("⚠️ 올바른 카테고리 ID(숫자)를 입력해 주세요.", ephemeral=True)
             return
 
-        channel = interaction.guild.get_channel(channel_id)
-        if not channel:
-            await interaction.response.send_message(f"⚠️ ID `{channel_id}`에 해당하는 채널을 찾을 수 없습니다.", ephemeral=True)
+        category = interaction.guild.get_channel(channel_id)
+        if not category or not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message(f"⚠️ ID `{channel_id}`에 해당하는 카테고리를 찾을 수 없습니다. 카테고리 ID를 입력해 주세요.", ephemeral=True)
             return
 
         await save_report_settings(interaction.guild.id, {"report_channel_id": channel_id})
         embed = discord.Embed(
-            title="📌 제보 전용 채널 설정 완료",
-            description=f"이제 제보 티켓 스레드가 {channel.mention} 채널에 생성됩니다.",
+            title="📌 제보 카테고리 설정 완료",
+            description=f"이제 제보 티켓 채널이 **{category.name}** 카테고리 안에 생성됩니다.",
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -447,9 +463,9 @@ class Report(commands.Cog):
         channel_id = settings.get("report_channel_id")
         if channel_id:
             ch = interaction.guild.get_channel(channel_id)
-            channel_text = ch.mention if ch else f"❓ (삭제된 채널: {channel_id})"
+            channel_text = f"**{ch.name}**" if ch else f"❓ (삭제된 카테고리: {channel_id})"
         else:
-            channel_text = "설정 안 됨 (현재 채널에 생성)"
+            channel_text = "설정 안 됨"
 
         embed = discord.Embed(
             title="⚙️ 바이옴 제보 시스템 설정",
@@ -459,7 +475,7 @@ class Report(commands.Cog):
         embed.add_field(name="⚡ 시스템 상태", value=enabled_text, inline=True)
         embed.add_field(name="💰 기본 지급 포인트", value=points_text, inline=True)
         embed.add_field(name="🔔 알림 역할", value=role_text, inline=False)
-        embed.add_field(name="📌 제보 전용 채널", value=channel_text, inline=False)
+        embed.add_field(name="📌 제보 카테고리", value=channel_text, inline=False)
         embed.set_footer(text="설정은 이 서버에만 적용됩니다.")
 
         view = ReportSettingsView(settings)

@@ -8,6 +8,17 @@ from utils.database import (
 )
 
 
+def get_total_percent(items: list[dict]) -> float:
+    return sum(float(item.get("percent", item.get("weight", 0))) for item in items)
+
+
+def is_valid_100_percent(items: list[dict]) -> bool:
+    if not items:
+        return False
+    total = get_total_percent(items)
+    return abs(total - 100.0) < 0.001
+
+
 # ── Gacha Play View ───────────────────────────────────────────────────
 
 class GachaPlayView(discord.ui.View):
@@ -27,6 +38,18 @@ class GachaPlayView(discord.ui.View):
             await interaction.response.send_message("⚠️ 등록된 뽑기 항목이 없습니다. 관리자에게 문의해 주세요.", ephemeral=True)
             return
 
+        # 100% 검증
+        total_pct = get_total_percent(items)
+        if not is_valid_100_percent(items):
+            embed = discord.Embed(
+                title="⚠️ 뽑기 실행 불가",
+                description=f"관리자가 설정한 뽑기 항목들의 **전체 확률 합이 100%가 아니어서** 현재 뽑기를 진행할 수 없습니다.\n\n"
+                            f"📊 **현재 확률 합계**: `{total_pct:.2f}%` (100%로 설정되어야 함)",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
         # 포인트 차감 시도
         success, remaining = await deduct_user_points(user_id, price)
         if not success:
@@ -40,14 +63,14 @@ class GachaPlayView(discord.ui.View):
             return
 
         # 확률 추첨 (random.choices)
-        weights = [item.get("weight", 1) for item in items]
+        weights = [float(item.get("percent", item.get("weight", 0))) for item in items]
         selected_item = random.choices(items, weights=weights, k=1)[0]
 
         item_name = selected_item["name"]
         reward_points = selected_item.get("reward_points", 0)
         desc = selected_item.get("description", "")
 
-        # 만약 포인트 보상이 포함된 당첨 항목이면 자동 추가
+        # 포인트 보상인 경우 자동 지급
         new_balance = remaining
         if reward_points > 0:
             new_balance = await add_user_points(user_id, reward_points)
@@ -113,10 +136,9 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 추가
         required=True,
         max_length=50
     )
-    weight_input = discord.ui.TextInput(
-        label="확률 가중치 (숫자가 높을수록 잘 나옴)",
-        placeholder="예: 10 (가중치 비율에 따라 확률 계산)",
-        default="10",
+    percent_input = discord.ui.TextInput(
+        label="당첨 확률 (%)",
+        placeholder="예: 10 (10% 의미) 또는 0.5 (0.5% 의미)",
         required=True,
         max_length=10
     )
@@ -137,12 +159,12 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 추가
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            weight = int(self.weight_input.value.strip())
+            percent = float(self.percent_input.value.strip())
             reward_pts = int(self.reward_points_input.value.strip())
-            if weight <= 0 or reward_pts < 0:
+            if percent <= 0 or percent > 100 or reward_pts < 0:
                 raise ValueError()
         except ValueError:
-            await interaction.response.send_message("⚠️ 가중치는 1 이상, 포인트 보상은 0 이상의 숫자를 입력해 주세요.", ephemeral=True)
+            await interaction.response.send_message("⚠️ 확률은 0 초과 100 이하의 숫자, 포인트 보상은 0 이상의 숫자를 입력해 주세요.", ephemeral=True)
             return
 
         settings = await get_gacha_settings(interaction.guild.id)
@@ -152,7 +174,8 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 추가
         new_item = {
             "id": new_id,
             "name": self.item_name.value.strip(),
-            "weight": weight,
+            "percent": percent,
+            "weight": percent,
             "reward_points": reward_pts,
             "description": self.item_desc.value.strip() if self.item_desc.value else ""
         }
@@ -160,10 +183,13 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 추가
         settings["items"] = items
         await save_gacha_settings(interaction.guild.id, settings)
 
+        current_total = get_total_percent(items)
+        status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다! (뽑기 플레이 가능)" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{current_total:.2f}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
+
         embed = discord.Embed(
             title="✅ 뽑기 항목 추가 완료",
-            description=f"**{new_item['name']}** 항목(가중치: **{weight}**)이 뽑기 리스트에 추가되었습니다.",
-            color=discord.Color.green()
+            description=f"**{new_item['name']}** 항목(확률: **{percent}%**)이 추가되었습니다.\n\n{status_msg}",
+            color=discord.Color.green() if abs(current_total - 100.0) < 0.001 else discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -174,7 +200,7 @@ class DeleteGachaItemSelect(discord.ui.Select):
             discord.SelectOption(
                 label=item["name"],
                 value=str(item["id"]),
-                description=f"가중치: {item.get('weight', 1)} | 포인트 보상: {item.get('reward_points', 0):,}P",
+                description=f"확률: {item.get('percent', item.get('weight', 0))}% | 포인트 보상: {item.get('reward_points', 0):,}P",
                 emoji="🗑️"
             )
             for item in items
@@ -193,9 +219,12 @@ class DeleteGachaItemSelect(discord.ui.Select):
         await save_gacha_settings(interaction.guild.id, settings)
 
         item_name = deleted_item["name"] if deleted_item else "선택 항목"
+        current_total = get_total_percent(new_items)
+        status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다!" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{current_total:.2f}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
+
         embed = discord.Embed(
             title="🗑️ 뽑기 항목 삭제 완료",
-            description=f"**{item_name}** 항목이 뽑기 리스트에서 삭제되었습니다.",
+            description=f"**{item_name}** 항목이 삭제되었습니다.\n\n{status_msg}",
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -211,9 +240,9 @@ class GachaSettingsSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label="1회 뽑기 가격 설정", value="price", description="뽑기 1회에 필요한 포인트를 변경합니다.", emoji="💰"),
-            discord.SelectOption(label="당첨 항목 추가", value="add", description="새로운 뽑기 당첨 항목과 확률 가중치를 추가합니다.", emoji="➕"),
+            discord.SelectOption(label="당첨 항목 추가", value="add", description="새로운 뽑기 당첨 항목과 확률(%)을 추가합니다.", emoji="➕"),
             discord.SelectOption(label="당첨 항목 삭제", value="delete", description="등록된 뽑기 당첨 항목을 삭제합니다.", emoji="🗑️"),
-            discord.SelectOption(label="전체 확률표 확인", value="list", description="현재 등록된 뽑기 항목과 계산된 확률(%)을 확인합니다.", emoji="📊"),
+            discord.SelectOption(label="전체 확률표 확인", value="list", description="현재 등록된 항목 및 총 100% 달성 여부를 확인합니다.", emoji="📊"),
         ]
         super().__init__(placeholder="뽑기 관리 기능을 선택하세요...", options=options)
 
@@ -249,20 +278,22 @@ class GachaSettingsSelect(discord.ui.Select):
                     color=discord.Color.gold()
                 )
             else:
-                total_weight = sum(item.get("weight", 1) for item in items)
+                total_pct = get_total_percent(items)
+                status_str = "✅ **100.00%** (뽑기 정상 가동 가능)" if abs(total_pct - 100.0) < 0.001 else f"⚠️ **{total_pct:.2f}%** (100%가 되지 않아 뽑기 생성 불가!)"
+
                 embed = discord.Embed(
                     title="📊 뽑기 항목 및 확률표",
-                    description=f"💰 **1회 뽑기 가격**: **{price:,} P** | 총 **{len(items)}개** 항목 등록됨",
-                    color=discord.Color.gold()
+                    description=f"💰 **1회 뽑기 가격**: **{price:,} P** | 총 **{len(items)}개** 항목\n"
+                                f"📊 **전체 확률 합계**: {status_str}",
+                    color=discord.Color.green() if abs(total_pct - 100.0) < 0.001 else discord.Color.red()
                 )
                 for item in items:
-                    weight = item.get("weight", 1)
-                    percent = (weight / total_weight) * 100 if total_weight > 0 else 0
+                    pct = float(item.get("percent", item.get("weight", 0)))
                     reward_pts = item.get("reward_points", 0)
                     reward_info = f" (+{reward_pts:,}P 자동지급)" if reward_pts > 0 else ""
 
                     embed.add_field(
-                        name=f"🎲 {item['name']} - **{percent:.2f}%** (가중치: {weight})",
+                        name=f"🎲 {item['name']} - **{pct:.2f}%**",
                         value=f"📝 {item.get('description', '설명 없음')}{reward_info}",
                         inline=False
                     )
@@ -297,28 +328,31 @@ class Gacha(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        total_weight = sum(item.get("weight", 1) for item in items)
+        total_pct = get_total_percent(items)
+        is_ready = is_valid_100_percent(items)
+        status_line = "✅ 현재 뽑기를 플레이하실 수 있습니다." if is_ready else f"⚠️ 현재 전체 확률 합계가 **{total_pct:.2f}%**로 100%가 되지 않아 뽑기를 진행할 수 없습니다."
+
         embed = discord.Embed(
             title="🎰 한바헌 럭키 뽑기",
             description=f"아래 **[🎲 1회 뽑기 실행]** 버튼을 눌러 행운을 시험해 보세요!\n\n"
                         f"💳 **1회 뽑기 가격**: **{price:,} P**\n"
-                        f"💰 **현재 내 보유 포인트**: **{user_points:,} P**",
-            color=discord.Color.gold()
+                        f"💰 **현재 내 보유 포인트**: **{user_points:,} P**\n\n"
+                        f"{status_line}",
+            color=discord.Color.gold() if is_ready else discord.Color.red()
         )
         for item in items:
-            weight = item.get("weight", 1)
-            percent = (weight / total_weight) * 100 if total_weight > 0 else 0
+            pct = float(item.get("percent", item.get("weight", 0)))
             embed.add_field(
-                name=f"🎁 {item['name']} (**{percent:.2f}%**)",
+                name=f"🎁 {item['name']} (**{pct:.2f}%**)",
                 value=f"📝 {item.get('description', '설명 없음')}",
                 inline=True
             )
-        embed.set_footer(text="뽑기를 진행하면 포인트가 즉시 차감되고 당첨 결과가 표시됩니다.")
+        embed.set_footer(text="확률 총합이 100%일 때만 뽑기 실행이 가능합니다.")
 
         view = GachaPlayView()
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 가격, 당첨 항목, 확률을 설정합니다.")
+    @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 가격, 당첨 항목, 확률(총합 100%)을 설정합니다.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def gacha_settings(self, interaction: discord.Interaction):
@@ -326,9 +360,13 @@ class Gacha(commands.Cog):
         price = settings.get("price", 100)
         items = settings.get("items", [])
 
+        total_pct = get_total_percent(items)
+        status_str = "✅ **100%** (뽑기 생성 완료)" if is_valid_100_percent(items) else f"⚠️ **{total_pct:.2f}%** (100%를 맞춰야 유저들이 뽑기 가능)"
+
         embed = discord.Embed(
             title="⚙️ 럭키 뽑기 설정 관리",
-            description=f"현재 1회 뽑기 가격: **{price:,} P** | 등록된 항목 수: **{len(items)}개**\n\n"
+            description=f"💰 1회 뽑기 가격: **{price:,} P** | 📦 항목 수: **{len(items)}개**\n"
+                        f"📊 전체 확률 합계: {status_str}\n\n"
                         "아래 드롭다운 메뉴에서 설정할 관리 기능을 선택하세요.",
             color=discord.Color.dark_gold()
         )

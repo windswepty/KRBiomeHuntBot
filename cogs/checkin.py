@@ -123,8 +123,19 @@ class CheckIn(commands.Cog):
         for idx, u_info in enumerate(top_users, start=1):
             uid = u_info["user_id"]
             pts = u_info["points"]
+            
+            # 캐시 조회 및 API fetch 시도
             member = interaction.guild.get_member(uid)
-            user_str = member.mention if member else f"<@{uid}>"
+            if not member:
+                try:
+                    member = await interaction.guild.fetch_member(uid)
+                except Exception:
+                    member = None
+
+            if member:
+                user_str = f"**{member.display_name}** ({member.mention})"
+            else:
+                user_str = "*알 수 없는 유저 (서버 퇴장)*"
 
             medal = rank_medals[idx - 1] if idx <= 3 else f"`{idx}위`"
             ranking_lines.append(f"{medal} {user_str} — **{pts:,} P**")

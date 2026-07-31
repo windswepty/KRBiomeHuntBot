@@ -1,7 +1,30 @@
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
 from utils.database import add_user_points, get_report_settings, save_report_settings
+
+
+def parse_channel_mention(raw_input: str) -> str:
+    raw_input = raw_input.strip()
+    if not raw_input:
+        return raw_input
+
+    # 1. https://discord.com/channels/서버ID/채널ID 형태 파싱
+    match = re.search(r"channels/\d+/(\d+)", raw_input)
+    if match:
+        return f"<#{match.group(1)}>"
+
+    # 2. 이미 <#123456789> 채널 멘션 형태인 경우
+    if re.match(r"^<#\d+>$", raw_input):
+        return raw_input
+
+    # 3. 17~20자리 숫자 ID만 포함된 경우
+    digits = re.findall(r"\d{17,20}", raw_input)
+    if digits:
+        return f"<#{digits[0]}>"
+
+    return raw_input
 
 
 # ── Modals ────────────────────────────────────────────────────────────
@@ -79,6 +102,7 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
         await ticket_channel.send(welcome_msg)
 
         # 티켓 임베드
+        channel_mention_str = parse_channel_mention(self.channel_link.value)
         embed = discord.Embed(
             title="🎫 희귀 바이옴 제보 티켓",
             description="해당티켓은 희귀 바이옴 인증 및 포인트 적립을 위해 생성되었습니다!\n"
@@ -87,7 +111,7 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
             color=discord.Color.green()
         )
         embed.add_field(name="👤 제보자", value=user.mention, inline=True)
-        embed.add_field(name="🔗 희귀 바이옴 채널 링크", value=self.channel_link.value, inline=False)
+        embed.add_field(name="🔗 희귀 바이옴 채널 링크", value=channel_mention_str, inline=False)
         embed.add_field(name="📝 규칙 동의 답변", value=self.rules_agree.value, inline=False)
         embed.set_footer(text="Vinceticket / KRBiomeHuntBot • Ticket System")
 

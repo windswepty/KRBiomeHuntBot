@@ -88,12 +88,12 @@ class GachaPlayView(discord.ui.View):
 
         item_name = selected_item["name"]
         reward_points = selected_item.get("reward_points", 0)
+        reward_role_id = selected_item.get("reward_role_id", 0)
         desc = selected_item.get("description", "")
         stock = selected_item.get("stock", -1)
 
         # 재고 1 차감 (stock > 0 인 경우)
         if stock > 0:
-            # 설정의 원래 items 객체에서 찾아서 stock 차감 후 저장
             for item in items:
                 if item.get("id") == selected_item.get("id"):
                     item["stock"] -= 1
@@ -109,10 +109,23 @@ class GachaPlayView(discord.ui.View):
         if reward_points > 0:
             new_balance = await add_user_points(user_id, reward_points)
 
+        # 역할 보상 자동 지급 시도
+        role_notice = ""
+        if reward_role_id and reward_role_id > 0:
+            role = interaction.guild.get_role(reward_role_id)
+            if role:
+                try:
+                    await interaction.user.add_roles(role)
+                    role_notice = f"\n🎭 **{role.mention}** 역할이 계정에 즉시 지급되었습니다!"
+                except Exception as e:
+                    role_notice = f"\n⚠️ 역할 자동 지급 실패 (봇 권한/역할 순서 확인 필요: {e})"
+            else:
+                role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
+
         # 결과 임베드
         embed = discord.Embed(
             title="🎰 럭키 뽑기 결과!",
-            description=f"🎉 축하합니다! **[{item_name}]** 에 당첨되셨습니다!\n\n"
+            description=f"🎉 축하합니다! **[{item_name}]** 에 당첨되셨습니다!{role_notice}\n\n"
                         f"💳 **소모 포인트**: -{price:,} P\n"
                         f"💰 **현재 총 보유 포인트**: **{new_balance:,} P**\n"
                         f"📦 **해당 상품 남은 재고**: `{stock_text}`",
@@ -164,10 +177,10 @@ class SetGachaPriceModal(discord.ui.Modal, title="💰 1회 뽑기 가격 설정
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 재고 추가"):
+class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 역할 추가"):
     item_name = discord.ui.TextInput(
         label="당첨 항목 이름",
-        placeholder="예: 💎 1,000P 대박 당첨! 또는 🎁 희귀 칭호",
+        placeholder="예: 💎 1,000P 대박 당첨! 또는 🎭 VIP 역할",
         required=True,
         max_length=50
     )
@@ -184,30 +197,31 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
         required=True,
         max_length=10
     )
+    role_id_input = discord.ui.TextInput(
+        label="자동 지급 역할 ID (없으면 0 입력)",
+        placeholder="예: 1234567890123456789 (0 입력 시 역할 보상 없음)",
+        default="0",
+        required=True,
+        max_length=25
+    )
     reward_points_input = discord.ui.TextInput(
-        label="포인트 보상 (포인트 당첨인 경우 입력, 없으면 0)",
+        label="포인트 보상 (없으면 0 입력)",
         placeholder="예: 1000 (0 입력 시 포인트 지급 없음)",
         default="0",
         required=True,
         max_length=10
-    )
-    item_desc = discord.ui.TextInput(
-        label="항목 설명",
-        placeholder="예: 관리자에게 수령할 보상 메시지 등",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=200
     )
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             percent = float(self.percent_input.value.strip())
             stock = int(self.item_stock_input.value.strip())
+            role_id = int(self.role_id_input.value.strip())
             reward_pts = int(self.reward_points_input.value.strip())
-            if percent <= 0 or percent > 100 or (stock < 0 and stock != -1) or reward_pts < 0:
+            if percent <= 0 or percent > 100 or (stock < 0 and stock != -1) or role_id < 0 or reward_pts < 0:
                 raise ValueError()
         except ValueError:
-            await interaction.response.send_message("⚠️ 확률은 0 초과 100 이하의 숫자, 재고는 0 이상 (-1은 무제한), 포인트 보상은 0 이상의 숫자를 입력해 주세요.", ephemeral=True)
+            await interaction.response.send_message("⚠️ 확률(0~100), 재고(-1 이상), 역할 ID(숫자), 포인트 보상을 정확히 입력해 주세요.", ephemeral=True)
             return
 
         settings = await get_gacha_settings(interaction.guild.id)
@@ -220,8 +234,9 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
             "percent": percent,
             "weight": percent,
             "stock": stock,
+            "reward_role_id": role_id,
             "reward_points": reward_pts,
-            "description": self.item_desc.value.strip() if self.item_desc.value else ""
+            "description": ""
         }
         items.append(new_item)
         settings["items"] = items
@@ -230,10 +245,15 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
         current_total = get_total_percent(items)
         status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다! (뽑기 플레이 가능)" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{current_total:.2f}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
 
+        role_info = ""
+        if role_id > 0:
+            role = interaction.guild.get_role(role_id)
+            role_info = f" | 지급 역할: {role.mention}" if role else f" | 지급 역할 ID: `{role_id}`"
+
         stock_str = format_stock_str(stock)
         embed = discord.Embed(
             title="✅ 뽑기 항목 추가 완료",
-            description=f"**{new_item['name']}** 항목(확률: **{percent}%** | 재고: `{stock_str}`)이 추가되었습니다.\n\n{status_msg}",
+            description=f"**{new_item['name']}** 항목(확률: **{percent}%** | 재고: `{stock_str}`{role_info})이 추가되었습니다.\n\n{status_msg}",
             color=discord.Color.green() if abs(current_total - 100.0) < 0.001 else discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -245,7 +265,7 @@ class DeleteGachaItemSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"{item['name']} [{format_stock_str(item.get('stock', -1))}]",
                 value=str(item["id"]),
-                description=f"확률: {item.get('percent', item.get('weight', 0))}% | 포인트 보상: {item.get('reward_points', 0):,}P",
+                description=f"확률: {item.get('percent', item.get('weight', 0))}% | 역할 ID: {item.get('reward_role_id', 0)}",
                 emoji="🗑️"
             )
             for item in items
@@ -285,9 +305,9 @@ class GachaSettingsSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label="1회 뽑기 가격 설정", value="price", description="뽑기 1회에 필요한 포인트를 변경합니다.", emoji="💰"),
-            discord.SelectOption(label="당첨 항목 및 재고 추가", value="add", description="새로운 뽑기 당첨 항목, 확률(%), 재고를 추가합니다.", emoji="➕"),
+            discord.SelectOption(label="당첨 항목 및 역할 추가", value="add", description="새로운 당첨 항목, 확률(%), 수량, 지급 역할을 추가합니다.", emoji="➕"),
             discord.SelectOption(label="당첨 항목 삭제", value="delete", description="등록된 뽑기 당첨 항목을 삭제합니다.", emoji="🗑️"),
-            discord.SelectOption(label="전체 확률표 및 재고 확인", value="list", description="현재 등록된 항목, 재고, 총 100% 달성 여부를 확인합니다.", emoji="📊"),
+            discord.SelectOption(label="전체 확률표 및 재고 확인", value="list", description="현재 등록된 항목, 역할, 총 100% 달성 여부를 확인합니다.", emoji="📊"),
         ]
         super().__init__(placeholder="뽑기 관리 기능을 선택하세요...", options=options)
 
@@ -336,11 +356,21 @@ class GachaSettingsSelect(discord.ui.Select):
                     pct = float(item.get("percent", item.get("weight", 0)))
                     stock_str = format_stock_str(item.get("stock", -1))
                     reward_pts = item.get("reward_points", 0)
-                    reward_info = f" (+{reward_pts:,}P 자동지급)" if reward_pts > 0 else ""
+                    role_id = item.get("reward_role_id", 0)
+
+                    extra_info = []
+                    if reward_pts > 0:
+                        extra_info.append(f"+{reward_pts:,}P")
+                    if role_id > 0:
+                        role = interaction.guild.get_role(role_id)
+                        role_str = role.mention if role else f"ID: {role_id}"
+                        extra_info.append(f"역할: {role_str}")
+
+                    extra_str = f" ({', '.join(extra_info)})" if extra_info else ""
 
                     embed.add_field(
                         name=f"🎲 {item['name']} - **{pct:.2f}%** (재고: `{stock_str}`)",
-                        value=f"📝 {item.get('description', '설명 없음')}{reward_info}",
+                        value=f"📝 보상 내용{extra_str}",
                         inline=False
                     )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -358,7 +388,7 @@ class Gacha(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="뽑기", description="포인트를 소비하여 무작위 보상을 획득하는 럭키 뽑기를 진행합니다.")
+    @app_commands.command(name="뽑기", description="포인트를 소비하여 무작위 보상 및 역할을 획득하는 럭키 뽑기를 진행합니다.")
     async def roll(self, interaction: discord.Interaction):
         settings = await get_gacha_settings(interaction.guild.id)
         price = settings.get("price", 100)
@@ -389,17 +419,23 @@ class Gacha(commands.Cog):
         for item in items:
             pct = float(item.get("percent", item.get("weight", 0)))
             stock_str = format_stock_str(item.get("stock", -1))
+            role_id = item.get("reward_role_id", 0)
+            role_info = ""
+            if role_id > 0:
+                role = interaction.guild.get_role(role_id)
+                role_info = f"\n🎭 보상: {role.mention}" if role else "\n🎭 보상: 역할 지급"
+
             embed.add_field(
                 name=f"🎁 {item['name']} (**{pct:.2f}%** | 재고: `{stock_str}`)",
-                value=f"📝 {item.get('description', '설명 없음')}",
+                value=f"{role_info}".strip() or "📝 일반 당첨 항목",
                 inline=True
             )
-        embed.set_footer(text="확률 총합이 100%이고 재고가 남아있을 때만 뽑기 실행이 가능합니다.")
+        embed.set_footer(text="당첨된 역할이나 포인트는 계정에 즉시 지급됩니다.")
 
         view = GachaPlayView()
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 가격, 당첨 항목, 확률(총합 100%), 재고를 설정합니다.")
+    @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 가격, 당첨 항목, 확률(총합 100%), 재고, 역할을 설정합니다.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def gacha_settings(self, interaction: discord.Interaction):
@@ -411,7 +447,7 @@ class Gacha(commands.Cog):
         status_str = "✅ **100%** (뽑기 생성 완료)" if is_valid_100_percent(items) else f"⚠️ **{total_pct:.2f}%** (100%를 맞춰야 유저들이 뽑기 가능)"
 
         embed = discord.Embed(
-            title="⚙️ 럭키 뽑기 및 재고 설정 관리",
+            title="⚙️ 럭키 뽑기, 역할 및 재고 설정 관리",
             description=f"💰 1회 뽑기 가격: **{price:,} P** | 📦 항목 수: **{len(items)}개**\n"
                         f"📊 전체 확률 합계: {status_str}\n\n"
                         "아래 드롭다운 메뉴에서 설정할 관리 기능을 선택하세요.",

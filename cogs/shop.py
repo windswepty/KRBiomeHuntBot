@@ -45,6 +45,7 @@ class ShopSelect(discord.ui.Select):
         stock = selected_item.get("stock", -1)
         item_name = selected_item["name"]
         price = selected_item["price"]
+        reward_role_id = selected_item.get("reward_role_id", 0)
 
         # 재고 검사 (0개면 품절)
         if stock == 0:
@@ -76,10 +77,23 @@ class ShopSelect(discord.ui.Select):
         new_stock = selected_item.get("stock", -1)
         stock_text = format_stock_str(new_stock)
 
+        # 역할 자동 지급 시도
+        role_notice = ""
+        if reward_role_id and reward_role_id > 0:
+            role = interaction.guild.get_role(reward_role_id)
+            if role:
+                try:
+                    await interaction.user.add_roles(role)
+                    role_notice = f"\n🎭 **{role.mention}** 역할이 계정에 즉시 지급되었습니다!"
+                except Exception as e:
+                    role_notice = f"\n⚠️ 역할 자동 부여 실패 (봇 권한/역할 순서 확인 필요: {e})"
+            else:
+                role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
+
         # 구매 성공
         embed = discord.Embed(
             title="🎉 상품 구매 완료!",
-            description=f"**{item_name}** 상품을 성공적으로 구매하셨습니다!\n\n"
+            description=f"**{item_name}** 상품을 성공적으로 구매하셨습니다!{role_notice}\n\n"
                         f"💳 **소모 포인트**: -{price:,} P\n"
                         f"💰 **잔여 포인트**: **{remaining:,} P**\n"
                         f"📦 **남은 재고**: `{stock_text}`",
@@ -87,7 +101,7 @@ class ShopSelect(discord.ui.Select):
         )
         if selected_item.get("description"):
             embed.add_field(name="📝 상품 설명", value=selected_item["description"], inline=False)
-        embed.set_footer(text="구매 내역 적용을 위해 관리자에게 문의해 주세요.")
+        embed.set_footer(text="한바헌 포인트 상점 시스템")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -100,10 +114,10 @@ class ShopView(discord.ui.View):
 
 # ── Admin Shop Settings Modals & Views ────────────────────────────────
 
-class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 추가"):
+class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 및 역할 추가"):
     item_name = discord.ui.TextInput(
         label="상품 이름",
-        placeholder="예: 바이옴 감지권 1회",
+        placeholder="예: VIP 역할 구매 또는 바이옴 감지권",
         required=True,
         max_length=50
     )
@@ -120,9 +134,16 @@ class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 추가"):
         required=True,
         max_length=10
     )
+    role_id_input = discord.ui.TextInput(
+        label="구매 시 즉시 지급할 역할 ID (없으면 0)",
+        placeholder="예: 1234567890123456789 (0 입력 시 역할 없음)",
+        default="0",
+        required=True,
+        max_length=25
+    )
     item_desc = discord.ui.TextInput(
         label="상품 설명",
-        placeholder="예: 희귀 바이옴을 1회 탐지할 수 있는 상품입니다.",
+        placeholder="예: 구매 시 지정된 역할이 즉시 계정에 부여됩니다.",
         style=discord.TextStyle.paragraph,
         required=False,
         max_length=200
@@ -132,10 +153,11 @@ class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 추가"):
         try:
             price = int(self.item_price.value.strip())
             stock = int(self.item_stock.value.strip())
-            if price <= 0 or (stock < 0 and stock != -1):
+            role_id = int(self.role_id_input.value.strip())
+            if price <= 0 or (stock < 0 and stock != -1) or role_id < 0:
                 raise ValueError()
         except ValueError:
-            await interaction.response.send_message("⚠️ 가격은 1 이상, 재고는 0 이상 (무제한은 -1)의 숫자를 입력해 주세요.", ephemeral=True)
+            await interaction.response.send_message("⚠️ 가격(1 이상), 재고(-1 이상), 역할 ID(숫자)를 올바르게 입력해 주세요.", ephemeral=True)
             return
 
         items = await get_shop_items(interaction.guild.id)
@@ -146,15 +168,21 @@ class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 추가"):
             "name": self.item_name.value.strip(),
             "price": price,
             "stock": stock,
+            "reward_role_id": role_id,
             "description": self.item_desc.value.strip() if self.item_desc.value else ""
         }
         items.append(new_item)
         await save_shop_items(interaction.guild.id, items)
 
+        role_info = ""
+        if role_id > 0:
+            role = interaction.guild.get_role(role_id)
+            role_info = f" | 부여 역할: {role.mention}" if role else f" | 부여 역할 ID: `{role_id}`"
+
         stock_str = format_stock_str(stock)
         embed = discord.Embed(
-            title="✅ 상품 추가 완료",
-            description=f"**{new_item['name']}** (가격: **{price:,} P** | 재고: `{stock_str}`) 상품이 등록되었습니다.",
+            title="✅ 상점 상품 추가 완료",
+            description=f"**{new_item['name']}** (가격: **{price:,} P** | 재고: `{stock_str}`{role_info}) 상품이 등록되었습니다.",
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -166,7 +194,7 @@ class DeleteShopItemSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"{item['name']} [{format_stock_str(item.get('stock', -1))}]",
                 value=str(item["id"]),
-                description=f"가격: {item['price']:,}P",
+                description=f"가격: {item['price']:,}P | 역할 ID: {item.get('reward_role_id', 0)}",
                 emoji="🗑️"
             )
             for item in items
@@ -200,7 +228,7 @@ class DeleteShopItemView(discord.ui.View):
 class ShopSettingsSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="상품 추가", value="add", description="새로운 상점 상품 및 재고를 등록합니다.", emoji="➕"),
+            discord.SelectOption(label="상품 및 역할 추가", value="add", description="새로운 상점 상품, 가격, 지급 역할을 등록합니다.", emoji="➕"),
             discord.SelectOption(label="상품 삭제", value="delete", description="등록된 상점 상품을 삭제합니다.", emoji="🗑️"),
             discord.SelectOption(label="상품 목록 확인", value="list", description="현재 등록된 상점 상품 및 재고 현황을 확인합니다.", emoji="📜"),
         ]
@@ -236,8 +264,14 @@ class ShopSettingsSelect(discord.ui.Select):
                 for item in items:
                     desc = item.get('description', '설명 없음')
                     stock_str = format_stock_str(item.get('stock', -1))
+                    role_id = item.get('reward_role_id', 0)
+                    role_str = ""
+                    if role_id > 0:
+                        role = interaction.guild.get_role(role_id)
+                        role_str = f" | 부여 역할: {role.mention}" if role else f" | 부여 역할 ID: `{role_id}`"
+
                     embed.add_field(
-                        name=f"📦 [{item['id']}] {item['name']} - {item['price']:,} P (재고: `{stock_str}`)",
+                        name=f"📦 [{item['id']}] {item['name']} - {item['price']:,} P (재고: `{stock_str}`{role_str})",
                         value=f"📝 {desc}",
                         inline=False
                     )
@@ -256,7 +290,7 @@ class Shop(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="상점", description="포인트로 다양한 상품이나 혜택을 구매합니다.")
+    @app_commands.command(name="상점", description="포인트로 다양한 상품이나 혜택, 역할을 구매합니다.")
     async def point_shop(self, interaction: discord.Interaction):
         items = await get_shop_items(interaction.guild.id)
         user_points = await get_user_points(interaction.user.id)
@@ -277,22 +311,28 @@ class Shop(commands.Cog):
         )
         for item in items:
             stock_str = format_stock_str(item.get('stock', -1))
+            role_id = item.get('reward_role_id', 0)
+            role_info = ""
+            if role_id > 0:
+                role = interaction.guild.get_role(role_id)
+                role_info = f"\n🎭 혜택: {role.mention} 역할 부여" if role else "\n🎭 혜택: 역할 부여"
+
             embed.add_field(
                 name=f"📦 {item['name']} (💳 {item['price']:,} P | 재고: `{stock_str}`)",
-                value=f"📝 {item.get('description', '설명 없음')}",
+                value=f"📝 {item.get('description', '설명 없음')}{role_info}",
                 inline=False
             )
-        embed.set_footer(text="선택 메뉴에서 항목을 고르면 즉시 포인트가 차감되고 구매됩니다.")
+        embed.set_footer(text="선택 메뉴에서 항목을 고르면 즉시 포인트 차감 및 역할이 부여됩니다.")
 
         view = ShopView(items)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 상품 및 재고를 관리합니다.")
+    @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 상품, 가격, 재고, 역할을 관리합니다.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def shop_settings(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="⚙️ 상점 및 재고 설정 관리",
+            title="⚙️ 상점 및 역할 설정 관리",
             description="아래 드롭다운 메뉴에서 원하시는 상점 관리 기능을 선택하세요.",
             color=discord.Color.dark_purple()
         )

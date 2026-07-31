@@ -158,13 +158,22 @@ class TicketControlView(discord.ui.View):
                 await interaction.followup.send(f"⚠️ 채널 삭제에 실패했습니다: {e}", ephemeral=True)
             return
 
-        # 2. '티켓 닫기' 상태인 경우 -> 유저를 채널 권한에서 제외
+        # 2. '티켓 닫기' 상태인 경우 -> 유저를 채널 권한에서 제외 및 채널 이름 변경
         target_mention = "제보 유저"
+        user_name = "유저"
         if target_user_id:
             target_user = interaction.guild.get_member(target_user_id)
             if target_user:
                 target_mention = target_user.mention
+                user_name = target_user.name
                 await interaction.channel.set_permissions(target_user, view_channel=False)
+
+        # 채널 이름 변경 (🔒-닫힘-아이디)
+        new_channel_name = f"🔒-닫힘-{user_name}"
+        try:
+            await interaction.channel.edit(name=new_channel_name)
+        except Exception as e:
+            print(f"Failed to rename ticket channel: {e}", flush=True)
 
         await interaction.response.send_message("🔒 제보 유저를 채널에서 제외하고 티켓을 닫았습니다.", ephemeral=True)
         await interaction.channel.send(f"🔒 {target_mention} 님이 티켓 채널에서 제외되었습니다.")

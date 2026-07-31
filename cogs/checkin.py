@@ -181,6 +181,7 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="포인트지급", description="[관리자 전용] 특정 유저에게 포인트를 지급합니다.")
+    @app_commands.rename(member="멤버", amount="포인트")
     @app_commands.describe(member="포인트를 지급할 유저", amount="지급할 포인트 수량")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
@@ -204,6 +205,7 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트회수", description="[관리자 전용] 특정 유저의 포인트를 회수(차감)합니다.")
+    @app_commands.rename(member="멤버", amount="포인트")
     @app_commands.describe(member="포인트를 회수할 유저", amount="회수할 포인트 수량")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)

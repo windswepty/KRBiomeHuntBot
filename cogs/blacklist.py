@@ -25,16 +25,15 @@ def parse_user_id(raw_input: str) -> int | None:
 
 class AddBlacklistModal(discord.ui.Modal, title="➕ 포인트 블랙리스트 등록"):
     user_input = discord.ui.TextInput(
-        label="제한할 유저의 ID 또는 @멘션을 입력해 주세요!",
-        placeholder="예: 1234567890123456789 또는 @유저멘션",
+        label="제한할 유저의 디스코드 ID를 입력해 주세요!",
+        placeholder="예: 1531611325493678132",
         required=True,
         max_length=50
     )
     reason_input = discord.ui.TextInput(
         label="블랙리스트 등록 사유를 입력해 주세요!",
-        placeholder="예: 매크로 채팅 파밍 행위 적발",
+        placeholder="예: 매크로 채팅 파밍 방지 차단 (비워두시면 기본 사유 적용)",
         style=discord.TextStyle.paragraph,
-        default="매크로 채팅 파밍 방지 차단",
         required=False,
         max_length=200
     )
@@ -43,7 +42,7 @@ class AddBlacklistModal(discord.ui.Modal, title="➕ 포인트 블랙리스트 �
         user_id = parse_user_id(self.user_input.value)
         if not user_id:
             await interaction.response.send_message(
-                "⚠️ 유저 ID를 찾을 수 없습니다. 올바른 유저 ID(17~20자리 숫자) 또는 @멘션을 입력해 주세요.",
+                "⚠️ 올바른 유저 ID 숫자(예: `1531611325493678132`)를 입력해 주세요.",
                 ephemeral=True
             )
             return
@@ -74,8 +73,8 @@ class AddBlacklistModal(discord.ui.Modal, title="➕ 포인트 블랙리스트 �
 
 class RemoveBlacklistModal(discord.ui.Modal, title="➖ 포인트 블랙리스트 해제"):
     user_input = discord.ui.TextInput(
-        label="제한 해제할 유저의 ID 또는 @멘션을 입력해 주세요!",
-        placeholder="예: 1234567890123456789 또는 @유저멘션",
+        label="제한 해제할 유저의 디스코드 ID를 입력해 주세요!",
+        placeholder="예: 1531611325493678132",
         required=True,
         max_length=50
     )
@@ -84,7 +83,7 @@ class RemoveBlacklistModal(discord.ui.Modal, title="➖ 포인트 블랙리스�
         user_id = parse_user_id(self.user_input.value)
         if not user_id:
             await interaction.response.send_message(
-                "⚠️ 유저 ID를 찾을 수 없습니다. 올바른 유저 ID(17~20자리 숫자) 또는 @멘션을 입력해 주세요.",
+                "⚠️ 올바른 유저 ID 숫자(예: `1531611325493678132`)를 입력해 주세요.",
                 ephemeral=True
             )
             return

@@ -68,8 +68,8 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
     )
 
     rules_agree = discord.ui.TextInput(
-        label="이유없는 티켓은 큰 불이익을 받으며, 심하면 밴까지 수위가 높아질수도 있습니다.",
-        placeholder="여기에 '확인' 이라고 답하면 서버 및 티켓 규칙을 모두 읽은것으로 간주합니다",
+        label="서버 및 티켓규칙을 모두 확인했나요?",
+        placeholder="확인했다면 '확인' 이라고 입력해주세요!",
         style=discord.TextStyle.short,
         required=True
     )

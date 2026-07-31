@@ -34,7 +34,7 @@ class GachaPlayView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
 
-    @discord.ui.button(label="🎲 1회 뽑기 실행", style=discord.ButtonStyle.primary, emoji="🎰")
+    @discord.ui.button(label="1회 뽑기 실행", style=discord.ButtonStyle.primary, emoji="🎲")
     async def roll_gacha(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = interaction.guild.id
         user_id = interaction.user.id

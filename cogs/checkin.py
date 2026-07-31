@@ -181,10 +181,10 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="포인트지급", description="[관리자 전용] 특정 유저에게 포인트를 지급합니다.")
-    @app_commands.describe(member="포인트를 지급할 유저", amount="지급할 포인트 수량", reason="지급 사유 (선택)")
+    @app_commands.describe(member="포인트를 지급할 유저", amount="지급할 포인트 수량")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
-    async def give_points(self, interaction: discord.Interaction, member: discord.Member, amount: int, reason: str = "관리자 지급"):
+    async def give_points(self, interaction: discord.Interaction, member: discord.Member, amount: int):
         if amount <= 0:
             await interaction.response.send_message("⚠️ 지급할 포인트는 1 P 이상이어야 합니다.", ephemeral=True)
             return
@@ -192,23 +192,22 @@ class CheckIn(commands.Cog):
         new_total = await add_user_points(interaction.guild.id, member.id, amount)
         await add_activity_log(
             interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-            f"[{member.display_name}]에게 {amount:,}P 지급 (사유: {reason})"
+            f"[{member.display_name}]에게 {amount:,}P 지급"
         )
 
         embed = discord.Embed(
             title="🎁 포인트 지급 완료",
             description=f"{member.mention} 유저에게 **+{amount:,} P**를 지급하였습니다.\n\n"
-                        f"💰 **해당 유저의 현재 총 포인트**: **{new_total:,} P**\n"
-                        f"📝 **사유**: {reason}",
+                        f"💰 **해당 유저의 현재 총 포인트**: **{new_total:,} P**",
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트회수", description="[관리자 전용] 특정 유저의 포인트를 회수(차감)합니다.")
-    @app_commands.describe(member="포인트를 회수할 유저", amount="회수할 포인트 수량", reason="회수 사유 (선택)")
+    @app_commands.describe(member="포인트를 회수할 유저", amount="회수할 포인트 수량")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
-    async def take_points(self, interaction: discord.Interaction, member: discord.Member, amount: int, reason: str = "관리자 회수"):
+    async def take_points(self, interaction: discord.Interaction, member: discord.Member, amount: int):
         if amount <= 0:
             await interaction.response.send_message("⚠️ 회수할 포인트는 1 P 이상이어야 합니다.", ephemeral=True)
             return
@@ -230,14 +229,13 @@ class CheckIn(commands.Cog):
 
         await add_activity_log(
             interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-            f"[{member.display_name}]의 {amount:,}P 회수 (사유: {reason})"
+            f"[{member.display_name}]의 {amount:,}P 회수"
         )
 
         embed = discord.Embed(
             title="🔻 포인트 회수 완료",
             description=f"{member.mention} 유저의 포인트 **-{amount:,} P**를 회수하였습니다.\n\n"
-                        f"💰 **해당 유저의 현재 총 포인트**: **{new_total:,} P**\n"
-                        f"📝 **사유**: {reason}",
+                        f"💰 **해당 유저의 현재 총 포인트**: **{new_total:,} P**",
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)

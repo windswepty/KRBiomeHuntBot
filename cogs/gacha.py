@@ -399,8 +399,8 @@ class GachaSettingsSelect(discord.ui.Select):
                     extra_str = f" ({', '.join(extra_info)})" if extra_info else ""
 
                     embed.add_field(
-                        name=f"🎲 {item['name']} - **{pct:.2f}%** (재고: `{stock_str}`)",
-                        value=f"📝 보상 내용{extra_str}",
+                        name=f"🎲 {item['name']}",
+                        value=f"• **확률**: `{pct:.2f}%` | **재고**: `{stock_str}`{extra_str}",
                         inline=False
                     )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -459,15 +459,19 @@ class Gacha(commands.Cog):
             pct = float(item.get("percent", item.get("weight", 0)))
             stock_str = format_stock_str(item.get("stock", -1))
             role_id = item.get("reward_role_id", 0)
-            role_info = ""
+
+            info_lines = [f"• **확률**: `{pct:.2f}%` | **재고**: `{stock_str}`"]
             if role_id > 0:
                 role = interaction.guild.get_role(role_id)
-                role_info = f"\n🎭 보상: {role.mention}" if role else "\n🎭 보상: 역할 지급"
+                role_info = role.mention if role else f"ID: {role_id}"
+                info_lines.append(f"• **보상 혜택**: {role_info}")
+            elif item.get("reward_points", 0) > 0:
+                info_lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} P` 적립")
 
             embed.add_field(
-                name=f"🎁 {item['name']} (**{pct:.2f}%** | 재고: `{stock_str}`)",
-                value=f"{role_info}".strip() or "📝 일반 당첨 항목",
-                inline=True
+                name=f"🎁 {item['name']}",
+                value="\n".join(info_lines),
+                inline=False
             )
         embed.set_footer(text="당첨된 역할이나 포인트는 계정에 즉시 지급됩니다.")
 

@@ -356,14 +356,18 @@ class Shop(commands.Cog):
         for item in items:
             stock_str = format_stock_str(item.get('stock', -1))
             role_id = item.get('reward_role_id', 0)
-            role_info = ""
+
+            info_lines = [f"• **가격**: `{item['price']:,} P` | **재고**: `{stock_str}`"]
+            if item.get('description'):
+                info_lines.append(f"• **설명**: {item['description']}")
             if role_id > 0:
                 role = interaction.guild.get_role(role_id)
-                role_info = f"\n🎭 혜택: {role.mention} 역할 부여" if role else "\n🎭 혜택: 역할 부여"
+                role_info = role.mention if role else f"ID: {role_id}"
+                info_lines.append(f"• **혜택**: {role_info} 역할 부여")
 
             embed.add_field(
-                name=f"📦 {item['name']} (💳 {item['price']:,} P | 재고: `{stock_str}`)",
-                value=f"📝 {item.get('description', '설명 없음')}{role_info}",
+                name=f"📦 {item['name']}",
+                value="\n".join(info_lines),
                 inline=False
             )
         embed.set_footer(text="선택 메뉴에서 항목을 고르면 즉시 포인트 차감 및 역할이 부여됩니다.")

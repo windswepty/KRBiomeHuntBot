@@ -43,7 +43,7 @@ class ChatReward(commands.Cog):
             return
 
         # Process message for chat points
-        await process_chat_message(message.author.id)
+        await process_chat_message(message.guild.id, message.author.id)
 
 async def setup(bot):
     await bot.add_cog(ChatReward(bot))

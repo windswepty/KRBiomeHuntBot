@@ -210,7 +210,7 @@ class TicketControlView(discord.ui.View):
         amount = settings.get("default_points", 500)
 
         # DB에 포인트 추가 및 로그 기록
-        new_total = await add_user_points(target_user_id, amount)
+        new_total = await add_user_points(interaction.guild.id, target_user_id, amount)
         target_user = interaction.guild.get_member(target_user_id)
         target_mention = target_user.mention if target_user else f"<@{target_user_id}>"
         target_name = target_user.display_name if target_user else "제보자"

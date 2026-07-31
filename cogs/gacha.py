@@ -92,7 +92,7 @@ class GachaPlayView(discord.ui.View):
             return
 
         # 포인트 차감 시도
-        success, remaining = await deduct_user_points(user_id, price)
+        success, remaining = await deduct_user_points(guild_id, user_id, price)
         if not success:
             embed = discord.Embed(
                 title="⚠️ 포인트 부족",
@@ -140,7 +140,7 @@ class GachaPlayView(discord.ui.View):
         # 포인트 보상인 경우 자동 추가
         new_balance = remaining
         if reward_points > 0:
-            new_balance = await add_user_points(user_id, reward_points)
+            new_balance = await add_user_points(guild_id, user_id, reward_points)
 
         # 역할 보상 자동 지급 시도
         role_notice = ""
@@ -501,7 +501,7 @@ class Gacha(commands.Cog):
         gacha_title = settings.get("title", "한바헌 럭키 뽑기")
         price = settings.get("price", 100)
         items = settings.get("items", [])
-        user_points = await get_user_points(interaction.user.id)
+        user_points = await get_user_points(interaction.guild.id, interaction.user.id)
 
         title_str = f"🎰 [비활성화 상태] {gacha_title}" if not is_enabled else f"🎰 {gacha_title}"
 

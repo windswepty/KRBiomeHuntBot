@@ -80,7 +80,7 @@ class CheckIn(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        success, total_points = await checkin_user(interaction.user.id)
+        success, total_points = await checkin_user(interaction.guild.id, interaction.user.id)
 
         if success:
             embed = discord.Embed(
@@ -100,7 +100,7 @@ class CheckIn(commands.Cog):
 
     @app_commands.command(name="포인트확인", description="현재 내가 보유한 총 포인트를 확인합니다.")
     async def view_points(self, interaction: discord.Interaction):
-        total_points = await get_user_points(interaction.user.id)
+        total_points = await get_user_points(interaction.guild.id, interaction.user.id)
         embed = discord.Embed(
             title="💳 내 포인트 정보",
             description=f"💰 **현재 총 보유 포인트**: **{total_points:,}** P",
@@ -110,8 +110,8 @@ class CheckIn(commands.Cog):
 
     @app_commands.command(name="포인트랭킹", description="서버의 포인트 보유 순위 TOP 10을 확인합니다.")
     async def point_ranking(self, interaction: discord.Interaction):
-        top_users = await get_top_users(limit=10)
-        my_rank, my_points = await get_user_rank(interaction.user.id)
+        top_users = await get_top_users(interaction.guild.id, limit=10)
+        my_rank, my_points = await get_user_rank(interaction.guild.id, interaction.user.id)
 
         if not top_users:
             embed = discord.Embed(

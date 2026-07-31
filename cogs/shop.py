@@ -71,7 +71,7 @@ class ShopSelect(discord.ui.Select):
             return
 
         # 포인트 차감 시도
-        success, remaining = await deduct_user_points(interaction.user.id, price)
+        success, remaining = await deduct_user_points(guild_id, interaction.user.id, price)
         if not success:
             embed = discord.Embed(
                 title="⚠️ 포인트 부족",
@@ -381,7 +381,7 @@ class Shop(commands.Cog):
 
         shop_title = settings.get("title", "한바헌 포인트 상점")
         items = settings.get("items", [])
-        user_points = await get_user_points(interaction.user.id)
+        user_points = await get_user_points(interaction.guild.id, interaction.user.id)
 
         title_str = f"🛒 [비활성화 상태] {shop_title}" if not is_enabled else f"🛒 {shop_title}"
 

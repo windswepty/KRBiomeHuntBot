@@ -79,23 +79,26 @@ async def save_data(data):
         with open(ECONOMY_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-async def checkin_user(user_id: int) -> tuple[bool, int]:
-    str_id = str(user_id)
+def _get_user_key(guild_id: int, user_id: int) -> str:
+    return f"{guild_id}:{user_id}"
+
+async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
+    str_key = _get_user_key(guild_id, user_id)
     today = get_today_str()
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_id})
+            doc = users_col.find_one({"_id": str_key})
             if not doc:
-                doc = {"_id": str_id, "points": 0, "last_checkin": "", "chat_count": 0}
+                doc = {"_id": str_key, "guild_id": str(guild_id), "user_id": str(user_id), "points": 0, "last_checkin": "", "chat_count": 0}
 
             if doc.get("last_checkin") == today:
                 return False, doc.get("points", 0)
 
             new_points = doc.get("points", 0) + 100
             users_col.update_one(
-                {"_id": str_id},
-                {"$set": {"last_checkin": today, "points": new_points}},
+                {"_id": str_key},
+                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "last_checkin": today, "points": new_points}},
                 upsert=True
             )
             return True, new_points
@@ -104,10 +107,10 @@ async def checkin_user(user_id: int) -> tuple[bool, int]:
 
     # Local JSON fallback
     data = await load_data()
-    if str_id not in data:
-        data[str_id] = {"points": 0, "last_checkin": "", "chat_count": 0}
+    if str_key not in data:
+        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
 
-    user_info = data[str_id]
+    user_info = data[str_key]
     if user_info.get("last_checkin") == today:
         return False, user_info.get("points", 0)
 
@@ -117,14 +120,14 @@ async def checkin_user(user_id: int) -> tuple[bool, int]:
 
     return True, user_info["points"]
 
-async def process_chat_message(user_id: int) -> tuple[int, bool]:
-    str_id = str(user_id)
+async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
+    str_key = _get_user_key(guild_id, user_id)
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_id})
+            doc = users_col.find_one({"_id": str_key})
             if not doc:
-                doc = {"_id": str_id, "points": 0, "last_checkin": "", "chat_count": 0}
+                doc = {"_id": str_key, "guild_id": str(guild_id), "user_id": str(user_id), "points": 0, "last_checkin": "", "chat_count": 0}
 
             new_count = doc.get("chat_count", 0) + 1
             awarded = False
@@ -135,8 +138,8 @@ async def process_chat_message(user_id: int) -> tuple[int, bool]:
                 awarded = True
 
             users_col.update_one(
-                {"_id": str_id},
-                {"$set": {"chat_count": new_count, "points": new_points}},
+                {"_id": str_key},
+                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "chat_count": new_count, "points": new_points}},
                 upsert=True
             )
             return new_points, awarded
@@ -145,10 +148,10 @@ async def process_chat_message(user_id: int) -> tuple[int, bool]:
 
     # Local JSON fallback
     data = await load_data()
-    if str_id not in data:
-        data[str_id] = {"points": 0, "last_checkin": "", "chat_count": 0}
+    if str_key not in data:
+        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
 
-    user_info = data[str_id]
+    user_info = data[str_key]
     user_info["chat_count"] = user_info.get("chat_count", 0) + 1
 
     awarded = False
@@ -159,12 +162,12 @@ async def process_chat_message(user_id: int) -> tuple[int, bool]:
     await save_data(data)
     return user_info["points"], awarded
 
-async def get_user_points(user_id: int) -> int:
-    str_id = str(user_id)
+async def get_user_points(guild_id: int, user_id: int) -> int:
+    str_key = _get_user_key(guild_id, user_id)
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_id})
+            doc = users_col.find_one({"_id": str_key})
             if doc:
                 return doc.get("points", 0)
             return 0
@@ -172,21 +175,21 @@ async def get_user_points(user_id: int) -> int:
             print(f"MongoDB get points error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    if str_id in data:
-        return data[str_id].get("points", 0)
+    if str_key in data:
+        return data[str_key].get("points", 0)
     return 0
 
-async def add_user_points(user_id: int, amount: int) -> int:
-    str_id = str(user_id)
+async def add_user_points(guild_id: int, user_id: int, amount: int) -> int:
+    str_key = _get_user_key(guild_id, user_id)
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_id})
+            doc = users_col.find_one({"_id": str_key})
             current_points = doc.get("points", 0) if doc else 0
             new_points = max(0, current_points + amount)
             users_col.update_one(
-                {"_id": str_id},
-                {"$set": {"points": new_points}},
+                {"_id": str_key},
+                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "points": new_points}},
                 upsert=True
             )
             return new_points
@@ -194,23 +197,26 @@ async def add_user_points(user_id: int, amount: int) -> int:
             print(f"MongoDB add_user_points error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    if str_id not in data:
-        data[str_id] = {"points": 0, "last_checkin": "", "chat_count": 0}
+    if str_key not in data:
+        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
 
-    current_points = data[str_id].get("points", 0)
+    current_points = data[str_key].get("points", 0)
     new_points = max(0, current_points + amount)
-    data[str_id]["points"] = new_points
+    data[str_key]["points"] = new_points
     await save_data(data)
     return new_points
 
-async def get_top_users(limit: int = 10) -> list[dict]:
+async def get_top_users(guild_id: int, limit: int = 10) -> list[dict]:
+    str_gid = str(guild_id)
+
     if users_col is not None:
         try:
-            cursor = users_col.find().sort("points", -1).limit(limit)
+            cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
             result = []
             for doc in cursor:
+                uid_val = doc.get("user_id") or doc["_id"].split(":")[-1]
                 result.append({
-                    "user_id": int(doc["_id"]),
+                    "user_id": int(uid_val),
                     "points": doc.get("points", 0)
                 })
             return result
@@ -218,28 +224,36 @@ async def get_top_users(limit: int = 10) -> list[dict]:
             print(f"MongoDB get_top_users error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    sorted_users = sorted(
-        [{"user_id": int(uid), "points": info.get("points", 0)} for uid, info in data.items()],
-        key=lambda x: x["points"],
-        reverse=True
-    )
+    guild_items = []
+    for key, info in data.items():
+        if ":" in key:
+            g_str, u_str = key.split(":", 1)
+            if g_str == str_gid:
+                guild_items.append({"user_id": int(u_str), "points": info.get("points", 0)})
+
+    sorted_users = sorted(guild_items, key=lambda x: x["points"], reverse=True)
     return sorted_users[:limit]
 
-async def get_user_rank(user_id: int) -> tuple[int, int]:
-    """Returns (rank, points) for the specified user_id."""
-    str_id = str(user_id)
+async def get_user_rank(guild_id: int, user_id: int) -> tuple[int, int]:
+    """Returns (rank, points) for the specified user_id in the guild."""
+    str_gid = str(guild_id)
+    str_key = _get_user_key(guild_id, user_id)
+
     if users_col is not None:
         try:
-            user_doc = users_col.find_one({"_id": str_id})
+            user_doc = users_col.find_one({"_id": str_key})
             user_points = user_doc.get("points", 0) if user_doc else 0
-            count_higher = users_col.count_documents({"points": {"$gt": user_points}})
+            count_higher = users_col.count_documents({"guild_id": str_gid, "points": {"$gt": user_points}})
             return count_higher + 1, user_points
         except Exception as e:
             print(f"MongoDB get_user_rank error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    user_points = data.get(str_id, {}).get("points", 0)
-    count_higher = sum(1 for info in data.values() if info.get("points", 0) > user_points)
+    user_points = data.get(str_key, {}).get("points", 0)
+    count_higher = sum(
+        1 for k, info in data.items()
+        if ":" in k and k.split(":", 1)[0] == str_gid and info.get("points", 0) > user_points
+    )
     return count_higher + 1, user_points
 
 
@@ -315,20 +329,20 @@ async def save_report_settings(guild_id: int, settings: dict) -> None:
             json.dump(all_settings, f, ensure_ascii=False, indent=2)
 
 
-async def deduct_user_points(user_id: int, amount: int) -> tuple[bool, int]:
-    """Deduct points from user if they have enough. Returns (success, new_or_current_balance)."""
-    str_id = str(user_id)
+async def deduct_user_points(guild_id: int, user_id: int, amount: int) -> tuple[bool, int]:
+    str_key = _get_user_key(guild_id, user_id)
 
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_id})
+            doc = users_col.find_one({"_id": str_key})
             current_points = doc.get("points", 0) if doc else 0
             if current_points < amount:
                 return False, current_points
+
             new_points = current_points - amount
             users_col.update_one(
-                {"_id": str_id},
-                {"$set": {"points": new_points}},
+                {"_id": str_key},
+                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "points": new_points}},
                 upsert=True
             )
             return True, new_points
@@ -336,15 +350,15 @@ async def deduct_user_points(user_id: int, amount: int) -> tuple[bool, int]:
             print(f"MongoDB deduct_user_points error: {e}, using local file.", flush=True)
 
     data = await load_data()
-    if str_id not in data:
-        data[str_id] = {"points": 0, "last_checkin": "", "chat_count": 0}
+    if str_key not in data:
+        data[str_key] = {"points": 0, "last_checkin": "", "chat_count": 0}
 
-    current_points = data[str_id].get("points", 0)
+    current_points = data[str_key].get("points", 0)
     if current_points < amount:
         return False, current_points
 
     new_points = current_points - amount
-    data[str_id]["points"] = new_points
+    data[str_key]["points"] = new_points
     await save_data(data)
     return True, new_points
 

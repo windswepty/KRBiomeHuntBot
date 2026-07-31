@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from utils.database import get_shop_items, save_shop_items, get_user_points, deduct_user_points
+from utils.database import get_shop_items, save_shop_items, get_user_points, deduct_user_points, add_activity_log
 
 
 def format_stock_str(stock: int) -> str:
@@ -89,6 +89,9 @@ class ShopSelect(discord.ui.Select):
                     role_notice = f"\n⚠️ 역할 자동 부여 실패 (봇 권한/역할 순서 확인 필요: {e})"
             else:
                 role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
+
+        # 로그 기록
+        await add_activity_log(guild_id, "shop", interaction.user.id, interaction.user.display_name, f"[{item_name}] 상점 상품 구매 (-{price:,}P)")
 
         # 구매 성공
         embed = discord.Embed(

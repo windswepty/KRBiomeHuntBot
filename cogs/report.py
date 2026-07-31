@@ -2,7 +2,7 @@ import re
 import discord
 from discord.ext import commands
 from discord import app_commands
-from utils.database import add_user_points, get_report_settings, save_report_settings
+from utils.database import add_user_points, get_report_settings, save_report_settings, add_activity_log
 
 
 def parse_channel_mention(raw_input: str) -> str:
@@ -209,12 +209,19 @@ class TicketControlView(discord.ui.View):
         settings = await get_report_settings(interaction.guild.id)
         amount = settings.get("default_points", 500)
 
-        # DB에 포인트 추가
+        # DB에 포인트 추가 및 로그 기록
         new_total = await add_user_points(target_user_id, amount)
-
         target_user = interaction.guild.get_member(target_user_id)
         target_mention = target_user.mention if target_user else f"<@{target_user_id}>"
         target_name = target_user.display_name if target_user else "제보자"
+
+        await add_activity_log(
+            interaction.guild.id,
+            "report",
+            target_user_id,
+            target_name,
+            f"희귀 바이옴 제보 보상 +{amount:,}P 지급 (담당 관리자: {interaction.user.display_name})"
+        )
 
         # Ephemeral 응답 보내기
         await interaction.response.send_message(f"✅ {target_mention}님에게 {amount:,}포인트를 성공적으로 지급했습니다.", ephemeral=True)

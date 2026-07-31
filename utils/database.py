@@ -11,12 +11,14 @@ ECONOMY_FILE = os.path.join(DATA_DIR, "economy.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "report_settings.json")
 SHOP_FILE = os.path.join(DATA_DIR, "shop_items.json")
 GACHA_FILE = os.path.join(DATA_DIR, "gacha_settings.json")
+LOGS_FILE = os.path.join(DATA_DIR, "activity_logs.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 _lock = asyncio.Lock()
 _settings_lock = asyncio.Lock()
 _shop_lock = asyncio.Lock()
 _gacha_lock = asyncio.Lock()
+_logs_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # MongoDB setup
@@ -25,6 +27,7 @@ users_col = None
 settings_col = None
 shop_col = None
 gacha_col = None
+logs_col = None
 
 if MONGO_URI:
     try:
@@ -37,6 +40,7 @@ if MONGO_URI:
         settings_col = mongo_db["report_settings"]
         shop_col = mongo_db["shop_items"]
         gacha_col = mongo_db["gacha_settings"]
+        logs_col = mongo_db["activity_logs"]
         print("Connected to MongoDB successfully for permanent data storage!", flush=True)
     except Exception as e:
         print(f"MongoDB connection warning: {e}. Falling back to local JSON storage.", flush=True)
@@ -44,6 +48,7 @@ if MONGO_URI:
         settings_col = None
         shop_col = None
         gacha_col = None
+        logs_col = None
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -418,3 +423,70 @@ async def save_gacha_settings(guild_id: int, settings: dict) -> None:
 
         with open(GACHA_FILE, "w", encoding="utf-8") as f:
             json.dump(all_gacha, f, ensure_ascii=False, indent=2)
+
+
+# ── Activity Logs DB (per-guild) ──────────────────────────────────────
+
+async def add_activity_log(guild_id: int, log_type: str, user_id: int, user_name: str, details: str) -> None:
+    """log_type: 'shop', 'gacha', 'report'"""
+    str_gid = str(guild_id)
+    timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = {
+        "type": log_type,
+        "user_id": user_id,
+        "user_name": user_name,
+        "details": details,
+        "timestamp": timestamp
+    }
+
+    if logs_col is not None:
+        try:
+            logs_col.insert_one({"guild_id": str_gid, **log_entry})
+            return
+        except Exception as e:
+            print(f"MongoDB add_activity_log error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _logs_lock:
+        all_logs = {}
+        try:
+            if os.path.exists(LOGS_FILE):
+                with open(LOGS_FILE, "r", encoding="utf-8") as f:
+                    all_logs = json.load(f)
+        except Exception:
+            pass
+
+        if str_gid not in all_logs:
+            all_logs[str_gid] = []
+        all_logs[str_gid].insert(0, log_entry)
+        all_logs[str_gid] = all_logs[str_gid][:200]
+
+        with open(LOGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_logs, f, ensure_ascii=False, indent=2)
+
+async def get_activity_logs(guild_id: int, log_type: str = "all", limit: int = 15) -> list[dict]:
+    str_gid = str(guild_id)
+
+    if logs_col is not None:
+        try:
+            query = {"guild_id": str_gid}
+            if log_type != "all":
+                query["type"] = log_type
+            cursor = logs_col.find(query).sort("_id", -1).limit(limit)
+            return list(cursor)
+        except Exception as e:
+            print(f"MongoDB get_activity_logs error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _logs_lock:
+        try:
+            if os.path.exists(LOGS_FILE):
+                with open(LOGS_FILE, "r", encoding="utf-8") as f:
+                    all_logs = json.load(f)
+                logs = all_logs.get(str_gid, [])
+                if log_type != "all":
+                    logs = [l for l in logs if l.get("type") == log_type]
+                return logs[:limit]
+        except Exception:
+            pass
+    return []

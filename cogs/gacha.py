@@ -4,7 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 from utils.database import (
     get_gacha_settings, save_gacha_settings,
-    get_user_points, deduct_user_points, add_user_points
+    get_user_points, deduct_user_points, add_user_points, add_activity_log
 )
 
 
@@ -121,6 +121,9 @@ class GachaPlayView(discord.ui.View):
                     role_notice = f"\n⚠️ 역할 자동 지급 실패 (봇 권한/역할 순서 확인 필요: {e})"
             else:
                 role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
+
+        # 로그 기록
+        await add_activity_log(guild_id, "gacha", user_id, interaction.user.display_name, f"[{item_name}] 뽑기 당첨 (-{price:,}P)")
 
         # 결과 임베드
         embed = discord.Embed(

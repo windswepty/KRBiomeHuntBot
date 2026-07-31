@@ -9,16 +9,22 @@ load_dotenv()
 DATA_DIR = "data"
 ECONOMY_FILE = os.path.join(DATA_DIR, "economy.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "report_settings.json")
+SHOP_FILE = os.path.join(DATA_DIR, "shop_items.json")
+GACHA_FILE = os.path.join(DATA_DIR, "gacha_settings.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 _lock = asyncio.Lock()
 _settings_lock = asyncio.Lock()
+_shop_lock = asyncio.Lock()
+_gacha_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # MongoDB setup
 mongo_db = None
 users_col = None
 settings_col = None
+shop_col = None
+gacha_col = None
 
 if MONGO_URI:
     try:
@@ -29,11 +35,15 @@ if MONGO_URI:
         mongo_db = client["krbiomehuntbot"]
         users_col = mongo_db["users"]
         settings_col = mongo_db["report_settings"]
+        shop_col = mongo_db["shop_items"]
+        gacha_col = mongo_db["gacha_settings"]
         print("Connected to MongoDB successfully for permanent data storage!", flush=True)
     except Exception as e:
         print(f"MongoDB connection warning: {e}. Falling back to local JSON storage.", flush=True)
         users_col = None
         settings_col = None
+        shop_col = None
+        gacha_col = None
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -254,3 +264,157 @@ async def save_report_settings(guild_id: int, settings: dict) -> None:
 
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(all_settings, f, ensure_ascii=False, indent=2)
+
+
+async def deduct_user_points(user_id: int, amount: int) -> tuple[bool, int]:
+    """Deduct points from user if they have enough. Returns (success, new_or_current_balance)."""
+    str_id = str(user_id)
+
+    if users_col is not None:
+        try:
+            doc = users_col.find_one({"_id": str_id})
+            current_points = doc.get("points", 0) if doc else 0
+            if current_points < amount:
+                return False, current_points
+            new_points = current_points - amount
+            users_col.update_one(
+                {"_id": str_id},
+                {"$set": {"points": new_points}},
+                upsert=True
+            )
+            return True, new_points
+        except Exception as e:
+            print(f"MongoDB deduct_user_points error: {e}, using local file.", flush=True)
+
+    data = await load_data()
+    if str_id not in data:
+        data[str_id] = {"points": 0, "last_checkin": "", "chat_count": 0}
+
+    current_points = data[str_id].get("points", 0)
+    if current_points < amount:
+        return False, current_points
+
+    new_points = current_points - amount
+    data[str_id]["points"] = new_points
+    await save_data(data)
+    return True, new_points
+
+
+# ── Shop Items DB (per-guild) ─────────────────────────────────────────
+
+async def get_shop_items(guild_id: int) -> list[dict]:
+    str_gid = str(guild_id)
+
+    if shop_col is not None:
+        try:
+            doc = shop_col.find_one({"_id": str_gid})
+            if doc and "items" in doc:
+                return doc["items"]
+            return []
+        except Exception as e:
+            print(f"MongoDB get_shop_items error: {e}, using local file.", flush=True)
+
+    _ensure_data_dir()
+    async with _shop_lock:
+        try:
+            if os.path.exists(SHOP_FILE):
+                with open(SHOP_FILE, "r", encoding="utf-8") as f:
+                    all_shop = json.load(f)
+                return all_shop.get(str_gid, [])
+        except Exception:
+            pass
+    return []
+
+async def save_shop_items(guild_id: int, items: list[dict]) -> None:
+    str_gid = str(guild_id)
+
+    if shop_col is not None:
+        try:
+            shop_col.update_one(
+                {"_id": str_gid},
+                {"$set": {"items": items}},
+                upsert=True
+            )
+            return
+        except Exception as e:
+            print(f"MongoDB save_shop_items error: {e}, using local file.", flush=True)
+
+    _ensure_data_dir()
+    async with _shop_lock:
+        all_shop = {}
+        try:
+            if os.path.exists(SHOP_FILE):
+                with open(SHOP_FILE, "r", encoding="utf-8") as f:
+                    all_shop = json.load(f)
+        except Exception:
+            pass
+
+        all_shop[str_gid] = items
+        with open(SHOP_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_shop, f, ensure_ascii=False, indent=2)
+
+
+# ── Gacha Settings & Items DB (per-guild) ─────────────────────────────
+
+DEFAULT_GACHA_SETTINGS = {
+    "price": 100,
+    "items": []  # list of {"name": str, "weight": int, "reward_points": int, "description": str}
+}
+
+async def get_gacha_settings(guild_id: int) -> dict:
+    str_gid = str(guild_id)
+
+    if gacha_col is not None:
+        try:
+            doc = gacha_col.find_one({"_id": str_gid})
+            if doc:
+                res = dict(DEFAULT_GACHA_SETTINGS)
+                res.update({k: v for k, v in doc.items() if k != "_id"})
+                return res
+        except Exception as e:
+            print(f"MongoDB get_gacha_settings error: {e}, using local file.", flush=True)
+
+    _ensure_data_dir()
+    async with _gacha_lock:
+        try:
+            if os.path.exists(GACHA_FILE):
+                with open(GACHA_FILE, "r", encoding="utf-8") as f:
+                    all_gacha = json.load(f)
+                if str_gid in all_gacha:
+                    res = dict(DEFAULT_GACHA_SETTINGS)
+                    res.update(all_gacha[str_gid])
+                    return res
+        except Exception:
+            pass
+    return dict(DEFAULT_GACHA_SETTINGS)
+
+async def save_gacha_settings(guild_id: int, settings: dict) -> None:
+    str_gid = str(guild_id)
+
+    if gacha_col is not None:
+        try:
+            gacha_col.update_one(
+                {"_id": str_gid},
+                {"$set": settings},
+                upsert=True
+            )
+            return
+        except Exception as e:
+            print(f"MongoDB save_gacha_settings error: {e}, using local file.", flush=True)
+
+    _ensure_data_dir()
+    async with _gacha_lock:
+        all_gacha = {}
+        try:
+            if os.path.exists(GACHA_FILE):
+                with open(GACHA_FILE, "r", encoding="utf-8") as f:
+                    all_gacha = json.load(f)
+        except Exception:
+            pass
+
+        if str_gid not in all_gacha:
+            all_gacha[str_gid] = {}
+        all_gacha[str_gid].update(settings)
+
+        with open(GACHA_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_gacha, f, ensure_ascii=False, indent=2)

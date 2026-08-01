@@ -97,10 +97,15 @@ class SetChannelBoostModal(discord.ui.Modal, title="⚡ 채널 부스트 배율 
                 f"[{self.channel_name}] {mult:g}배 부스트 설정 ({time_str})"
             )
             earned_pts = int(round(10 * mult))
+            ts_str = ""
+            if duration_minutes > 0:
+                exp_ts = int((datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)).timestamp())
+                ts_str = f"\n⏱️ **종료 시각**: <t:{exp_ts}:R> (<t:{exp_ts}:t> 종료)"
+
             embed = discord.Embed(
                 title="⚡ 게릴라 채널 부스트 설정 완료!",
                 description=f"🎉 {channel_mention} 채널에 **{mult:g}배** 포인트 부스트가 설정되었습니다!\n\n"
-                            f"⏱️ **유지 시간**: {time_str} *(경과 시 자동 원복)*\n"
+                            f"⏱️ **유지 시간**: {time_str}{ts_str}\n"
                             f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다.",
                 color=discord.Color.green()
             )
@@ -109,7 +114,8 @@ class SetChannelBoostModal(discord.ui.Modal, title="⚡ 채널 부스트 배율 
                     announce_embed = discord.Embed(
                         title="⚡ [게릴라 이벤트] 포인트 부스트 시작!",
                         description=f"🔥 이 채널에 **{mult:g}배** 포인트 부스트 이벤트가 시작되었습니다!\n"
-                                    f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다! (유지시간: {time_str})",
+                                    f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다!\n"
+                                    f"⏱️ **이벤트 기간**: {time_str}{ts_str}",
                         color=discord.Color.gold()
                     )
                     await channel.send(embed=announce_embed)
@@ -252,12 +258,11 @@ class ChannelBoostSettingsSelect(discord.ui.Select):
                 if exp_str:
                     try:
                         exp_time = datetime.fromisoformat(exp_str)
-                        remain_sec = int((exp_time - now).total_seconds())
-                        if remain_sec > 0:
-                            mins, secs = divmod(remain_sec, 60)
-                            time_info = f"⏱️ 남은 시간: `{mins}분 {secs}초`"
+                        ts = int(exp_time.timestamp())
+                        if now > exp_time:
+                            time_info = "⏱️ 만료됨 (자동 복구됨)"
                         else:
-                            time_info = "⏱️ 만료됨"
+                            time_info = f"⏱️ 남은 시간: <t:{ts}:R> (<t:{ts}:t> 종료)"
                     except Exception:
                         time_info = "⏱️ 시간 정보 오류"
                 else:

@@ -268,6 +268,85 @@ class DeleteShopItemView(discord.ui.View):
         self.add_item(DeleteShopItemSelect(items))
 
 
+class SetShopItemStockModal(discord.ui.Modal, title="📦 상점 상품 재고 충전/수정"):
+    def __init__(self, item_id: int, current_stock: int, item_name: str):
+        super().__init__()
+        self.item_id = item_id
+        self.item_name = item_name
+
+        default_val = str(current_stock)
+        self.stock_input = discord.ui.TextInput(
+            label="새로운 재고 수량 (무제한: -1)",
+            placeholder="예: 10 (10개로 충전) 또는 -1 (무제한)",
+            default=default_val,
+            required=True,
+            max_length=10
+        )
+        self.add_item(self.stock_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_stock = int(self.stock_input.value.strip())
+            if new_stock < 0 and new_stock != -1:
+                raise ValueError()
+        except ValueError:
+            await interaction.response.send_message("⚠️ 0 이상의 수량 또는 무제한(-1)을 숫자로 입력해 주세요.", ephemeral=True)
+            return
+
+        items = await get_shop_items(interaction.guild.id)
+        target_item = next((item for item in items if item.get("id") == self.item_id), None)
+        if not target_item:
+            await interaction.response.send_message("⚠️ 대상 상품을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        target_item["stock"] = new_stock
+        await save_shop_items(interaction.guild.id, items)
+
+        stock_str = format_stock_str(new_stock)
+        embed = discord.Embed(
+            title="📦 상품 재고 수정/충전 완료",
+            description=f"**{target_item['name']}** 상품의 재고가 **`{stock_str}`**(으)로 변경/충전되었습니다.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class RefillShopItemStockSelect(discord.ui.Select):
+    def __init__(self, items: list[dict]):
+        sorted_items = sorted(items, key=lambda x: x.get("price", 0), reverse=True)
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:25]} [{format_stock_str(item.get('stock', -1))}]",
+                value=str(item["id"]),
+                description=f"현재 재고: {format_stock_str(item.get('stock', -1))} | 가격: {item['price']:,}P",
+                emoji="📦" if item.get('stock', -1) != 0 else "🚫"
+            )
+            for item in sorted_items
+        ]
+        super().__init__(placeholder="재고를 충전/수정할 상품을 선택하세요...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        item_id = int(self.values[0])
+        items = await get_shop_items(interaction.guild.id)
+        item = next((i for i in items if i.get("id") == item_id), None)
+        if not item:
+            await interaction.response.send_message("⚠️ 선택 상품 정보를 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        modal = SetShopItemStockModal(
+            item_id=item_id,
+            current_stock=item.get("stock", -1),
+            item_name=item.get("name", "상품")
+        )
+        await interaction.response.send_modal(modal)
+
+
+class RefillShopItemStockView(discord.ui.View):
+    def __init__(self, items: list[dict]):
+        super().__init__(timeout=180)
+        self.add_item(RefillShopItemStockSelect(items))
+
+
 class ShopSettingsSelect(discord.ui.Select):
     def __init__(self, current_settings: dict):
         self.current_settings = current_settings
@@ -287,6 +366,7 @@ class ShopSettingsSelect(discord.ui.Select):
                 emoji="🏷️"
             ),
             discord.SelectOption(label="상품 및 역할 추가", value="add", description="새로운 상점 상품, 가격, 지급 역할을 등록합니다.", emoji="➕"),
+            discord.SelectOption(label="상품 재고 수정/충전", value="stock", description="일부분/전부 품절된 상점 상품의 재고를 수정 및 충전합니다.", emoji="📦"),
             discord.SelectOption(label="상품 삭제", value="delete", description="등록된 상점 상품을 삭제합니다.", emoji="🗑️"),
             discord.SelectOption(label="상품 목록 확인", value="list", description="현재 등록된 상점 상품 및 재고 현황을 확인합니다.", emoji="📜"),
         ]
@@ -314,6 +394,13 @@ class ShopSettingsSelect(discord.ui.Select):
 
         elif choice == "add":
             await interaction.response.send_modal(AddShopItemModal())
+
+        elif choice == "stock":
+            items = await get_shop_items(interaction.guild.id)
+            if not items:
+                await interaction.response.send_message("⚠️ 재고를 변경/충전할 등록된 상점 상품이 없습니다.", ephemeral=True)
+                return
+            await interaction.response.send_message("📦 재고를 수정/충전할 상품을 아래 메뉴에서 선택하세요.", view=RefillShopItemStockView(items), ephemeral=True)
 
         elif choice == "delete":
             items = await get_shop_items(interaction.guild.id)

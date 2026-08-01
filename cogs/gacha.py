@@ -392,6 +392,95 @@ class DeleteGachaItemView(discord.ui.View):
         self.add_item(DeleteGachaItemSelect(items))
 
 
+class SetGachaItemStockModal(discord.ui.Modal, title="📦 뽑기 항목 재고 충전/수정"):
+    def __init__(self, item_id: int, current_stock: int, item_name: str):
+        super().__init__()
+        self.item_id = item_id
+        self.item_name = item_name
+
+        default_val = str(current_stock)
+        self.stock_input = discord.ui.TextInput(
+            label=f"새로운 재고 수량 (무제한: -1)",
+            placeholder="예: 10 (10개로 충전) 또는 -1 (무제한)",
+            default=default_val,
+            required=True,
+            max_length=10
+        )
+        self.add_item(self.stock_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_stock = int(self.stock_input.value.strip())
+            if new_stock < 0 and new_stock != -1:
+                raise ValueError()
+        except ValueError:
+            await interaction.response.send_message("⚠️ 0 이상의 수량 또는 무제한(-1)을 숫자로 입력해 주세요.", ephemeral=True)
+            return
+
+        settings = await get_gacha_settings(interaction.guild.id)
+        items = settings.get("items", [])
+
+        target_item = None
+        for item in items:
+            if item.get("id") == self.item_id:
+                item["stock"] = new_stock
+                target_item = item
+                break
+
+        if not target_item:
+            await interaction.response.send_message("⚠️ 대상 항목을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        settings["items"] = items
+        await save_gacha_settings(interaction.guild.id, settings)
+
+        stock_str = format_stock_str(new_stock)
+        embed = discord.Embed(
+            title="📦 재고 수정/충전 완료",
+            description=f"**{target_item['name']}** 항목의 재고가 **`{stock_str}`**(으)로 변경/충전되었습니다.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class RefillGachaItemStockSelect(discord.ui.Select):
+    def __init__(self, items: list[dict]):
+        sorted_items = sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0))))
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:25]} [{format_stock_str(item.get('stock', -1))}]",
+                value=str(item["id"]),
+                description=f"현재 재고: {format_stock_str(item.get('stock', -1))} | 확률: {item.get('percent', item.get('weight', 0))}%",
+                emoji="📦" if item.get('stock', -1) != 0 else "🚫"
+            )
+            for item in sorted_items
+        ]
+        super().__init__(placeholder="재고를 충전/수정할 뽑기 항목을 선택하세요...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        item_id = int(self.values[0])
+        settings = await get_gacha_settings(interaction.guild.id)
+        items = settings.get("items", [])
+        item = next((i for i in items if i.get("id") == item_id), None)
+        if not item:
+            await interaction.response.send_message("⚠️ 선택 항목 정보를 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        modal = SetGachaItemStockModal(
+            item_id=item_id,
+            current_stock=item.get("stock", -1),
+            item_name=item.get("name", "항목")
+        )
+        await interaction.response.send_modal(modal)
+
+
+class RefillGachaItemStockView(discord.ui.View):
+    def __init__(self, items: list[dict]):
+        super().__init__(timeout=180)
+        self.add_item(RefillGachaItemStockSelect(items))
+
+
+
 class GachaSettingsSelect(discord.ui.Select):
     def __init__(self, current_settings: dict):
         self.current_settings = current_settings
@@ -420,6 +509,7 @@ class GachaSettingsSelect(discord.ui.Select):
             ),
             discord.SelectOption(label="1회 뽑기 가격 설정", value="price", description="뽑기 1회에 필요한 포인트를 변경합니다.", emoji="💰"),
             discord.SelectOption(label="당첨 항목 및 역할 추가", value="add", description="새로운 당첨 항목, 확률(%), 수량, 지급 역할을 추가합니다.", emoji="➕"),
+            discord.SelectOption(label="당첨 항목 재고 수정/충전", value="stock", description="일부분/전부 품절된 뽑기 항목의 재고를 수정 및 충전합니다.", emoji="📦"),
             discord.SelectOption(label="당첨 항목 삭제", value="delete", description="등록된 뽑기 당첨 항목을 삭제합니다.", emoji="🗑️"),
             discord.SelectOption(label="전체 확률표 및 재고 확인", value="list", description="현재 등록된 항목, 역할, 총 100% 달성 여부를 확인합니다.", emoji="📊"),
         ]
@@ -459,6 +549,14 @@ class GachaSettingsSelect(discord.ui.Select):
 
         elif choice == "add":
             await interaction.response.send_modal(AddGachaItemModal())
+
+        elif choice == "stock":
+            settings = await get_gacha_settings(interaction.guild.id)
+            items = settings.get("items", [])
+            if not items:
+                await interaction.response.send_message("⚠️ 재고를 변경/충전할 등록된 뽑기 항목이 없습니다.", ephemeral=True)
+                return
+            await interaction.response.send_message("📦 재고를 수정/충전할 항목을 선택하세요.", view=RefillGachaItemStockView(items), ephemeral=True)
 
         elif choice == "delete":
             settings = await get_gacha_settings(interaction.guild.id)

@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -9,55 +9,69 @@ from utils.database import (
 )
 
 
-def parse_duration_to_minutes(duration_str: str) -> tuple[int, str]:
+def parse_duration_to_seconds(duration_str: str) -> tuple[int, str]:
     if not duration_str:
         return 0, "**무제한(직접 해제 전까지)**"
     s = str(duration_str).strip().lower()
-    if s in ["0", "0분", "0시간", "무제한", "none"]:
+    if s in ["0", "0초", "0분", "0시간", "0일", "무제한", "none"]:
         return 0, "**무제한(직접 해제 전까지)**"
 
-    # 일 단위 (예: 1d, 1일, 2일)
-    m_day = re.match(r'^(\d+)(?:d|일)$', s)
-    if m_day:
-        days = int(m_day.group(1))
-        return days * 1440, f"**{days}일간**"
+    # 1. 초 단위 (s / 초)
+    m_sec = re.match(r'^(\d+)(?:s|초|초동안)$', s)
+    if m_sec:
+        secs = int(m_sec.group(1))
+        return secs, f"**{secs}초간**"
 
-    # 시간 단위 (예: 2h, 2시간, 1시간)
+    # 2. 분 단위 (m / 분)
+    m_min = re.match(r'^(\d+)(?:m|분|분동안)$', s)
+    if m_min:
+        mins = int(m_min.group(1))
+        return mins * 60, f"**{mins}분간**"
+
+    # 3. 시간 단위 (h / 시간)
     m_hour = re.match(r'^(\d+)(?:h|시간|시간동안)$', s)
     if m_hour:
         hours = int(m_hour.group(1))
-        return hours * 60, f"**{hours}시간 동안**"
+        return hours * 3600, f"**{hours}시간 동안**"
 
-    # 분 단위 (예: 30m, 30, 30분)
-    m_min = re.match(r'^(\d+)(?:m|분|분동안)?$', s)
-    if m_min:
-        mins = int(m_min.group(1))
-        if mins == 0:
-            return 0, "**무제한(직접 해제 전까지)**"
-        return mins, f"**{mins}분간**"
+    # 4. 일 단위 (d / 일)
+    m_day = re.match(r'^(\d+)(?:d|일)$', s)
+    if m_day:
+        days = int(m_day.group(1))
+        return days * 86400, f"**{days}일간**"
+
+    # 5. 순수 숫자인 경우
+    if s.isdigit():
+        val = int(s)
+        if val < 60:
+            return val, f"**{val}초간**"
+        else:
+            mins = val // 60
+            return val, f"**{val}초간 ({mins}분)**"
 
     return 0, "**무제한(직접 해제 전까지)**"
 
 
 # ── Modals & Select Views for Channel Boost ───────────────────────────
 
-class SetChannelBoostModal(discord.ui.Modal, title="⚡ 채널 부스트 배율 및 기간 설정"):
+class SetChannelBoostModal(discord.ui.Modal):
     def __init__(self, channel_id: int, channel_name: str):
-        super().__init__()
+        title_str = f"⚡ #{channel_name[:20]} 부스트 설정"
+        super().__init__(title=title_str)
         self.channel_id = channel_id
         self.channel_name = channel_name
 
         self.multiplier_input = discord.ui.TextInput(
-            label=f"[{channel_name[:15]}] 포인트 배율",
-            placeholder="예: 2 (2배 적립) 또는 3 (3배 적립)",
+            label="포인트 배율 (기본 1.0)",
+            placeholder="예: 2 (2배 적립) 또는 3.5 (3.5배 적립)",
             default="2",
             required=True,
-            max_length=5
+            max_length=10
         )
         self.duration_input = discord.ui.TextInput(
-            label="유지 시간 (0 지정 시 무제한)",
-            placeholder="예: 30분, 1시간, 1일, 60 (0은 무제한)",
-            default="1시간",
+            label="유지 시간 (최소 10초 / 0은 무제한)",
+            placeholder="예: 10s, 30m, 1h, 2d (또는 30분, 1시간, 2일)",
+            default="30m",
             required=True,
             max_length=20
         )
@@ -66,63 +80,71 @@ class SetChannelBoostModal(discord.ui.Modal, title="⚡ 채널 부스트 배율 
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            mult = float(self.multiplier_input.value.strip())
-            if mult < 1.0:
-                raise ValueError()
-        except ValueError:
-            await interaction.response.send_message("⚠️ 배율은 1.0 이상의 숫자를 입력해 주세요.", ephemeral=True)
-            return
+            try:
+                mult = float(self.multiplier_input.value.strip())
+                if mult < 1.0:
+                    raise ValueError()
+            except ValueError:
+                await interaction.response.send_message("⚠️ 배율은 1.0 이상의 숫자를 입력해 주세요. (예: 2 또는 3.5)", ephemeral=True)
+                return
 
-        duration_str = self.duration_input.value.strip()
-        duration_minutes, time_str = parse_duration_to_minutes(duration_str)
+            duration_str = self.duration_input.value.strip()
+            duration_seconds, time_str = parse_duration_to_seconds(duration_str)
 
-        channel = interaction.guild.get_channel(self.channel_id)
-        channel_mention = channel.mention if channel else f"<#{self.channel_id}>"
+            if 0 < duration_seconds < 10:
+                await interaction.response.send_message("⚠️ 유지 시간의 최소 설정값은 **10초(10s)**입니다. (0 지정 시 무제한)", ephemeral=True)
+                return
 
-        await set_channel_boost(interaction.guild.id, self.channel_id, mult, duration_minutes)
+            channel = interaction.guild.get_channel(self.channel_id)
+            channel_mention = channel.mention if channel else f"<#{self.channel_id}>"
 
-        if mult == 1.0:
-            await add_activity_log(
-                interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-                f"[{self.channel_name}] 채널 부스트 해제"
-            )
-            embed = discord.Embed(
-                title="⚡ 채널 부스트 해제 완료",
-                description=f"{channel_mention} 채널의 부스트가 해제(기본 10P 적립)되었습니다.",
-                color=discord.Color.orange()
-            )
-        else:
-            await add_activity_log(
-                interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-                f"[{self.channel_name}] {mult:g}배 부스트 설정 ({time_str})"
-            )
-            earned_pts = int(round(10 * mult))
-            ts_str = ""
-            if duration_minutes > 0:
-                exp_ts = int((datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)).timestamp())
-                ts_str = f"\n⏱️ **종료 시각**: <t:{exp_ts}:R> (<t:{exp_ts}:t> 종료)"
+            await set_channel_boost(interaction.guild.id, self.channel_id, mult, duration_seconds)
 
-            embed = discord.Embed(
-                title="⚡ 게릴라 채널 부스트 설정 완료!",
-                description=f"🎉 {channel_mention} 채널에 **{mult:g}배** 포인트 부스트가 설정되었습니다!\n\n"
-                            f"⏱️ **유지 시간**: {time_str}{ts_str}\n"
-                            f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다.",
-                color=discord.Color.green()
-            )
-            if channel:
-                try:
-                    announce_embed = discord.Embed(
-                        title="⚡ [게릴라 이벤트] 포인트 부스트 시작!",
-                        description=f"🔥 이 채널에 **{mult:g}배** 포인트 부스트 이벤트가 시작되었습니다!\n"
-                                    f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다!\n"
-                                    f"⏱️ **이벤트 기간**: {time_str}{ts_str}",
-                        color=discord.Color.gold()
-                    )
-                    await channel.send(embed=announce_embed)
-                except Exception:
-                    pass
+            if mult == 1.0:
+                await add_activity_log(
+                    interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
+                    f"[{self.channel_name}] 채널 부스트 해제"
+                )
+                embed = discord.Embed(
+                    title="⚡ 채널 부스트 해제 완료",
+                    description=f"{channel_mention} 채널의 부스트가 해제(기본 10P 적립)되었습니다.",
+                    color=discord.Color.orange()
+                )
+            else:
+                await add_activity_log(
+                    interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
+                    f"[{self.channel_name}] {mult:g}배 부스트 설정 ({time_str})"
+                )
+                earned_pts = int(round(10 * mult))
+                ts_str = ""
+                if duration_seconds > 0:
+                    exp_ts = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+                    ts_str = f"\n⏱️ **종료 시각**: <t:{exp_ts}:R> (<t:{exp_ts}:t> 종료)"
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+                embed = discord.Embed(
+                    title="⚡ 게릴라 채널 부스트 설정 완료!",
+                    description=f"🎉 {channel_mention} 채널에 **{mult:g}배** 포인트 부스트가 설정되었습니다!\n\n"
+                                f"⏱️ **유지 시간**: {time_str}{ts_str}\n"
+                                f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다.",
+                    color=discord.Color.green()
+                )
+                if channel:
+                    try:
+                        announce_embed = discord.Embed(
+                            title="⚡ [게릴라 이벤트] 포인트 부스트 시작!",
+                            description=f"🔥 이 채널에 **{mult:g}배** 포인트 부스트 이벤트가 시작되었습니다!\n"
+                                        f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다!\n"
+                                        f"⏱️ **이벤트 기간**: {time_str}{ts_str}",
+                            color=discord.Color.gold()
+                        )
+                        await channel.send(embed=announce_embed)
+                    except Exception:
+                        pass
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            print(f"SetChannelBoostModal on_submit error: {e}", flush=True)
+            await interaction.response.send_message(f"⚠️ 부스트 설정 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
 
 
 class SelectChannelForBoostSelect(discord.ui.ChannelSelect):

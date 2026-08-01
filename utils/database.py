@@ -832,13 +832,13 @@ async def get_channel_boost(guild_id: int, channel_id: int) -> float:
     return float(boost_info.get("multiplier", 1.0))
 
 
-async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, duration_minutes: int = 0) -> None:
+async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, duration_seconds: int = 0) -> None:
     str_cid = str(channel_id)
     str_gid = str(guild_id)
 
     expires_at = None
-    if duration_minutes > 0:
-        exp_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+    if duration_seconds > 0:
+        exp_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
         expires_at = exp_time.isoformat()
 
     data_doc = {

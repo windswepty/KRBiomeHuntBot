@@ -13,6 +13,7 @@ SHOP_FILE = os.path.join(DATA_DIR, "shop_items.json")
 GACHA_FILE = os.path.join(DATA_DIR, "gacha_settings.json")
 LOGS_FILE = os.path.join(DATA_DIR, "activity_logs.json")
 BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
+BOOST_FILE = os.path.join(DATA_DIR, "channel_boosts.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 _lock = asyncio.Lock()
@@ -21,6 +22,7 @@ _shop_lock = asyncio.Lock()
 _gacha_lock = asyncio.Lock()
 _logs_lock = asyncio.Lock()
 _blacklist_lock = asyncio.Lock()
+_boost_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # MongoDB setup
@@ -31,6 +33,7 @@ shop_col = None
 gacha_col = None
 logs_col = None
 blacklist_col = None
+boost_col = None
 
 if MONGO_URI:
     try:
@@ -45,6 +48,7 @@ if MONGO_URI:
         gacha_col = mongo_db["gacha_settings"]
         logs_col = mongo_db["activity_logs"]
         blacklist_col = mongo_db["blacklist"]
+        boost_col = mongo_db["channel_boosts"]
         print("Connected to MongoDB successfully for permanent data storage!", flush=True)
     except Exception as e:
         print(f"MongoDB connection warning: {e}. Falling back to local JSON storage.", flush=True)
@@ -54,6 +58,7 @@ if MONGO_URI:
         gacha_col = None
         logs_col = None
         blacklist_col = None
+        boost_col = None
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -164,8 +169,11 @@ async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
 
     return True, user_info["points"]
 
-async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
+async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0) -> tuple[int, bool, int, float]:
+    """Returns (new_points, awarded, earned_points, boost_mult)"""
     str_key = _get_user_key(guild_id, user_id)
+    boost_mult = await get_channel_boost(guild_id, channel_id) if channel_id > 0 else 1.0
+    earned_points = max(1, int(round(10 * boost_mult)))
 
     if users_col is not None:
         try:
@@ -175,7 +183,7 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
             new_points = doc.get("points", 0)
 
             if new_count % 10 == 0:
-                new_points += 10
+                new_points += earned_points
                 awarded = True
 
             users_col.update_one(
@@ -183,7 +191,7 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
                 {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "chat_count": new_count, "points": new_points}},
                 upsert=True
             )
-            return new_points, awarded
+            return new_points, awarded, earned_points, boost_mult
         except Exception as e:
             print(f"MongoDB chat process error: {e}, using local file.", flush=True)
 
@@ -194,11 +202,11 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
 
     awarded = False
     if user_info["chat_count"] % 10 == 0:
-        user_info["points"] = user_info.get("points", 0) + 10
+        user_info["points"] = user_info.get("points", 0) + earned_points
         awarded = True
 
     await save_data(data)
-    return user_info["points"], awarded
+    return user_info["points"], awarded, earned_points, boost_mult
 
 async def get_user_points(guild_id: int, user_id: int) -> int:
     if users_col is not None:
@@ -780,3 +788,127 @@ async def get_blacklist_users(guild_id: int) -> list[dict]:
         except Exception:
             pass
     return []
+
+
+# ── Channel Boost Helper Functions ───────────────────────────────────
+
+async def get_channel_boost(guild_id: int, channel_id: int) -> float:
+    """채널의 현재 부스트 배율 반환 (없거나 만료되었으면 1.0)"""
+    if not channel_id:
+        return 1.0
+    str_cid = str(channel_id)
+    now = datetime.now(timezone.utc)
+
+    boost_info = None
+    if boost_col is not None:
+        try:
+            boost_info = boost_col.find_one({"_id": str_cid})
+        except Exception:
+            boost_info = None
+    else:
+        _ensure_data_dir()
+        async with _boost_lock:
+            try:
+                if os.path.exists(BOOST_FILE):
+                    with open(BOOST_FILE, "r", encoding="utf-8") as f:
+                        all_b = json.load(f)
+                        boost_info = all_b.get(str_cid)
+            except Exception:
+                pass
+
+    if not boost_info:
+        return 1.0
+
+    exp_str = boost_info.get("expires_at")
+    if exp_str:
+        try:
+            exp_time = datetime.fromisoformat(exp_str)
+            if now > exp_time:
+                await set_channel_boost(guild_id, channel_id, 1.0, 0)
+                return 1.0
+        except Exception:
+            pass
+
+    return float(boost_info.get("multiplier", 1.0))
+
+
+async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, duration_minutes: int = 0) -> None:
+    str_cid = str(channel_id)
+    str_gid = str(guild_id)
+
+    expires_at = None
+    if duration_minutes > 0:
+        exp_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+        expires_at = exp_time.isoformat()
+
+    data_doc = {
+        "_id": str_cid,
+        "guild_id": str_gid,
+        "channel_id": str_cid,
+        "multiplier": multiplier,
+        "expires_at": expires_at
+    }
+
+    if boost_col is not None:
+        try:
+            if multiplier <= 1.0:
+                boost_col.delete_one({"_id": str_cid})
+            else:
+                boost_col.replace_one({"_id": str_cid}, data_doc, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB set_channel_boost error: {e}", flush=True)
+
+    _ensure_data_dir()
+    async with _boost_lock:
+        all_b = {}
+        if os.path.exists(BOOST_FILE):
+            try:
+                with open(BOOST_FILE, "r", encoding="utf-8") as f:
+                    all_b = json.load(f)
+            except Exception:
+                all_b = {}
+        if multiplier <= 1.0:
+            all_b.pop(str_cid, None)
+        else:
+            all_b[str_cid] = data_doc
+        with open(BOOST_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_b, f, ensure_ascii=False, indent=2)
+
+
+async def get_all_active_boosts(guild_id: int) -> list[dict]:
+    str_gid = str(guild_id)
+    now = datetime.now(timezone.utc)
+    active = []
+
+    raw_boosts = []
+    if boost_col is not None:
+        try:
+            raw_boosts = list(boost_col.find({"guild_id": str_gid}))
+        except Exception:
+            pass
+    else:
+        _ensure_data_dir()
+        async with _boost_lock:
+            if os.path.exists(BOOST_FILE):
+                try:
+                    with open(BOOST_FILE, "r", encoding="utf-8") as f:
+                        all_b = json.load(f)
+                        raw_boosts = [v for v in all_b.values() if v.get("guild_id") == str_gid]
+                except Exception:
+                    pass
+
+    for b in raw_boosts:
+        exp_str = b.get("expires_at")
+        if exp_str:
+            try:
+                exp_time = datetime.fromisoformat(exp_str)
+                if now > exp_time:
+                    continue
+            except Exception:
+                pass
+        if float(b.get("multiplier", 1.0)) > 1.0:
+            active.append(b)
+
+    return active
+

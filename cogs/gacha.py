@@ -1,4 +1,5 @@
 import random
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -6,6 +7,14 @@ from utils.database import (
     get_gacha_settings, save_gacha_settings,
     get_user_points, deduct_user_points, add_user_points, add_activity_log
 )
+
+
+def parse_role_mentions(text: str) -> str:
+    if not text:
+        return text
+    # {@12345}, {12345}, {@&12345} 등의 패턴을 디스코드 표준 역할 멘션 <@&12345> 로 자동 변환
+    return re.sub(r'\{@?&?(\d{17,20})\}', r'<@&\1>', text)
+
 
 
 def format_stock_str(stock: int) -> str:
@@ -170,7 +179,7 @@ class GachaPlayView(discord.ui.View):
             color=discord.Color.gold()
         )
         if desc:
-            embed.add_field(name="📝 항목 설명", value=desc, inline=False)
+            embed.add_field(name="📝 항목 설명", value=parse_role_mentions(desc), inline=False)
 
         if reward_points > 0:
             embed.add_field(
@@ -665,7 +674,7 @@ class Gacha(commands.Cog):
         else:
             status_line = "✅ 현재 뽑기를 플레이하실 수 있습니다."
 
-        gacha_desc = settings.get("description", "").strip()
+        gacha_desc = parse_role_mentions(settings.get("description", "").strip())
         desc_header = f"{gacha_desc}\n\n" if gacha_desc else ""
 
         embed = discord.Embed(
@@ -708,7 +717,7 @@ class Gacha(commands.Cog):
         settings = await get_gacha_settings(interaction.guild.id)
         enabled_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
         gacha_title = settings.get("title", "한바헌 럭키 뽑기")
-        gacha_desc = settings.get("description", "").strip()
+        gacha_desc = parse_role_mentions(settings.get("description", "").strip())
         desc_text = f"**{gacha_desc}**" if gacha_desc else "*미설정*"
         price = settings.get("price", 100)
         items = settings.get("items", [])

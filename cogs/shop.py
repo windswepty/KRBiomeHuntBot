@@ -1,3 +1,4 @@
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -5,6 +6,14 @@ from utils.database import (
     get_shop_items, save_shop_items, get_shop_settings, save_shop_settings,
     get_user_points, deduct_user_points, add_activity_log
 )
+
+
+def parse_role_mentions(text: str) -> str:
+    if not text:
+        return text
+    # {@12345}, {12345}, {@&12345} 등의 패턴을 디스코드 표준 역할 멘션 <@&12345> 로 자동 변환
+    return re.sub(r'\{@?&?(\d{17,20})\}', r'<@&\1>', text)
+
 
 
 def format_stock_str(stock: int) -> str:
@@ -116,7 +125,7 @@ class ShopSelect(discord.ui.Select):
             color=discord.Color.green()
         )
         if selected_item.get("description"):
-            embed.add_field(name="📝 상품 설명", value=selected_item["description"], inline=False)
+            embed.add_field(name="📝 상품 설명", value=parse_role_mentions(selected_item["description"]), inline=False)
         shop_title = settings.get("title", "한바헌 포인트 상점")
         embed.set_footer(text=f"{shop_title} 시스템")
 
@@ -428,7 +437,7 @@ class ShopSettingsSelect(discord.ui.Select):
                 # 비싼 순으로 정렬 (내림차순)
                 sorted_items = sorted(items, key=lambda x: x.get("price", 0), reverse=True)
                 for item in sorted_items:
-                    desc = item.get('description', '설명 없음')
+                    desc = parse_role_mentions(item.get('description', '설명 없음'))
                     stock_str = format_stock_str(item.get('stock', -1))
                     role_id = item.get('reward_role_id', 0)
                     role_str = ""
@@ -495,7 +504,7 @@ class Shop(commands.Cog):
 
             info_lines = [f"• **가격**: `{item['price']:,} P` | **재고**: `{stock_str}`"]
             if item.get('description'):
-                info_lines.append(f"• **설명**: {item['description']}")
+                info_lines.append(f"• **설명**: {parse_role_mentions(item['description'])}")
             if role_id > 0:
                 role = interaction.guild.get_role(role_id)
                 role_info = role.mention if role else f"ID: {role_id}"

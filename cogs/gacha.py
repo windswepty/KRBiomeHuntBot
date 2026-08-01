@@ -162,7 +162,7 @@ class GachaPlayView(discord.ui.View):
 
         # 결과 임베드
         embed = discord.Embed(
-            title=f"🎰 {gacha_title} 결과!",
+            title=f"{gacha_title} 결과!",
             description=f"🎉 축하합니다! **[{item_name}]** 에 당첨되셨습니다!{role_notice}\n\n"
                         f"💳 **소모 포인트**: -{price:,} P\n"
                         f"💰 **현재 총 보유 포인트**: **{new_balance:,} P**\n"
@@ -188,7 +188,7 @@ class GachaPlayView(discord.ui.View):
 class SetGachaTitleModal(discord.ui.Modal, title="🏷️ 뽑기 이름/제목 변경"):
     title_input = discord.ui.TextInput(
         label="새로운 뽑기 이름/제목",
-        placeholder="예: 🎰 럭키 뽑기 파라다이스 또는 🎁 바이옴 랜덤 뽑기",
+        placeholder="예: 럭키 뽑기 파라다이스 또는 🎁 바이옴 랜덤 뽑기",
         default="한바헌 럭키 뽑기",
         required=True,
         max_length=50
@@ -542,7 +542,7 @@ class Gacha(commands.Cog):
         items = settings.get("items", [])
         user_points = await get_user_points(interaction.guild.id, interaction.user.id)
 
-        title_str = f"🎰 [비활성화 상태] {gacha_title}" if not is_enabled else f"🎰 {gacha_title}"
+        title_str = f"[비활성화 상태] {gacha_title}" if not is_enabled else gacha_title
 
         if not items:
             embed = discord.Embed(

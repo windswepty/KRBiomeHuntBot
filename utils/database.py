@@ -520,6 +520,7 @@ async def save_shop_items(guild_id: int, items: list[dict]) -> None:
 DEFAULT_GACHA_SETTINGS = {
     "enabled": True,
     "title": "한바헌 럭키 뽑기",
+    "description": "",
     "price": 100,
     "items": []
 }

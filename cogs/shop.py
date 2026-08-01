@@ -150,18 +150,21 @@ class SetShopTitleModal(discord.ui.Modal, title="🏷️ 상점 이름/제목 �
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        new_title = self.title_input.value.strip()
-        if not new_title:
-            await interaction.response.send_message("⚠️ 올바른 상점 이름을 입력해 주세요.", ephemeral=True)
-            return
+        try:
+            new_title = self.title_input.value.strip()
+            if not new_title:
+                await interaction.response.send_message("⚠️ 올바른 상점 이름을 입력해 주세요.", ephemeral=True)
+                return
 
-        await save_shop_settings(interaction.guild.id, {"title": new_title})
-        embed = discord.Embed(
-            title="🏷️ 상점 이름 변경 완료",
-            description=f"상점 이름이 **{new_title}**(으)로 변경되었습니다.",
-            color=discord.Color.green()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            await save_shop_settings(interaction.guild.id, {"title": new_title})
+            embed = discord.Embed(
+                title="🏷️ 상점 이름 변경 완료",
+                description=f"상점 이름이 **{new_title}**(으)로 변경되었습니다.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
 
 
 class AddShopItemModal(discord.ui.Modal, title="➕ 상점 상품 및 역할 추가"):

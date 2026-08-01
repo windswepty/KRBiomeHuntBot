@@ -204,21 +204,24 @@ class SetGachaTitleModal(discord.ui.Modal, title="🏷️ 뽑기 이름/제목 �
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        new_title = self.title_input.value.strip()
-        if not new_title:
-            await interaction.response.send_message("⚠️ 올바른 뽑기 이름을 입력해 주세요.", ephemeral=True)
-            return
+        try:
+            new_title = self.title_input.value.strip()
+            if not new_title:
+                await interaction.response.send_message("⚠️ 올바른 뽑기 이름을 입력해 주세요.", ephemeral=True)
+                return
 
-        settings = await get_gacha_settings(interaction.guild.id)
-        settings["title"] = new_title
-        await save_gacha_settings(interaction.guild.id, settings)
+            settings = await get_gacha_settings(interaction.guild.id)
+            settings["title"] = new_title
+            await save_gacha_settings(interaction.guild.id, settings)
 
-        embed = discord.Embed(
-            title="🏷️ 뽑기 이름 변경 완료",
-            description=f"뽑기 이름이 **{new_title}**(으)로 변경되었습니다.",
-            color=discord.Color.green()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed = discord.Embed(
+                title="🏷️ 뽑기 이름 변경 완료",
+                description=f"뽑기 이름이 **{new_title}**(으)로 변경되었습니다.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
 
 
 class SetGachaDescriptionModal(discord.ui.Modal, title="📝 뽑기 설명/안내 문구 변경"):
@@ -231,18 +234,21 @@ class SetGachaDescriptionModal(discord.ui.Modal, title="📝 뽑기 설명/안�
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        new_desc = self.desc_input.value.strip()
-        settings = await get_gacha_settings(interaction.guild.id)
-        settings["description"] = new_desc
-        await save_gacha_settings(interaction.guild.id, settings)
+        try:
+            new_desc = self.desc_input.value.strip()
+            settings = await get_gacha_settings(interaction.guild.id)
+            settings["description"] = new_desc
+            await save_gacha_settings(interaction.guild.id, settings)
 
-        desc_preview = f"**{new_desc}**" if new_desc else "*설정 안 함 (삭제됨)*"
-        embed = discord.Embed(
-            title="📝 뽑기 설명 변경 완료",
-            description=f"뽑기 설명이 성공적으로 설정/변경되었습니다.\n\n📝 **현재 설정된 설명**:\n{desc_preview}",
-            color=discord.Color.green()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            desc_preview = f"**{new_desc}**" if new_desc else "*설정 안 함 (삭제됨)*"
+            embed = discord.Embed(
+                title="📝 뽑기 설명 변경 완료",
+                description=f"뽑기 설명이 성공적으로 설정/변경되었습니다.\n\n📝 **현재 설정된 설명**:\n{desc_preview}",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
 
 
 

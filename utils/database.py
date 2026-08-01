@@ -175,7 +175,7 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
             new_points = doc.get("points", 0)
 
             if new_count % 10 == 0:
-                new_points += 5
+                new_points += 10
                 awarded = True
 
             users_col.update_one(
@@ -194,7 +194,7 @@ async def process_chat_message(guild_id: int, user_id: int) -> tuple[int, bool]:
 
     awarded = False
     if user_info["chat_count"] % 10 == 0:
-        user_info["points"] = user_info.get("points", 0) + 5
+        user_info["points"] = user_info.get("points", 0) + 10
         awarded = True
 
     await save_data(data)

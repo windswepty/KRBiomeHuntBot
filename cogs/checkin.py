@@ -42,7 +42,7 @@ class PointGuideSelect(discord.ui.Select):
         elif self.values[0] == "chat":
             embed = discord.Embed(
                 title="💬 [서버 채팅 활동으로 포인트 얻기]",
-                description="• 서버에서 텍스트 채팅 **10회**를 작성할 때마다 **+5포인트**가 자동으로 적립됩니다!\n\n"
+                description="• 서버에서 텍스트 채팅 **10회**를 작성할 때마다 **+10포인트**가 자동으로 적립됩니다!\n\n"
                             "• 하루 일일 상한선(제한) 없이 무제한으로 적립이 가능합니다.\n"
                             "• *(단, 사진/파일/스티커 및 단독 이모티콘 메시지는 카운트에서 제외됩니다)*",
                 color=discord.Color.blue()

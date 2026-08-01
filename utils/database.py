@@ -912,3 +912,52 @@ async def get_all_active_boosts(guild_id: int) -> list[dict]:
 
     return active
 
+
+async def check_and_clear_expired_boosts() -> list[dict]:
+    """만료 시간이 지난 부스트를 DB에서 자동 정리하고 만료된 항목 목록 반환"""
+    now = datetime.now(timezone.utc)
+    expired = []
+
+    if boost_col is not None:
+        try:
+            cursor = boost_col.find({"expires_at": {"$ne": None}})
+            for doc in cursor:
+                exp_str = doc.get("expires_at")
+                if exp_str:
+                    try:
+                        exp_time = datetime.fromisoformat(exp_str)
+                        if now >= exp_time:
+                            expired.append(dict(doc))
+                            boost_col.delete_one({"_id": doc["_id"]})
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"MongoDB check_and_clear_expired_boosts error: {e}", flush=True)
+    else:
+        _ensure_data_dir()
+        async with _boost_lock:
+            try:
+                if os.path.exists(BOOST_FILE):
+                    with open(BOOST_FILE, "r", encoding="utf-8") as f:
+                        all_b = json.load(f)
+                    to_remove = []
+                    for cid, b in all_b.items():
+                        exp_str = b.get("expires_at")
+                        if exp_str:
+                            try:
+                                exp_time = datetime.fromisoformat(exp_str)
+                                if now >= exp_time:
+                                    expired.append(dict(b))
+                                    to_remove.append(cid)
+                            except Exception:
+                                pass
+                    for cid in to_remove:
+                        all_b.pop(cid, None)
+                    with open(BOOST_FILE, "w", encoding="utf-8") as f:
+                        json.dump(all_b, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    return expired
+
+

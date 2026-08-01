@@ -1,11 +1,12 @@
 import re
 from datetime import datetime, timezone, timedelta
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from utils.database import (
     process_chat_message, is_user_blacklisted,
-    set_channel_boost, get_channel_boost, get_all_active_boosts, add_activity_log
+    set_channel_boost, get_channel_boost, get_all_active_boosts, add_activity_log,
+    check_and_clear_expired_boosts
 )
 
 
@@ -311,6 +312,35 @@ class ChannelBoostSettingsView(discord.ui.View):
 class ChatReward(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.check_boost_expiration.start()
+
+    def cog_unload(self):
+        self.check_boost_expiration.cancel()
+
+    @tasks.loop(seconds=5)
+    async def check_boost_expiration(self):
+        await self.bot.wait_until_ready()
+        try:
+            expired_boosts = await check_and_clear_expired_boosts()
+            for b in expired_boosts:
+                cid = int(b["channel_id"])
+                guild_id = int(b["guild_id"])
+                guild = self.bot.get_guild(guild_id)
+                if guild:
+                    channel = guild.get_channel(cid)
+                    if channel:
+                        try:
+                            embed = discord.Embed(
+                                title="⚡ [게릴라 이벤트] 포인트 부스트 이벤트 종료!",
+                                description="🎉 준비된 게릴라 포인트 부스트 이벤트 시간이 완료되어 종료되었습니다!\n\n"
+                                            "💬 이제 채팅 10회당 기본 적립 보상(**+10P**)으로 정상 복구됩니다. 참여해 주신 분들 모두 감사드립니다! 🙏",
+                                color=discord.Color.orange()
+                            )
+                            await channel.send(embed=embed)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"check_boost_expiration loop error: {e}", flush=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

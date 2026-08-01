@@ -333,7 +333,7 @@ class ChatReward(commands.Cog):
                             embed = discord.Embed(
                                 title="⚡ [게릴라 이벤트] 포인트 부스트 이벤트 종료!",
                                 description="🎉 준비된 게릴라 포인트 부스트 이벤트 시간이 완료되어 종료되었습니다!\n\n"
-                                            "💬 이제 채팅 10회당 기본 적립 보상(**+10P**)으로 정상 복구됩니다. 참여해 주신 분들 모두 감사드립니다! 🙏",
+                                            "💬 이제 채팅 10회당 기본 적립 보상(**+10P**)으로 정상 복구됩니다.",
                                 color=discord.Color.orange()
                             )
                             await channel.send(embed=embed)

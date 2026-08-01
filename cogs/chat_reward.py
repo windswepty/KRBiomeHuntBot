@@ -348,19 +348,9 @@ class ChatReward(commands.Cog):
             return
 
         # Process message for chat points (with channel boost support)
-        new_pts, awarded, earned_pts, boost_mult = await process_chat_message(
+        await process_chat_message(
             message.guild.id, message.author.id, message.channel.id
         )
-
-        if awarded and boost_mult > 1.0:
-            try:
-                # 게릴라 부스트 적립 안내 (5초 후 자동 삭제)
-                await message.channel.send(
-                    f"⚡ {message.author.mention} 님! **채널 부스트 이벤트** 혜택으로 10회 채팅 적립 포인트 **{boost_mult:g}배 (+{earned_pts}P)**를 획득하셨습니다!",
-                    delete_after=5
-                )
-            except Exception:
-                pass
 
     @app_commands.command(name="채널부스트", description="[관리자 전용] 게릴라 채널 부스트 설정, 배율, 기간 및 해제를 관리합니다.")
     @app_commands.default_permissions(administrator=True)

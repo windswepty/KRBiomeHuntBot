@@ -104,6 +104,42 @@ def collect_guarded_channels(guild: discord.Guild, settings: dict) -> list:
     return list(seen.values())
 
 
+def extract_component_links(message) -> list[str]:
+    """메시지에 붙은 링크 버튼에서 URL을 뽑아냅니다.
+
+    일부 매크로 웹훅(예: MultiScope)은 링크를 임베드 본문이 아니라
+    **[Join Server] 같은 링크 버튼**에 담아 보냅니다. 본문만 검사하면
+    이런 메시지가 무방비로 통과하므로 컴포넌트도 함께 훑습니다.
+
+    디스코드 컴포넌트는 중첩될 수 있어 재귀적으로 탐색합니다.
+    """
+    found: list[str] = []
+
+    def walk(node, depth: int = 0):
+        if node is None or depth > 6:
+            return
+        url = getattr(node, "url", None)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            found.append(clean_url(url))
+        for attr in ("children", "items", "components"):
+            sub = getattr(node, attr, None)
+            if not sub:
+                continue
+            try:
+                for child in sub:
+                    walk(child, depth + 1)
+            except TypeError:
+                continue
+
+    try:
+        for row in getattr(message, "components", None) or []:
+            walk(row)
+    except Exception as e:
+        print(f"[LinkGuard] 컴포넌트 링크 추출 오류: {e}", flush=True)
+
+    return list(dict.fromkeys(found))
+
+
 def link_key(url: str) -> str:
     """링크를 식별하는 키를 만듭니다.
 
@@ -994,10 +1030,8 @@ class LinkGuard(commands.Cog):
         if not is_guarded_channel(message.channel, settings):
             return
 
-        # 3. 임베드가 있어야 처리
-        if not message.embeds:
-            return
-
+        # 3. 링크가 들어올 수 있는 세 곳을 모두 훑습니다.
+        #    ① 임베드 본문  ② 메시지 본문  ③ 링크 버튼 (예: MultiScope의 [Join Server])
         locked_text = settings.get("locked_text", "🔒 인증된 유저만 입장할 수 있습니다")
 
         sanitized_embeds: list[discord.Embed] = []
@@ -1007,9 +1041,13 @@ class LinkGuard(commands.Cog):
             sanitized_embeds.append(clean)
             all_links.extend(links)
 
-        # 본문(content)에 있는 링크도 함께 처리
+        # 본문(content)에 있는 링크
         clean_content, content_links = strip_links(message.content or "", locked_text)
         all_links.extend(content_links)
+
+        # 링크 버튼(컴포넌트)에 담긴 링크 — 원본 버튼은 재게시하지 않으므로 함께 사라집니다
+        button_links = extract_component_links(message)
+        all_links.extend(button_links)
 
         all_links = list(dict.fromkeys(all_links))
         if not all_links:

@@ -104,6 +104,17 @@ def collect_guarded_channels(guild: discord.Guild, settings: dict) -> list:
     return list(seen.values())
 
 
+def sort_links_by_priority(links: list[str]) -> list[str]:
+    """개인서버 링크를 맨 앞으로 보냅니다 (버튼과 로그의 대표 링크가 되도록)."""
+    def rank(u: str) -> int:
+        if is_roblox_private_server(u):
+            return 0
+        if is_roblox_link(u):
+            return 1
+        return 2
+    return sorted(links, key=rank)
+
+
 def extract_component_links(message) -> list[str]:
     """메시지에 붙은 링크 버튼에서 URL을 뽑아냅니다.
 
@@ -195,58 +206,79 @@ def describe_roblox_link(url: str) -> str:
     return f"🔗 `{host[:60]}`" if host else "🔗 링크"
 
 
-def strip_links(text: str, locked_text: str) -> tuple[str, list[str]]:
-    """텍스트에서 링크를 뽑아내고, 그 자리를 잠금 문구로 치환합니다."""
+def strip_links(text: str, locked_text: str, only_roblox: bool = True) -> tuple[str, list[str]]:
+    """텍스트에서 링크를 뽑아내고, 그 자리를 잠금 문구로 치환합니다.
+
+    only_roblox=True 면 **로블록스 링크만** 보호 대상으로 삼습니다.
+    매크로 임베드에는 제작자 홍보 사이트 같은 링크가 함께 들어있는 경우가 많은데,
+    그런 링크까지 감추면 정작 버튼이 엉뚱한 주소로 연결됩니다.
+    """
     if not text:
         return text, []
 
     found: list[str] = []
 
     def _md_sub(match: re.Match) -> str:
-        found.append(clean_url(match.group(2)))
+        url = clean_url(match.group(2))
+        if only_roblox and not is_roblox_link(url):
+            return match.group(0)          # 보호 대상이 아니면 원문 그대로 둡니다
+        found.append(url)
         return f"{match.group(1)} `{locked_text}`"
 
     result = MD_LINK_RE.sub(_md_sub, text)
 
     def _url_sub(match: re.Match) -> str:
-        found.append(clean_url(match.group(0)))
+        url = clean_url(match.group(0))
+        if only_roblox and not is_roblox_link(url):
+            return match.group(0)
+        found.append(url)
         return f"`{locked_text}`"
 
     result = URL_RE.sub(_url_sub, result)
     return result, found
 
 
-def sanitize_embed(embed: discord.Embed, locked_text: str) -> tuple[discord.Embed, list[str]]:
+def sanitize_embed(embed: discord.Embed, locked_text: str,
+                   only_roblox: bool = True) -> tuple[discord.Embed, list[str]]:
     """임베드에서 링크를 제거한 사본과, 추출된 링크 목록을 반환합니다.
 
     이미지/썸네일/아이콘 URL은 실제 열람 대상이 아니므로 건드리지 않습니다.
+    only_roblox=True 면 로블록스 링크만 보호하고, 제작자 홍보 링크 등은 그대로 둡니다.
     """
     data = embed.to_dict()
     links: list[str] = []
 
+    def _takes(url: str) -> bool:
+        return bool(url) and (not only_roblox or is_roblox_link(url))
+
     # 제목의 하이퍼링크 제거 (title 클릭이 불가능해집니다)
-    if data.get("url"):
-        links.append(clean_url(data.pop("url")))
+    title_url = clean_url(data.get("url") or "")
+    if _takes(title_url):
+        links.append(title_url)
+        data.pop("url", None)
 
     if data.get("title"):
-        data["title"], found = strip_links(data["title"], locked_text)
+        data["title"], found = strip_links(data["title"], locked_text, only_roblox)
         links.extend(found)
 
     if data.get("description"):
-        data["description"], found = strip_links(data["description"], locked_text)
+        data["description"], found = strip_links(data["description"], locked_text, only_roblox)
         links.extend(found)
 
     for field in data.get("fields", []):
         if field.get("value"):
-            field["value"], found = strip_links(field["value"], locked_text)
+            field["value"], found = strip_links(field["value"], locked_text, only_roblox)
             links.extend(found)
         if field.get("name"):
-            field["name"], found = strip_links(field["name"], locked_text)
+            field["name"], found = strip_links(field["name"], locked_text, only_roblox)
             links.extend(found)
 
     author = data.get("author")
-    if isinstance(author, dict) and author.get("url"):
-        links.append(clean_url(author.pop("url")))
+    if isinstance(author, dict):
+        author_url = clean_url(author.get("url") or "")
+        if _takes(author_url):
+            links.append(author_url)
+            author.pop("url", None)
 
     # 중복 제거 (순서 유지)
     unique_links = list(dict.fromkeys(links))
@@ -1002,6 +1034,12 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="🔍"
             ),
             discord.SelectOption(
+                label="로블록스 링크만 보호 (권장)",
+                value="robloxonly",
+                description="제작자 홍보 링크 등 로블록스가 아닌 링크는 건드리지 않습니다.",
+                emoji="🎮"
+            ),
+            discord.SelectOption(
                 label="워터마크 / 자동삭제 설정",
                 value="protect",
                 description="유출자 추적 표식과 유출 메시지 자동 삭제를 켜고 끕니다.",
@@ -1083,6 +1121,23 @@ class GuardSettingsSelect(discord.ui.Select):
                 view=RemoveGuardChannelView(channel_ids, guild),
                 ephemeral=True
             )
+
+        elif choice == "robloxonly":
+            new_state = not settings.get("roblox_only", True)
+            await save_linkguard_settings(guild.id, {"roblox_only": new_state})
+            embed = discord.Embed(
+                title="🎮 보호 대상 범위 변경",
+                description=f"로블록스 링크 전용 모드가 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.\n\n"
+                            + ("**켜짐**: 로블록스 링크만 보호합니다.\n"
+                               "매크로 제작자의 홍보 사이트 링크 등은 그대로 두므로,\n"
+                               "버튼이 엉뚱한 주소로 연결되지 않습니다.\n"
+                               "로블록스 링크가 하나도 없는 메시지는 아예 건드리지 않습니다."
+                               if new_state else
+                               "**꺼짐**: 메시지 안의 **모든 링크**를 보호합니다.\n"
+                               "⚠️ 매크로 홍보 링크까지 버튼에 섞여 들어갈 수 있습니다."),
+                color=discord.Color.green() if new_state else discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
         elif choice == "trace":
             await interaction.response.send_modal(WatermarkLookupModal())
@@ -1294,25 +1349,29 @@ class LinkGuard(commands.Cog):
         # 3. 링크가 들어올 수 있는 세 곳을 모두 훑습니다.
         #    ① 임베드 본문  ② 메시지 본문  ③ 링크 버튼 (예: MultiScope의 [Join Server])
         locked_text = settings.get("locked_text", "🔒 인증된 유저만 입장할 수 있습니다")
+        only_roblox = settings.get("roblox_only", True)
 
         sanitized_embeds: list[discord.Embed] = []
         all_links: list[str] = []
         for embed in message.embeds:
-            clean, links = sanitize_embed(embed, locked_text)
+            clean, links = sanitize_embed(embed, locked_text, only_roblox)
             sanitized_embeds.append(clean)
             all_links.extend(links)
 
         # 본문(content)에 있는 링크
-        clean_content, content_links = strip_links(message.content or "", locked_text)
+        clean_content, content_links = strip_links(message.content or "", locked_text, only_roblox)
         all_links.extend(content_links)
 
         # 링크 버튼(컴포넌트)에 담긴 링크 — 원본 버튼은 재게시하지 않으므로 함께 사라집니다
         button_links = extract_component_links(message)
+        if only_roblox:
+            button_links = [u for u in button_links if is_roblox_link(u)]
         all_links.extend(button_links)
 
-        all_links = list(dict.fromkeys(all_links))
+        all_links = sort_links_by_priority(list(dict.fromkeys(all_links)))
         if not all_links:
-            # 보호할 링크가 없으면 원본을 그대로 둡니다
+            # 보호할 링크가 없으면 원본을 그대로 둡니다.
+            # (로블록스 전용 모드에서는 제작자 홍보 링크만 있는 메시지가 여기에 해당합니다)
             return
 
         me = guild.me

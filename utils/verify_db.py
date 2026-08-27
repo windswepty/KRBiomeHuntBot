@@ -166,6 +166,9 @@ DEFAULT_LINKGUARD_SETTINGS = {
     "watermark": True,
     # 서버 안에서 보호 링크가 유출되면 그 메시지를 자동 삭제
     "auto_delete_leak": True,
+    # 로블록스 링크만 보호 대상으로 삼습니다.
+    # 매크로 임베드에 함께 들어있는 제작자 홍보 링크 등을 잘못 가로채지 않도록 하는 안전장치입니다.
+    "roblox_only": True,
 }
 
 

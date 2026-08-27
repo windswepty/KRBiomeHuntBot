@@ -1065,33 +1065,99 @@ class LogChannelSelect(discord.ui.ChannelSelect):
             return
 
         await save_linkguard_settings(interaction.guild.id, {"log_channel_id": channel.id})
-
-        me = interaction.guild.me
-        can_send = channel.permissions_for(me).send_messages if me else False
-
-        embed = discord.Embed(
-            title="✅ 로그 채널 설정 완료",
-            description=f"앞으로 다음 기록이 {channel.mention} 채널로 전송됩니다.\n\n"
-                        "• 🛡️ **새 링크 보호 시작** — 링크마다 임베드 1개\n"
-                        "  └ 👥 사용 인원이 이 임베드에 누적 표시됩니다\n"
-                        "  └ **[👥 링크 사용 유저]** 버튼으로 사용자 명단 확인\n"
-                        "• 🚨 **링크 유출 감지** — 게시자 · 원 수령자 · 조치 결과\n\n"
-                        "-# 클릭할 때마다 메시지를 보내지 않으므로 채널이 도배되지 않습니다.",
-            color=discord.Color.green() if can_send else discord.Color.orange()
+        await interaction.response.send_message(
+            embed=build_log_channel_embed(interaction.guild, channel), ephemeral=True
         )
-        if not can_send:
-            embed.add_field(
-                name="⚠️ 권한 경고",
-                value=f"봇이 {channel.mention} 채널에 메시지를 보낼 권한이 없습니다. 채널 권한을 확인해 주세요.",
-                inline=False
+
+
+def build_log_channel_embed(guild: discord.Guild, channel) -> discord.Embed:
+    """로그 채널 설정 완료 임베드 (권한 경고 포함)."""
+    me = guild.me
+    perms = channel.permissions_for(me) if me else None
+    can_send = perms.send_messages if perms else False
+    can_embed = perms.embed_links if perms else False
+    can_view = perms.view_channel if perms else False
+
+    embed = discord.Embed(
+        title="✅ 로그 채널 설정 완료",
+        description=f"앞으로 다음 기록이 {channel.mention} 채널로 전송됩니다.\n\n"
+                    "• 🛡️ **새 링크 보호 시작** — 링크마다 임베드 1개\n"
+                    "  └ 👥 사용 인원이 이 임베드에 누적 표시됩니다\n"
+                    "  └ **[👥 링크 사용 유저]** 버튼으로 사용자 명단 확인\n"
+                    "• 🚨 **링크 유출 감지** — 게시자 · 원 수령자 · 조치 결과\n\n"
+                    "-# 클릭할 때마다 메시지를 보내지 않으므로 채널이 도배되지 않습니다.",
+        color=discord.Color.green() if (can_send and can_embed and can_view)
+        else discord.Color.orange()
+    )
+
+    missing = []
+    if not can_view:
+        missing.append("채널 보기")
+    if not can_send:
+        missing.append("메시지 보내기")
+    if not can_embed:
+        missing.append("링크 첨부")
+    if missing:
+        embed.add_field(
+            name="⚠️ 권한 부족",
+            value=f"봇에게 {channel.mention} 채널의 `{' · '.join(missing)}` 권한이 없습니다.\n"
+                  "이대로면 로그가 전송되지 않습니다. 채널 권한을 확인해 주세요.",
+            inline=False
+        )
+    else:
+        embed.add_field(name="🔑 권한 점검", value="✅ 정상적으로 전송할 수 있습니다.", inline=False)
+    return embed
+
+
+class LogChannelIdModal(discord.ui.Modal, title="🆔 로그 채널 ID로 설정"):
+    channel_input = discord.ui.TextInput(
+        label="로그 채널의 ID를 입력하세요",
+        placeholder="예: 1329788098187624500  (채널 우클릭 → ID 복사)",
+        required=True,
+        max_length=50
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        match = re.search(r'\d{17,20}', self.channel_input.value)
+        if not match:
+            await interaction.response.send_message(
+                "⚠️ 올바른 채널 ID를 찾지 못했습니다.\n"
+                "-# 디스코드 설정 → 고급 → 개발자 모드를 켠 뒤, 채널 우클릭 → `ID 복사`",
+                ephemeral=True
             )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        channel = guild.get_channel(int(match.group(0)))
+        if channel is None:
+            await interaction.response.send_message(
+                "⚠️ 이 서버에서 해당 ID의 채널을 찾을 수 없습니다.\n"
+                "-# 봇이 볼 수 없는 비공개 채널이면 채널 권한에 봇 역할을 추가해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "⚠️ 텍스트 채널만 로그 채널로 지정할 수 있습니다.",
+                ephemeral=True
+            )
+            return
+
+        await save_linkguard_settings(guild.id, {"log_channel_id": channel.id})
+        await interaction.response.send_message(
+            embed=build_log_channel_embed(guild, channel), ephemeral=True
+        )
 
 
 class LogChannelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
         self.add_item(LogChannelSelect())
+
+    @discord.ui.button(label="채널 ID로 입력", style=discord.ButtonStyle.secondary, emoji="🆔", row=1)
+    async def by_id_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LogChannelIdModal())
 
 
 class AutoDeleteToggleView(discord.ui.View):
@@ -1305,9 +1371,13 @@ class GuardSettingsSelect(discord.ui.Select):
             await interaction.response.send_modal(GuardTextModal(settings))
 
         elif choice == "logchannel":
+            current_id = settings.get("log_channel_id")
+            current = guild.get_channel(int(current_id)) if current_id else None
             await interaction.response.send_message(
-                "📋 **열람 · 유출 기록을 보낼 채널을 선택하세요.**\n"
-                "-# 관리자만 볼 수 있는 채널로 지정하시길 권장합니다.",
+                f"📋 **열람 · 유출 기록을 보낼 채널을 선택하세요.**\n"
+                f"-# 현재 설정: {current.mention if current else '미설정'}\n"
+                "-# 관리자만 볼 수 있는 채널로 지정하시길 권장합니다.\n"
+                "-# 목록에 안 보이는 비공개 채널은 아래 **[🆔 채널 ID로 입력]** 을 쓰세요.",
                 view=LogChannelView(),
                 ephemeral=True
             )

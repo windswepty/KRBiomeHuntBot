@@ -324,6 +324,17 @@ class ProtectedLinkView(discord.ui.View):
         settings = await get_linkguard_settings(guild.id)
         member = interaction.user
 
+        # 1-2) 로블록스 전용 모드인데 저장된 링크에 로블록스 링크가 하나도 없다면,
+        #      수정 이전에 잘못 보호된 메시지입니다 (매크로 홍보 링크 등).
+        #      유저를 엉뚱한 주소로 보내지 않고 여기서 막습니다.
+        if settings.get("roblox_only", True) and not any(is_roblox_link(u) for u in links):
+            await interaction.response.send_message(
+                "⚠️ **이 알림은 더 이상 유효하지 않습니다.**\n"
+                "개인서버 링크가 아닌 안내 메시지였습니다. 최신 알림을 이용해 주세요.",
+                ephemeral=True
+            )
+            return
+
         # 2) 시스템이 꺼져 있으면 게이트를 열어 둡니다.
         #    `/인증시스템` 비상 정지 시 "기능이 없던 상태"와 같아야 하므로,
         #    이미 게시된 보호 메시지도 누구나 링크를 받을 수 있어야 합니다.

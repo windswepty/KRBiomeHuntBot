@@ -1,0 +1,494 @@
+"""
+서버 인증 시스템 (독립 모듈).
+
+포인트/상점/뽑기/제보 시스템과 전혀 연동되지 않습니다.
+인증 통과 시 지정된 역할만 부여하며, 활동 로그에도 기록하지 않습니다.
+"""
+
+import re
+import discord
+from discord.ext import commands
+from discord import app_commands
+from utils.verify_db import (
+    get_verify_settings, save_verify_settings,
+    get_linkguard_settings, save_linkguard_settings,
+)
+
+# 봇 재시작 후에도 버튼이 살아있도록 고정 custom_id 사용
+VERIFY_BUTTON_ID = "hbh_verify_panel:click"
+
+
+def parse_role_id(raw_input: str) -> int | None:
+    """원시 입력에서 역할 ID를 추출합니다 (숫자 ID 또는 역할 멘션 지원)."""
+    if not raw_input:
+        return None
+    match = re.search(r'\d{17,20}', raw_input.strip())
+    if match:
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return None
+    return None
+
+
+async def is_verified(guild: discord.Guild, member: discord.Member) -> bool:
+    """멤버가 인증 역할을 보유하고 있는지 확인합니다."""
+    if member is None:
+        return False
+    settings = await get_verify_settings(guild.id)
+    role_id = settings.get("role_id")
+    if not role_id:
+        return False
+    return any(r.id == int(role_id) for r in getattr(member, "roles", []))
+
+
+# ── 인증 패널 (영구 View) ─────────────────────────────────────────────
+
+class VerifyPanelView(discord.ui.View):
+    def __init__(self, button_label: str = "인증하기"):
+        super().__init__(timeout=None)
+        self.verify_btn.label = button_label
+
+    @discord.ui.button(label="인증하기", style=discord.ButtonStyle.success, emoji="✅", custom_id=VERIFY_BUTTON_ID)
+    async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        settings = await get_verify_settings(guild.id)
+
+        if not settings.get("enabled", True):
+            await interaction.response.send_message(
+                "⚠️ 현재 인증 시스템이 비활성화되어 있습니다. 관리자에게 문의해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        role_id = settings.get("role_id")
+        if not role_id:
+            await interaction.response.send_message(
+                "⚠️ 인증 역할이 아직 설정되지 않았습니다. 관리자에게 `/인증설정`으로 역할을 지정해 달라고 요청해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        role = guild.get_role(int(role_id))
+        if role is None:
+            await interaction.response.send_message(
+                "⚠️ 설정된 인증 역할을 서버에서 찾을 수 없습니다. 관리자에게 문의해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        member = interaction.user
+        if any(r.id == role.id for r in member.roles):
+            await interaction.response.send_message(
+                f"ℹ️ 이미 인증이 완료된 상태입니다! (보유 역할: {role.mention})",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await member.add_roles(role, reason="서버 인증 버튼 통과")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "⚠️ 봇에게 역할을 부여할 권한이 없습니다.\n"
+                "서버 설정에서 **봇의 역할이 인증 역할보다 위에 있는지**, "
+                "그리고 **역할 관리 권한**이 있는지 확인해 주세요.",
+                ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ 인증 처리 중 오류가 발생했습니다: {e}", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="✅ 인증이 완료되었습니다!",
+            description=f"{member.mention} 님에게 {role.mention} 역할이 부여되었습니다.\n\n"
+                        "이제 보호된 링크를 정상적으로 열람하실 수 있습니다.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── 관리자 설정 UI ────────────────────────────────────────────────────
+
+class VerifyRoleModal(discord.ui.Modal, title="🎭 인증 역할 설정"):
+    role_input = discord.ui.TextInput(
+        label="인증 통과 시 부여할 역할의 ID를 입력해 주세요!",
+        placeholder="예: 1329788098187624500",
+        required=True,
+        max_length=50
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        role_id = parse_role_id(self.role_input.value)
+        if not role_id:
+            await interaction.response.send_message("⚠️ 올바른 역할 ID 숫자를 입력해 주세요.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(role_id)
+        if role is None:
+            await interaction.response.send_message(
+                "⚠️ 해당 ID의 역할을 이 서버에서 찾을 수 없습니다. ID를 다시 확인해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        await save_verify_settings(interaction.guild.id, {"role_id": role_id})
+
+        warn = ""
+        me = interaction.guild.me
+        if me and role >= me.top_role:
+            warn = ("\n\n⚠️ **주의**: 이 역할이 봇의 역할보다 위에 있어 부여에 실패할 수 있습니다.\n"
+                    "서버 설정 → 역할에서 **봇 역할을 인증 역할보다 위로** 올려 주세요.")
+
+        embed = discord.Embed(
+            title="✅ 인증 역할 설정 완료",
+            description=f"인증 통과 시 {role.mention} 역할이 부여됩니다.{warn}",
+            color=discord.Color.green() if not warn else discord.Color.orange()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class VerifyTextModal(discord.ui.Modal, title="📝 인증 패널 문구 설정"):
+    def __init__(self, current: dict):
+        super().__init__()
+        self.title_input = discord.ui.TextInput(
+            label="인증 패널 제목",
+            default=current.get("title", "✅ 서버 인증"),
+            required=True,
+            max_length=100
+        )
+        self.desc_input = discord.ui.TextInput(
+            label="인증 패널 안내 문구",
+            style=discord.TextStyle.paragraph,
+            default=current.get("description", ""),
+            required=True,
+            max_length=1000
+        )
+        self.label_input = discord.ui.TextInput(
+            label="인증 버튼에 표시할 문구",
+            default=current.get("button_label", "인증하기"),
+            required=True,
+            max_length=40
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.desc_input)
+        self.add_item(self.label_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await save_verify_settings(interaction.guild.id, {
+            "title": self.title_input.value.strip(),
+            "description": self.desc_input.value.strip(),
+            "button_label": self.label_input.value.strip(),
+        })
+        embed = discord.Embed(
+            title="✅ 인증 패널 문구 저장 완료",
+            description="변경된 문구는 **새로 전송하는 인증 패널**부터 적용됩니다.\n"
+                        "`/인증설정` → **인증 패널 전송**으로 다시 보내 주세요.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class PanelChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="인증 패널을 전송할 채널을 선택하세요...",
+            channel_types=[discord.ChannelType.text]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = interaction.guild.get_channel(self.values[0].id)
+        if channel is None:
+            await interaction.response.send_message("⚠️ 채널을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        settings = await get_verify_settings(interaction.guild.id)
+
+        embed = discord.Embed(
+            title=settings.get("title", "✅ 서버 인증"),
+            description=settings.get("description", ""),
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="한바헌 서버 인증 시스템")
+
+        view = VerifyPanelView(button_label=settings.get("button_label", "인증하기"))
+
+        try:
+            await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"⚠️ {channel.mention} 채널에 메시지를 보낼 권한이 없습니다.",
+                ephemeral=True
+            )
+            return
+
+        await save_verify_settings(interaction.guild.id, {"panel_channel_id": channel.id})
+        await interaction.response.send_message(
+            f"✅ {channel.mention} 채널에 인증 패널을 전송했습니다.",
+            ephemeral=True
+        )
+
+
+class PanelChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(PanelChannelSelect())
+
+
+class VerifySettingsSelect(discord.ui.Select):
+    def __init__(self, current: dict, guild: discord.Guild):
+        role_id = current.get("role_id")
+        role = guild.get_role(int(role_id)) if role_id else None
+        role_desc = f"현재: @{role.name}" if role else "아직 설정되지 않았습니다"
+        enabled_desc = "현재: ✅ 활성화" if current.get("enabled", True) else "현재: ❌ 비활성화"
+
+        options = [
+            discord.SelectOption(
+                label="시스템 활성화 / 비활성화",
+                value="toggle",
+                description=enabled_desc,
+                emoji="⚡"
+            ),
+            discord.SelectOption(
+                label="인증 역할 설정",
+                value="role",
+                description=role_desc[:95],
+                emoji="🎭"
+            ),
+            discord.SelectOption(
+                label="인증 패널 전송",
+                value="panel",
+                description="선택한 채널에 인증 버튼 임베드를 전송합니다.",
+                emoji="📨"
+            ),
+            discord.SelectOption(
+                label="인증 패널 문구 수정",
+                value="text",
+                description="패널 제목, 안내 문구, 버튼 문구를 변경합니다.",
+                emoji="📝"
+            ),
+            discord.SelectOption(
+                label="현재 설정 확인",
+                value="status",
+                description="인증 역할, 패널 채널, 권한 상태를 점검합니다.",
+                emoji="📊"
+            ),
+        ]
+        super().__init__(placeholder="인증 관리 기능을 선택하세요...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        guild = interaction.guild
+        settings = await get_verify_settings(guild.id)
+
+        if choice == "toggle":
+            new_state = not settings.get("enabled", True)
+            await save_verify_settings(guild.id, {"enabled": new_state})
+            state_text = "✅ 활성화" if new_state else "❌ 비활성화"
+            embed = discord.Embed(
+                title="⚡ 인증 시스템 상태 변경",
+                description=f"인증 시스템이 **{state_text}** 상태로 변경되었습니다.",
+                color=discord.Color.green() if new_state else discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif choice == "role":
+            await interaction.response.send_modal(VerifyRoleModal())
+
+        elif choice == "panel":
+            await interaction.response.send_message(
+                "📨 **인증 패널을 전송할 채널을 선택하세요.**",
+                view=PanelChannelView(),
+                ephemeral=True
+            )
+
+        elif choice == "text":
+            await interaction.response.send_modal(VerifyTextModal(settings))
+
+        elif choice == "status":
+            role_id = settings.get("role_id")
+            role = guild.get_role(int(role_id)) if role_id else None
+            panel_id = settings.get("panel_channel_id")
+            panel = guild.get_channel(int(panel_id)) if panel_id else None
+
+            embed = discord.Embed(
+                title="📊 인증 시스템 현재 설정",
+                color=discord.Color.blurple()
+            )
+            embed.add_field(
+                name="⚡ 시스템 상태",
+                value="✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화",
+                inline=False
+            )
+            embed.add_field(
+                name="🎭 인증 역할",
+                value=role.mention if role else "⚠️ 미설정 (인증이 동작하지 않습니다)",
+                inline=False
+            )
+            embed.add_field(
+                name="📨 최근 패널 전송 채널",
+                value=panel.mention if panel else "아직 전송한 적이 없습니다",
+                inline=False
+            )
+
+            me = guild.me
+            perm_lines = []
+            if me:
+                mark = "✅" if me.guild_permissions.manage_roles else "❌"
+                perm_lines.append(f"{mark} 역할 관리 권한")
+                if role:
+                    mark2 = "✅" if role < me.top_role else "❌"
+                    perm_lines.append(f"{mark2} 봇 역할이 인증 역할보다 위에 있음")
+            embed.add_field(
+                name="🔑 봇 권한 점검",
+                value="\n".join(perm_lines) if perm_lines else "확인 불가",
+                inline=False
+            )
+            embed.set_footer(text="한바헌 서버 인증 시스템")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class VerifySettingsView(discord.ui.View):
+    def __init__(self, current: dict, guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.add_item(VerifySettingsSelect(current, guild))
+
+
+# ── 시스템 전원 스위치 ────────────────────────────────────────────────
+#
+# 인증 · 링크 보호를 즉시 켜고 끄는 비상 스위치입니다.
+# 끄면 봇은 웹훅 임베드를 건드리지 않고 인증 버튼도 응답하지 않아,
+# 기능이 아예 없는 상태와 동일하게 동작합니다.
+
+def build_power_embed(verify_settings: dict, guard_settings: dict, guild: discord.Guild) -> discord.Embed:
+    v_on = verify_settings.get("enabled", True)
+    g_on = guard_settings.get("enabled", True)
+
+    if v_on and g_on:
+        state, color = "🟢 전체 가동 중", discord.Color.green()
+    elif not v_on and not g_on:
+        state, color = "🔴 전체 정지됨", discord.Color.red()
+    else:
+        state, color = "🟡 일부만 가동 중", discord.Color.orange()
+
+    role_id = verify_settings.get("role_id")
+    role = guild.get_role(int(role_id)) if role_id else None
+    channel_count = len(guard_settings.get("channel_ids", []))
+
+    embed = discord.Embed(
+        title="🎛️ 인증 시스템 전원 관리",
+        description=f"**현재 상태: {state}**\n\n"
+                    "문제가 생기면 여기서 **즉시 정지**할 수 있습니다.\n"
+                    "정지 상태에서는 봇이 웹훅 임베드를 전혀 건드리지 않고,\n"
+                    "인증 버튼도 동작하지 않아 **기능이 없는 것과 같은 상태**가 됩니다.",
+        color=color
+    )
+    embed.add_field(
+        name="🔐 서버 인증",
+        value=("✅ 켜짐" if v_on else "❌ 꺼짐")
+              + f"\n-# 인증 역할: {role.mention if role else '⚠️ 미설정'}",
+        inline=True
+    )
+    embed.add_field(
+        name="🔗 링크 보호",
+        value=("✅ 켜짐" if g_on else "❌ 꺼짐")
+              + f"\n-# 보호 채널: {channel_count}개",
+        inline=True
+    )
+    embed.set_footer(text="변경은 즉시 반영됩니다 (봇 재시작 불필요)")
+    return embed
+
+
+class SystemPowerView(discord.ui.View):
+    def __init__(self, verify_settings: dict, guard_settings: dict):
+        super().__init__(timeout=300)
+        self.v_on = verify_settings.get("enabled", True)
+        self.g_on = guard_settings.get("enabled", True)
+        self._sync_labels()
+
+    def _sync_labels(self):
+        self.verify_btn.label = "인증 끄기" if self.v_on else "인증 켜기"
+        self.verify_btn.style = discord.ButtonStyle.danger if self.v_on else discord.ButtonStyle.success
+        self.guard_btn.label = "링크 보호 끄기" if self.g_on else "링크 보호 켜기"
+        self.guard_btn.style = discord.ButtonStyle.danger if self.g_on else discord.ButtonStyle.success
+
+    async def _refresh(self, interaction: discord.Interaction):
+        v = await get_verify_settings(interaction.guild.id)
+        g = await get_linkguard_settings(interaction.guild.id)
+        self.v_on = v.get("enabled", True)
+        self.g_on = g.get("enabled", True)
+        self._sync_labels()
+        await interaction.response.edit_message(
+            embed=build_power_embed(v, g, interaction.guild), view=self
+        )
+
+    @discord.ui.button(label="인증 끄기", style=discord.ButtonStyle.danger, emoji="🔐", row=0)
+    async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_verify_settings(interaction.guild.id, {"enabled": not self.v_on})
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="링크 보호 끄기", style=discord.ButtonStyle.danger, emoji="🔗", row=0)
+    async def guard_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_linkguard_settings(interaction.guild.id, {"enabled": not self.g_on})
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="전체 켜기", style=discord.ButtonStyle.success, emoji="🟢", row=1)
+    async def all_on_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_verify_settings(interaction.guild.id, {"enabled": True})
+        await save_linkguard_settings(interaction.guild.id, {"enabled": True})
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="전체 끄기 (비상 정지)", style=discord.ButtonStyle.danger, emoji="🛑", row=1)
+    async def all_off_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_verify_settings(interaction.guild.id, {"enabled": False})
+        await save_linkguard_settings(interaction.guild.id, {"enabled": False})
+        await self._refresh(interaction)
+
+
+# ── Cog ───────────────────────────────────────────────────────────────
+
+class Verify(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="인증시스템", description="[관리자 전용] 인증 및 링크 보호 시스템을 즉시 켜거나 끕니다.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def system_power(self, interaction: discord.Interaction):
+        verify_settings = await get_verify_settings(interaction.guild.id)
+        guard_settings = await get_linkguard_settings(interaction.guild.id)
+
+        embed = build_power_embed(verify_settings, guard_settings, interaction.guild)
+        view = SystemPowerView(verify_settings, guard_settings)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(name="인증설정", description="[관리자 전용] 서버 인증 역할, 인증 패널 및 문구를 관리합니다.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def verify_settings(self, interaction: discord.Interaction):
+        settings = await get_verify_settings(interaction.guild.id)
+        role_id = settings.get("role_id")
+        role = interaction.guild.get_role(int(role_id)) if role_id else None
+        state_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
+        role_text = role.mention if role else "⚠️ 미설정"
+
+        embed = discord.Embed(
+            title="🔐 서버 인증 시스템 관리",
+            description=f"**시스템 상태**: {state_text}\n"
+                        f"**인증 역할**: {role_text}\n\n"
+                        "아래 드롭다운 메뉴에서 원하시는 관리 기능을 선택해 주세요.",
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text="한바헌 서버 인증 시스템")
+        view = VerifySettingsView(settings, interaction.guild)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+async def setup(bot):
+    await bot.add_cog(Verify(bot))
+    # 봇 재시작 후에도 인증 버튼이 동작하도록 영구 View 등록
+    bot.add_view(VerifyPanelView())

@@ -1,0 +1,467 @@
+"""
+인증 & 링크 보호 전용 데이터 계층.
+
+이 모듈은 포인트/상점/뽑기/제보 시스템(utils/database.py)과 완전히 분리되어 있습니다.
+독립된 MongoDB 컬렉션과 독립된 로컬 JSON 파일만 사용하며,
+기존 이코노미 코드를 전혀 import 하지 않습니다.
+"""
+
+import os
+import json
+import asyncio
+import hashlib
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATA_DIR = "data"
+VERIFY_FILE = os.path.join(DATA_DIR, "verify_settings.json")
+LINKGUARD_FILE = os.path.join(DATA_DIR, "linkguard_settings.json")
+PLINK_FILE = os.path.join(DATA_DIR, "protected_links.json")
+CLICKLOG_FILE = os.path.join(DATA_DIR, "link_clicks.json")
+WATERMARK_FILE = os.path.join(DATA_DIR, "link_watermarks.json")
+GUARDKEY_FILE = os.path.join(DATA_DIR, "guarded_keys.json")
+MONGO_URI = os.getenv("MONGO_URI")
+
+KST = timezone(timedelta(hours=9))
+
+_verify_lock = asyncio.Lock()
+_linkguard_lock = asyncio.Lock()
+_plink_lock = asyncio.Lock()
+_clicklog_lock = asyncio.Lock()
+_watermark_lock = asyncio.Lock()
+_guardkey_lock = asyncio.Lock()
+
+verify_col = None
+linkguard_col = None
+plink_col = None
+clicklog_col = None
+watermark_col = None
+guardkey_col = None
+
+if MONGO_URI:
+    try:
+        from pymongo import MongoClient
+        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        _client.admin.command('ping')
+        _db = _client["krbiomehuntbot"]
+        verify_col = _db["verify_settings"]
+        linkguard_col = _db["linkguard_settings"]
+        plink_col = _db["protected_links"]
+        clicklog_col = _db["link_clicks"]
+        watermark_col = _db["link_watermarks"]
+        guardkey_col = _db["guarded_keys"]
+        print("Connected to MongoDB successfully for verify/linkguard storage!", flush=True)
+    except Exception as e:
+        print(f"MongoDB (verify) connection warning: {e}. Falling back to local JSON storage.", flush=True)
+        verify_col = None
+        linkguard_col = None
+        plink_col = None
+        clicklog_col = None
+        watermark_col = None
+        guardkey_col = None
+
+
+def _ensure_data_dir():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _read_json(path: str) -> dict:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _write_json(path: str, payload: dict) -> None:
+    _ensure_data_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+# ── 인증 설정 ─────────────────────────────────────────────────────────
+
+DEFAULT_VERIFY_SETTINGS = {
+    "enabled": True,
+    "role_id": None,
+    "panel_channel_id": None,
+    "title": "✅ 서버 인증",
+    "description": "아래 **[인증하기]** 버튼을 눌러 인증을 완료해 주세요.\n"
+                   "인증이 완료되면 보호된 링크를 열람하실 수 있습니다.",
+    "button_label": "인증하기",
+}
+
+
+# 링크 버튼 클릭은 수백 명이 동시에 누를 수 있으므로, 조회가 DB를 타지 않도록
+# 메모리 캐시를 둡니다. 저장은 항상 save_* 를 거치므로 캐시가 어긋나지 않습니다.
+_verify_cache: dict[str, dict] = {}
+
+
+async def get_verify_settings(guild_id: int) -> dict:
+    str_gid = str(guild_id)
+
+    cached = _verify_cache.get(str_gid)
+    if cached is not None:
+        return dict(cached)
+
+    result = dict(DEFAULT_VERIFY_SETTINGS)
+
+    if verify_col is not None:
+        try:
+            doc = verify_col.find_one({"_id": str_gid})
+            if doc:
+                result.update({k: v for k, v in doc.items() if k != "_id"})
+            _verify_cache[str_gid] = dict(result)
+            return dict(result)
+        except Exception as e:
+            print(f"MongoDB get_verify_settings error: {e}, using local file.", flush=True)
+
+    async with _verify_lock:
+        all_settings = _read_json(VERIFY_FILE)
+    if str_gid in all_settings:
+        result.update(all_settings[str_gid])
+    _verify_cache[str_gid] = dict(result)
+    return dict(result)
+
+
+async def save_verify_settings(guild_id: int, settings: dict) -> None:
+    str_gid = str(guild_id)
+
+    # 캐시를 먼저 갱신해 저장 직후 조회에도 최신값이 보이게 합니다
+    current = _verify_cache.get(str_gid) or dict(DEFAULT_VERIFY_SETTINGS)
+    current.update(settings)
+    _verify_cache[str_gid] = current
+
+    if verify_col is not None:
+        try:
+            verify_col.update_one({"_id": str_gid}, {"$set": settings}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_verify_settings error: {e}, using local file.", flush=True)
+
+    async with _verify_lock:
+        all_settings = _read_json(VERIFY_FILE)
+        all_settings.setdefault(str_gid, {}).update(settings)
+        _write_json(VERIFY_FILE, all_settings)
+
+
+# ── 링크 보호(링크가드) 설정 ──────────────────────────────────────────
+
+DEFAULT_LINKGUARD_SETTINGS = {
+    "enabled": True,
+    "channel_ids": [],
+    "button_label": "🎮 개인서버 입장하기",
+    "locked_text": "🔒 인증된 유저만 입장할 수 있습니다",
+    # 열람 / 유출 기록을 실시간으로 보낼 채널
+    "log_channel_id": None,
+    # 유저마다 다른 워터마크(#hbh-xxxxxxxx)를 링크에 붙여 유출자를 추적
+    "watermark": True,
+    # 서버 안에서 보호 링크가 유출되면 그 메시지를 자동 삭제
+    "auto_delete_leak": True,
+}
+
+
+_linkguard_cache: dict[str, dict] = {}
+
+
+async def get_linkguard_settings(guild_id: int) -> dict:
+    str_gid = str(guild_id)
+
+    cached = _linkguard_cache.get(str_gid)
+    if cached is not None:
+        return dict(cached)
+
+    result = dict(DEFAULT_LINKGUARD_SETTINGS)
+
+    if linkguard_col is not None:
+        try:
+            doc = linkguard_col.find_one({"_id": str_gid})
+            if doc:
+                result.update({k: v for k, v in doc.items() if k != "_id"})
+            result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
+            _linkguard_cache[str_gid] = dict(result)
+            return dict(result)
+        except Exception as e:
+            print(f"MongoDB get_linkguard_settings error: {e}, using local file.", flush=True)
+
+    async with _linkguard_lock:
+        all_settings = _read_json(LINKGUARD_FILE)
+    if str_gid in all_settings:
+        result.update(all_settings[str_gid])
+    result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
+    _linkguard_cache[str_gid] = dict(result)
+    return dict(result)
+
+
+async def save_linkguard_settings(guild_id: int, settings: dict) -> None:
+    str_gid = str(guild_id)
+
+    current = _linkguard_cache.get(str_gid) or dict(DEFAULT_LINKGUARD_SETTINGS)
+    current.update(settings)
+    current["channel_ids"] = [int(c) for c in current.get("channel_ids", [])]
+    _linkguard_cache[str_gid] = current
+
+    if linkguard_col is not None:
+        try:
+            linkguard_col.update_one({"_id": str_gid}, {"$set": settings}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_linkguard_settings error: {e}, using local file.", flush=True)
+
+    async with _linkguard_lock:
+        all_settings = _read_json(LINKGUARD_FILE)
+        all_settings.setdefault(str_gid, {}).update(settings)
+        _write_json(LINKGUARD_FILE, all_settings)
+
+
+# ── 보호된 링크 저장소 (메시지 ID 기준) ───────────────────────────────
+
+_plink_cache: dict[str, list[str]] = {}
+
+
+async def save_protected_link(guild_id: int, message_id: int, links: list[str]) -> None:
+    """봇이 재게시한 메시지 ID에 원본 링크 목록을 매핑해 저장합니다."""
+    key = f"{guild_id}:{message_id}"
+
+    # 버튼 클릭 시 DB를 타지 않도록 메모리에 먼저 올려둡니다
+    _plink_cache[key] = list(links)
+    if len(_plink_cache) > 1000:
+        for old_key in list(_plink_cache)[:500]:
+            _plink_cache.pop(old_key, None)
+
+    if plink_col is not None:
+        try:
+            plink_col.update_one(
+                {"_id": key},
+                {"$set": {"guild_id": str(guild_id), "message_id": str(message_id), "links": links}},
+                upsert=True
+            )
+            return
+        except Exception as e:
+            print(f"MongoDB save_protected_link error: {e}, using local file.", flush=True)
+
+    async with _plink_lock:
+        all_links = _read_json(PLINK_FILE)
+        all_links[key] = {"guild_id": str(guild_id), "message_id": str(message_id), "links": links}
+        _write_json(PLINK_FILE, all_links)
+
+
+async def get_protected_link(guild_id: int, message_id: int) -> list[str]:
+    """메시지 ID에 매핑된 원본 링크 목록을 반환합니다. 없으면 빈 리스트.
+
+    메모리 캐시를 먼저 확인하므로, 봇이 살아있는 동안의 클릭은 DB를 타지 않습니다.
+    (봇 재시작 후 첫 클릭에서만 DB를 조회하고 다시 캐시에 올립니다)
+    """
+    key = f"{guild_id}:{message_id}"
+
+    cached = _plink_cache.get(key)
+    if cached is not None:
+        return list(cached)
+
+    if plink_col is not None:
+        try:
+            doc = plink_col.find_one({"_id": key})
+            if doc:
+                links = list(doc.get("links", []))
+                _plink_cache[key] = list(links)
+                return links
+        except Exception as e:
+            print(f"MongoDB get_protected_link error: {e}, using local file.", flush=True)
+
+    async with _plink_lock:
+        all_links = _read_json(PLINK_FILE)
+    entry = all_links.get(key)
+    if entry:
+        links = list(entry.get("links", []))
+        _plink_cache[key] = list(links)
+        return links
+    return []
+
+
+# ── 링크 클릭 기록 (유출 추적용) ──────────────────────────────────────
+#
+# 클릭 응답 속도에 영향을 주지 않도록, 호출부에서 응답을 보낸 **뒤에**
+# 백그라운드 태스크로 기록합니다.
+
+MAX_CLICK_LOGS = 500
+
+# event_type: "view" = 정상 열람 / "leak" = 서버 내 유출 감지
+
+
+async def add_click_log(
+    guild_id: int,
+    user_id: int,
+    user_name: str,
+    url: str,
+    event_type: str = "view",
+    detail: str = "",
+) -> None:
+    """누가 언제 어떤 링크를 열람했는지 / 유출했는지 기록합니다."""
+    timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    entry = {
+        "guild_id": str(guild_id),
+        "user_id": str(user_id),
+        "user_name": user_name,
+        "url": url,
+        "type": event_type,
+        "detail": detail,
+        "timestamp": timestamp,
+    }
+
+    if clicklog_col is not None:
+        try:
+            clicklog_col.insert_one(dict(entry))
+            return
+        except Exception as e:
+            print(f"MongoDB add_click_log error: {e}, using local file.", flush=True)
+
+    async with _clicklog_lock:
+        all_logs = _read_json(CLICKLOG_FILE)
+        guild_logs = all_logs.setdefault(str(guild_id), [])
+        guild_logs.insert(0, entry)
+        del guild_logs[MAX_CLICK_LOGS:]
+        _write_json(CLICKLOG_FILE, all_logs)
+
+
+async def get_click_logs(guild_id: int, limit: int = 30, event_type: str = "all") -> list[dict]:
+    """최근 열람 / 유출 기록을 최신순으로 반환합니다."""
+    if clicklog_col is not None:
+        try:
+            query: dict = {"guild_id": str(guild_id)}
+            if event_type != "all":
+                query["type"] = event_type
+            cursor = clicklog_col.find(query).sort("_id", -1).limit(limit)
+            return [{k: v for k, v in doc.items() if k != "_id"} for doc in cursor]
+        except Exception as e:
+            print(f"MongoDB get_click_logs error: {e}, using local file.", flush=True)
+
+    async with _clicklog_lock:
+        all_logs = _read_json(CLICKLOG_FILE)
+    logs = list(all_logs.get(str(guild_id), []))
+    if event_type != "all":
+        logs = [x for x in logs if x.get("type", "view") == event_type]
+    return logs[:limit]
+
+
+# ── 워터마크 (유출자 추적용) ──────────────────────────────────────────
+#
+# 유저마다 다른 코드를 링크 뒤에 프래그먼트(#hbh-xxxxxxxx)로 붙입니다.
+# 프래그먼트는 서버로 전송되지 않으므로 로블록스 링크의 동작을 깨뜨리지 않으면서,
+# 복사되어 퍼진 링크에는 그대로 따라붙습니다.
+
+_watermark_cache: dict[str, dict] = {}
+
+
+def make_watermark_code(guild_id: int, user_id: int) -> str:
+    """길드+유저 조합으로 항상 같은 8자리 코드를 만듭니다."""
+    raw = f"hbh:{guild_id}:{user_id}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:8]
+
+
+async def save_watermark(guild_id: int, code: str, user_id: int, user_name: str) -> None:
+    """워터마크 코드 → 유저 매핑을 저장합니다 (역추적용)."""
+    key = f"{guild_id}:{code}"
+    entry = {"guild_id": str(guild_id), "code": code, "user_id": str(user_id), "user_name": user_name}
+    _watermark_cache[key] = entry
+
+    if watermark_col is not None:
+        try:
+            watermark_col.update_one({"_id": key}, {"$set": entry}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_watermark error: {e}, using local file.", flush=True)
+
+    async with _watermark_lock:
+        all_marks = _read_json(WATERMARK_FILE)
+        all_marks[key] = entry
+        _write_json(WATERMARK_FILE, all_marks)
+
+
+async def get_watermark(guild_id: int, code: str) -> dict | None:
+    """워터마크 코드로 발급 대상 유저를 역추적합니다."""
+    key = f"{guild_id}:{code}"
+
+    cached = _watermark_cache.get(key)
+    if cached is not None:
+        return dict(cached)
+
+    if watermark_col is not None:
+        try:
+            doc = watermark_col.find_one({"_id": key})
+            if doc:
+                entry = {k: v for k, v in doc.items() if k != "_id"}
+                _watermark_cache[key] = entry
+                return dict(entry)
+        except Exception as e:
+            print(f"MongoDB get_watermark error: {e}, using local file.", flush=True)
+
+    async with _watermark_lock:
+        all_marks = _read_json(WATERMARK_FILE)
+    entry = all_marks.get(key)
+    if entry:
+        _watermark_cache[key] = entry
+        return dict(entry)
+    return None
+
+
+# ── 보호 대상 링크 색인 (유출 감지용) ─────────────────────────────────
+
+_guarded_keys_cache: dict[str, set[str]] = {}
+
+
+async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
+    """이 길드에서 보호 중인 링크 식별자(개인서버 코드 등)를 색인에 추가합니다."""
+    str_gid = str(guild_id)
+    bucket = _guarded_keys_cache.setdefault(str_gid, set())
+    bucket.update(keys)
+
+    if guardkey_col is not None:
+        try:
+            for key in keys:
+                guardkey_col.update_one(
+                    {"_id": f"{guild_id}:{key}"},
+                    {"$set": {"guild_id": str_gid, "key": key}},
+                    upsert=True
+                )
+            return
+        except Exception as e:
+            print(f"MongoDB register_guarded_keys error: {e}, using local file.", flush=True)
+
+    async with _guardkey_lock:
+        all_keys = _read_json(GUARDKEY_FILE)
+        existing = set(all_keys.get(str_gid, []))
+        existing.update(keys)
+        all_keys[str_gid] = sorted(existing)
+        _write_json(GUARDKEY_FILE, all_keys)
+
+
+async def get_guarded_keys(guild_id: int) -> set[str]:
+    """보호 중인 링크 식별자 집합을 반환합니다 (메모리 캐시 우선)."""
+    str_gid = str(guild_id)
+
+    cached = _guarded_keys_cache.get(str_gid)
+    if cached is not None:
+        return set(cached)
+
+    result: set[str] = set()
+
+    if guardkey_col is not None:
+        try:
+            for doc in guardkey_col.find({"guild_id": str_gid}):
+                result.add(doc.get("key", ""))
+            result.discard("")
+            _guarded_keys_cache[str_gid] = set(result)
+            return set(result)
+        except Exception as e:
+            print(f"MongoDB get_guarded_keys error: {e}, using local file.", flush=True)
+
+    async with _guardkey_lock:
+        all_keys = _read_json(GUARDKEY_FILE)
+    result = set(all_keys.get(str_gid, []))
+    _guarded_keys_cache[str_gid] = set(result)
+    return set(result)

@@ -154,7 +154,10 @@ async def save_verify_settings(guild_id: int, settings: dict) -> None:
 
 DEFAULT_LINKGUARD_SETTINGS = {
     "enabled": True,
+    # 개별 채널 지정
     "channel_ids": [],
+    # 카테고리 통째로 지정 (안에 있는 모든 채널이 자동 감시 대상, 새 채널도 자동 포함)
+    "category_ids": [],
     "button_label": "🎮 개인서버 입장하기",
     "locked_text": "🔒 인증된 유저만 입장할 수 있습니다",
     # 열람 / 유출 기록을 실시간으로 보낼 채널
@@ -184,6 +187,7 @@ async def get_linkguard_settings(guild_id: int) -> dict:
             if doc:
                 result.update({k: v for k, v in doc.items() if k != "_id"})
             result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
+            result["category_ids"] = [int(c) for c in result.get("category_ids", [])]
             _linkguard_cache[str_gid] = dict(result)
             return dict(result)
         except Exception as e:
@@ -194,6 +198,7 @@ async def get_linkguard_settings(guild_id: int) -> dict:
     if str_gid in all_settings:
         result.update(all_settings[str_gid])
     result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
+    result["category_ids"] = [int(c) for c in result.get("category_ids", [])]
     _linkguard_cache[str_gid] = dict(result)
     return dict(result)
 
@@ -204,6 +209,7 @@ async def save_linkguard_settings(guild_id: int, settings: dict) -> None:
     current = _linkguard_cache.get(str_gid) or dict(DEFAULT_LINKGUARD_SETTINGS)
     current.update(settings)
     current["channel_ids"] = [int(c) for c in current.get("channel_ids", [])]
+    current["category_ids"] = [int(c) for c in current.get("category_ids", [])]
     _linkguard_cache[str_gid] = current
 
     if linkguard_col is not None:

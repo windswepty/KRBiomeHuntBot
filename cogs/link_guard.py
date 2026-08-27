@@ -61,6 +61,49 @@ def is_roblox_private_server(url: str) -> bool:
     return bool(ROBLOX_SHARE_RE.search(url)) and "type=server" in url.lower()
 
 
+def resolve_base_channel(channel):
+    """스레드면 부모 채널을, 그 외에는 채널 자신을 돌려줍니다."""
+    if isinstance(channel, discord.Thread):
+        return channel.parent
+    return channel
+
+
+def is_guarded_channel(channel, settings: dict) -> bool:
+    """이 채널이 감시 대상인지 판정합니다.
+
+    개별 채널 지정과 **카테고리 지정**을 모두 지원합니다.
+    카테고리를 지정하면 그 안의 모든 채널(나중에 새로 만든 채널 포함)이
+    자동으로 감시 대상이 됩니다.
+    """
+    base = resolve_base_channel(channel)
+    if base is None:
+        return False
+
+    if base.id in settings.get("channel_ids", []):
+        return True
+
+    category_id = getattr(base, "category_id", None)
+    return category_id is not None and category_id in settings.get("category_ids", [])
+
+
+def collect_guarded_channels(guild: discord.Guild, settings: dict) -> list:
+    """현재 감시 대상인 텍스트 채널을 모두 모읍니다 (권한 점검용)."""
+    seen: dict[int, object] = {}
+
+    for cid in settings.get("channel_ids", []):
+        ch = guild.get_channel(cid)
+        if ch is not None:
+            seen[ch.id] = ch
+
+    for cat_id in settings.get("category_ids", []):
+        category = guild.get_channel(cat_id)
+        if isinstance(category, discord.CategoryChannel):
+            for ch in category.text_channels:
+                seen[ch.id] = ch
+
+    return list(seen.values())
+
+
 def link_key(url: str) -> str:
     """링크를 식별하는 키를 만듭니다.
 
@@ -441,6 +484,116 @@ class RemoveGuardChannelView(discord.ui.View):
         self.add_item(RemoveGuardChannelSelect(channel_ids, guild))
 
 
+class AddCategorySelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="감시할 카테고리를 선택하세요 (여러 개 가능)...",
+            channel_types=[discord.ChannelType.category],
+            max_values=25
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        settings = await get_linkguard_settings(guild.id)
+        category_ids = list(settings.get("category_ids", []))
+
+        added = 0
+        for selected in self.values:
+            if selected.id not in category_ids:
+                category_ids.append(selected.id)
+                added += 1
+
+        await save_linkguard_settings(guild.id, {"category_ids": category_ids})
+
+        settings["category_ids"] = category_ids
+        channels = collect_guarded_channels(guild, settings)
+
+        embed = discord.Embed(
+            title="✅ 감시 카테고리 추가 완료",
+            description=f"새로 추가된 카테고리: **{added}개**\n"
+                        f"현재 감시 카테고리: **{len(category_ids)}개** "
+                        f"→ 그 안의 텍스트 채널 **{len(channels)}개**가 감시 대상입니다.\n\n"
+                        "-# 카테고리에 채널을 새로 만들면 **자동으로 감시 대상에 포함**됩니다.",
+            color=discord.Color.green()
+        )
+
+        me = guild.me
+        lines = []
+        for cat_id in category_ids[:15]:
+            category = guild.get_channel(cat_id)
+            if not isinstance(category, discord.CategoryChannel):
+                lines.append(f"• ⚠️ <#{cat_id}> 카테고리를 찾을 수 없음")
+                continue
+            texts = category.text_channels
+            bad = [
+                c for c in texts
+                if me and not (
+                    c.permissions_for(me).manage_messages
+                    and c.permissions_for(me).send_messages
+                    and c.permissions_for(me).view_channel
+                )
+            ]
+            mark = "✅" if not bad else "⚠️"
+            note = "" if not bad else f" — 채널 {len(bad)}개 권한 부족"
+            lines.append(f"• {mark} **{category.name}** (채널 {len(texts)}개){note}")
+
+        embed.add_field(name="📂 감시 카테고리", value="\n".join(lines) or "없음", inline=False)
+        if any("⚠️" in ln for ln in lines):
+            embed.add_field(
+                name="🔑 권한 안내",
+                value="봇에게 해당 채널의 **채널 보기 · 메시지 보내기 · 메시지 관리** 권한이 필요합니다.\n"
+                      "비공개 채널은 봇 역할을 채널 권한에 추가해 주세요.\n"
+                      "`현재 설정 및 권한 점검`에서 문제 채널을 확인할 수 있습니다.",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class AddCategoryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(AddCategorySelect())
+
+
+class RemoveCategorySelect(discord.ui.Select):
+    def __init__(self, category_ids: list[int], guild: discord.Guild):
+        options = []
+        for cat_id in category_ids[:25]:
+            category = guild.get_channel(cat_id)
+            if isinstance(category, discord.CategoryChannel):
+                name = category.name
+                desc = f"텍스트 채널 {len(category.text_channels)}개의 감시가 해제됩니다"
+            else:
+                name = f"카테고리 ID {cat_id}"
+                desc = "선택 시 감시 목록에서 제거됩니다"
+            options.append(
+                discord.SelectOption(label=name[:100], value=str(cat_id), description=desc[:95], emoji="❌")
+            )
+        super().__init__(placeholder="감시를 해제할 카테고리를 선택하세요...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        cat_id = int(self.values[0])
+        settings = await get_linkguard_settings(interaction.guild.id)
+        category_ids = [c for c in settings.get("category_ids", []) if c != cat_id]
+        await save_linkguard_settings(interaction.guild.id, {"category_ids": category_ids})
+
+        category = interaction.guild.get_channel(cat_id)
+        name = category.name if isinstance(category, discord.CategoryChannel) else str(cat_id)
+        embed = discord.Embed(
+            title="❌ 감시 카테고리 해제 완료",
+            description=f"**{name}** 카테고리의 링크 보호가 해제되었습니다.\n"
+                        "이제 이 카테고리의 웹훅 임베드는 그대로 표시됩니다.",
+            color=discord.Color.orange()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class RemoveCategoryView(discord.ui.View):
+    def __init__(self, category_ids: list[int], guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.add_item(RemoveCategorySelect(category_ids, guild))
+
+
 class LogChannelSelect(discord.ui.ChannelSelect):
     def __init__(self):
         super().__init__(
@@ -504,6 +657,7 @@ class AutoDeleteToggleView(discord.ui.View):
 class GuardSettingsSelect(discord.ui.Select):
     def __init__(self, current: dict):
         channel_count = len(current.get("channel_ids", []))
+        category_count = len(current.get("category_ids", []))
         enabled_desc = "현재: ✅ 활성화" if current.get("enabled", True) else "현재: ❌ 비활성화"
 
         options = [
@@ -514,15 +668,27 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="⚡"
             ),
             discord.SelectOption(
-                label="보호 채널 추가",
+                label="감시 카테고리 추가 (권장)",
+                value="addcat",
+                description="카테고리 안의 모든 채널을 한 번에 감시 대상으로 지정합니다.",
+                emoji="📂"
+            ),
+            discord.SelectOption(
+                label="감시 카테고리 해제",
+                value="removecat",
+                description=f"현재 감시 중인 {category_count}개 카테고리 중 선택 해제",
+                emoji="🗂️"
+            ),
+            discord.SelectOption(
+                label="개별 채널 추가",
                 value="add",
-                description="웹훅 임베드를 감시할 채널을 추가합니다 (최대 5개씩).",
+                description="카테고리 밖의 채널을 하나씩 추가합니다 (최대 5개씩).",
                 emoji="➕"
             ),
             discord.SelectOption(
-                label="보호 채널 해제",
+                label="개별 채널 해제",
                 value="remove",
-                description=f"현재 보호 중인 {channel_count}개 채널 중 선택 해제",
+                description=f"개별 지정된 {channel_count}개 채널 중 선택 해제",
                 emoji="❌"
             ),
             discord.SelectOption(
@@ -579,6 +745,29 @@ class GuardSettingsSelect(discord.ui.Select):
                 color=discord.Color.green() if new_state else discord.Color.red()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif choice == "addcat":
+            await interaction.response.send_message(
+                "📂 **감시할 카테고리를 선택하세요.**\n"
+                "-# 카테고리 안의 모든 텍스트 채널(비공개 포함)이 감시 대상이 되며,\n"
+                "-# 나중에 새로 만드는 채널도 자동으로 포함됩니다.",
+                view=AddCategoryView(),
+                ephemeral=True
+            )
+
+        elif choice == "removecat":
+            category_ids = settings.get("category_ids", [])
+            if not category_ids:
+                await interaction.response.send_message(
+                    "ℹ️ 현재 감시 중인 카테고리가 없습니다.",
+                    ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                "🗂️ **감시를 해제할 카테고리를 선택하세요.**",
+                view=RemoveCategoryView(category_ids, guild),
+                ephemeral=True
+            )
 
         elif choice == "add":
             await interaction.response.send_message(
@@ -675,6 +864,14 @@ class GuardSettingsView(discord.ui.View):
         self.add_item(GuardSettingsSelect(current))
 
 
+def _channel_ready(channel, me) -> bool:
+    """봇이 이 채널에서 링크 보호를 수행할 수 있는지 확인합니다."""
+    if me is None or channel is None:
+        return False
+    perms = channel.permissions_for(me)
+    return perms.view_channel and perms.send_messages and perms.manage_messages
+
+
 def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: dict) -> discord.Embed:
     embed = discord.Embed(title="📊 링크 보호 시스템 현재 설정", color=discord.Color.blurple())
     embed.add_field(
@@ -684,37 +881,61 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
     )
 
     me = guild.me
+    category_ids = settings.get("category_ids", [])
     channel_ids = settings.get("channel_ids", [])
-    if not channel_ids:
+
+    # 감시 카테고리
+    if category_ids:
+        cat_lines = []
+        for cat_id in category_ids[:15]:
+            category = guild.get_channel(cat_id)
+            if not isinstance(category, discord.CategoryChannel):
+                cat_lines.append(f"• ⚠️ `{cat_id}` 카테고리를 찾을 수 없음")
+                continue
+            texts = category.text_channels
+            bad = [c for c in texts if not _channel_ready(c, me)]
+            if bad:
+                cat_lines.append(f"• ⚠️ **{category.name}** — 채널 {len(texts)}개 중 **{len(bad)}개 권한 부족**")
+            else:
+                cat_lines.append(f"• ✅ **{category.name}** — 채널 {len(texts)}개")
         embed.add_field(
-            name="📡 보호 중인 채널 (0개)",
-            value="아직 등록된 채널이 없습니다. **보호 채널 추가**로 등록해 주세요.",
+            name=f"📂 감시 카테고리 ({len(category_ids)}개)",
+            value="\n".join(cat_lines)[:1024],
             inline=False
         )
-    else:
+
+    # 개별 지정 채널
+    if channel_ids:
         lines = []
-        for cid in channel_ids[:15]:
+        for cid in channel_ids[:10]:
             channel = guild.get_channel(cid)
             if channel is None:
                 lines.append(f"• ⚠️ <#{cid}> 채널을 찾을 수 없음")
                 continue
-            perms = channel.permissions_for(me) if me else None
-            can_delete = perms.manage_messages if perms else False
-            can_send = perms.send_messages if perms else False
-            if can_delete and can_send:
-                lines.append(f"• ✅ {channel.mention}")
-            else:
-                missing = []
-                if not can_delete:
-                    missing.append("메시지 관리")
-                if not can_send:
-                    missing.append("메시지 보내기")
-                lines.append(f"• ⚠️ {channel.mention} — `{' / '.join(missing)}` 권한 없음")
+            lines.append(f"• {'✅' if _channel_ready(channel, me) else '⚠️'} {channel.mention}")
         embed.add_field(
-            name=f"📡 보호 중인 채널 ({len(channel_ids)}개)",
-            value="\n".join(lines),
+            name=f"➕ 개별 지정 채널 ({len(channel_ids)}개)",
+            value="\n".join(lines)[:1024],
             inline=False
         )
+
+    guarded = collect_guarded_channels(guild, settings)
+    if not guarded:
+        embed.add_field(
+            name="📡 감시 대상",
+            value="아직 등록된 감시 대상이 없습니다. **감시 카테고리 추가**로 등록해 주세요.",
+            inline=False
+        )
+    else:
+        broken = [c for c in guarded if not _channel_ready(c, me)]
+        summary = f"총 **{len(guarded)}개 채널**을 감시 중입니다."
+        if broken:
+            names = ", ".join(c.mention for c in broken[:10])
+            summary += (f"\n\n⚠️ **{len(broken)}개 채널에서 동작하지 않습니다:**\n{names}"
+                        + ("\n…" if len(broken) > 10 else "")
+                        + "\n-# 봇에게 `채널 보기` · `메시지 보내기` · `메시지 관리` 권한을 주세요.\n"
+                        "-# 비공개 채널은 채널 권한 설정에 봇 역할을 추가해야 합니다.")
+        embed.add_field(name="📡 감시 대상 요약", value=summary[:1024], inline=False)
 
     role_id = verify_settings.get("role_id")
     role = guild.get_role(int(role_id)) if role_id else None
@@ -770,7 +991,7 @@ class LinkGuard(commands.Cog):
         settings = await get_linkguard_settings(guild.id)
         if not settings.get("enabled", True):
             return
-        if message.channel.id not in settings.get("channel_ids", []):
+        if not is_guarded_channel(message.channel, settings):
             return
 
         # 3. 임베드가 있어야 처리
@@ -962,14 +1183,18 @@ class LinkGuard(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def linkguard_settings(self, interaction: discord.Interaction):
         settings = await get_linkguard_settings(interaction.guild.id)
+        category_count = len(settings.get("category_ids", []))
         channel_count = len(settings.get("channel_ids", []))
+        total = len(collect_guarded_channels(interaction.guild, settings))
         state_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
 
         embed = discord.Embed(
             title="🔗 웹훅 링크 보호 시스템 관리",
             description=f"**시스템 상태**: {state_text}\n"
-                        f"**보호 중인 채널**: **{channel_count}개**\n\n"
-                        "지정한 채널에 **웹훅**이 임베드를 올리면, 링크를 제거한 뒤 버튼으로 치환합니다.\n"
+                        f"**감시 카테고리**: **{category_count}개** · "
+                        f"**개별 채널**: **{channel_count}개**\n"
+                        f"**실제 감시 중인 채널**: **{total}개**\n\n"
+                        "감시 대상 채널에 **웹훅**이 임베드를 올리면, 링크를 제거한 뒤 버튼으로 치환합니다.\n"
                         "버튼을 누른 유저가 인증 역할을 가진 경우에만 실제 링크가 전달됩니다.\n\n"
                         "아래 드롭다운 메뉴에서 원하시는 관리 기능을 선택해 주세요.",
             color=discord.Color.blurple()

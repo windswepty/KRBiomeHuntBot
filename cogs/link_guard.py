@@ -284,7 +284,18 @@ class ProtectedLinkView(discord.ui.View):
             )
             return
 
-        # 2) 인증 설정 조회 (메모리 캐시)
+        settings = await get_linkguard_settings(guild.id)
+        member = interaction.user
+
+        # 2) 시스템이 꺼져 있으면 게이트를 열어 둡니다.
+        #    `/인증시스템` 비상 정지 시 "기능이 없던 상태"와 같아야 하므로,
+        #    이미 게시된 보호 메시지도 누구나 링크를 받을 수 있어야 합니다.
+        #    (여기서 막으면 정지했는데도 유저가 못 들어가는 상황이 됩니다)
+        if not settings.get("enabled", True):
+            await self._send_links(interaction, links, code="", settings=settings, gated=False)
+            return
+
+        # 3) 인증 설정 조회 (메모리 캐시)
         verify_settings = await get_verify_settings(guild.id)
         role_id = verify_settings.get("role_id")
 
@@ -295,8 +306,7 @@ class ProtectedLinkView(discord.ui.View):
             )
             return
 
-        # 3) 역할 검사 (이미 메모리에 있는 정보라 추가 요청이 없습니다)
-        member = interaction.user
+        # 4) 역할 검사 (이미 메모리에 있는 정보라 추가 요청이 없습니다)
         if not any(r.id == int(role_id) for r in getattr(member, "roles", [])):
             role = guild.get_role(int(role_id))
             panel_id = verify_settings.get("panel_channel_id")
@@ -312,11 +322,20 @@ class ProtectedLinkView(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # 4) 인증 통과 → 곧바로 눌러 들어갈 수 있는 링크 버튼만 전달합니다.
+        # 5) 인증 통과 → 곧바로 눌러 들어갈 수 있는 링크 버튼만 전달합니다.
         #    URL을 본문 텍스트로 적지 않아, 눈으로 보고 복사하기 어렵게 만듭니다.
-        settings = await get_linkguard_settings(guild.id)
         use_watermark = settings.get("watermark", True)
         code = make_watermark_code(guild.id, member.id) if use_watermark else ""
+        await self._send_links(interaction, links, code=code, settings=settings, gated=True)
+
+    async def _send_links(self, interaction, links, code: str, settings: dict, gated: bool) -> None:
+        """링크 버튼을 본인에게만 보이는 메시지로 전달합니다.
+
+        gated=False 는 시스템이 정지된 상태(누구나 열람 가능)를 뜻하며,
+        이때는 워터마크와 열람 기록을 남기지 않습니다.
+        """
+        guild = interaction.guild
+        member = interaction.user
 
         link_view = discord.ui.View(timeout=None)
         overflow: list[str] = []
@@ -341,13 +360,18 @@ class ProtectedLinkView(discord.ui.View):
             except Exception:
                 overflow.append(link)
 
-        if has_private_server:
-            content = ("🎮 **개인서버가 열렸습니다!** 아래 버튼을 누르면 바로 접속됩니다.\n"
+        headline = ("🎮 **개인서버가 열렸습니다!** 아래 버튼을 누르면 바로 접속됩니다."
+                    if has_private_server else
+                    "🔓 **아래 버튼을 눌러 이동하세요.**")
+
+        if not gated:
+            content = headline + "\n-# 현재 인증 시스템이 정지되어 있어 누구나 열람할 수 있습니다."
+        elif code:
+            content = (headline + "\n"
                        "-# 이 메시지는 본인에게만 보입니다. 이 링크에는 회원님을 식별하는 표식이 들어 있어,\n"
                        "-# 외부로 유출되면 누가 퍼뜨렸는지 확인됩니다.")
         else:
-            content = ("🔓 **링크가 잠금 해제되었습니다.** 아래 버튼을 눌러 이동하세요.\n"
-                       "-# 이 메시지는 본인에게만 보이며, 열람 기록이 남습니다.")
+            content = headline + "\n-# 이 메시지는 본인에게만 보이며, 열람 기록이 남습니다."
 
         if overflow:
             content += "\n\n⚠️ 버튼으로 만들 수 없는 링크:\n" + "\n".join(f"• {u}" for u in overflow[:3])
@@ -355,10 +379,11 @@ class ProtectedLinkView(discord.ui.View):
         view_arg = link_view if link_view.children else discord.utils.MISSING
         await interaction.response.send_message(content=content, view=view_arg, ephemeral=True)
 
-        # 5) 기록은 응답을 보낸 뒤에 백그라운드로 남깁니다 (클릭 속도에 영향 없음)
-        asyncio.create_task(
-            _after_click(guild, member, links[0], code, settings)
-        )
+        # 기록은 응답을 보낸 뒤에 백그라운드로 남깁니다 (클릭 속도에 영향 없음)
+        if gated:
+            asyncio.create_task(
+                _after_click(guild, member, links[0], code, settings)
+            )
 
 
 async def _after_click(guild, member, url: str, code: str, settings: dict) -> None:

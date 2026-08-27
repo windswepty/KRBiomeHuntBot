@@ -399,6 +399,25 @@ def build_power_embed(verify_settings: dict, guard_settings: dict, guild: discor
               + f"\n-# 보호 채널: {channel_count}개",
         inline=True
     )
+    # 인증만 끄고 링크 보호를 켜두면 신규 유저가 인증을 못 받아
+    # 링크에 영영 접근하지 못하는 상태가 됩니다. 명시적으로 경고합니다.
+    if (not v_on) and g_on:
+        embed.add_field(
+            name="⚠️ 주의: 신규 유저가 잠깁니다",
+            value="인증은 꺼졌는데 링크 보호가 켜져 있습니다.\n"
+                  "이 상태에서는 **아직 인증받지 못한 유저가 인증을 받을 방법이 없어**\n"
+                  "링크에 영영 접근하지 못합니다.\n"
+                  "평상시 상태로 되돌리려면 **[🛑 전체 끄기]** 를 눌러 주세요.",
+            inline=False
+        )
+    elif (not v_on) and (not g_on):
+        embed.add_field(
+            name="✅ 평상시 상태",
+            value="봇이 웹훅 임베드를 건드리지 않고, 유출 감지도 동작하지 않습니다.\n"
+                  "이미 치환된 과거 메시지의 버튼은 **누구나** 링크를 받을 수 있습니다.",
+            inline=False
+        )
+
     embed.set_footer(text="변경은 즉시 반영됩니다 (봇 재시작 불필요)")
     return embed
 

@@ -22,6 +22,8 @@ PLINK_FILE = os.path.join(DATA_DIR, "protected_links.json")
 CLICKLOG_FILE = os.path.join(DATA_DIR, "link_clicks.json")
 WATERMARK_FILE = os.path.join(DATA_DIR, "link_watermarks.json")
 GUARDKEY_FILE = os.path.join(DATA_DIR, "guarded_keys.json")
+USAGE_FILE = os.path.join(DATA_DIR, "link_usage.json")
+LOGREF_FILE = os.path.join(DATA_DIR, "log_references.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 KST = timezone(timedelta(hours=9))
@@ -32,6 +34,8 @@ _plink_lock = asyncio.Lock()
 _clicklog_lock = asyncio.Lock()
 _watermark_lock = asyncio.Lock()
 _guardkey_lock = asyncio.Lock()
+_usage_lock = asyncio.Lock()
+_logref_lock = asyncio.Lock()
 
 verify_col = None
 linkguard_col = None
@@ -39,6 +43,8 @@ plink_col = None
 clicklog_col = None
 watermark_col = None
 guardkey_col = None
+usage_col = None
+logref_col = None
 
 if MONGO_URI:
     try:
@@ -52,6 +58,8 @@ if MONGO_URI:
         clicklog_col = _db["link_clicks"]
         watermark_col = _db["link_watermarks"]
         guardkey_col = _db["guarded_keys"]
+        usage_col = _db["link_usage"]
+        logref_col = _db["log_references"]
         print("Connected to MongoDB successfully for verify/linkguard storage!", flush=True)
     except Exception as e:
         print(f"MongoDB (verify) connection warning: {e}. Falling back to local JSON storage.", flush=True)
@@ -61,6 +69,8 @@ if MONGO_URI:
         clicklog_col = None
         watermark_col = None
         guardkey_col = None
+        usage_col = None
+        logref_col = None
 
 
 def _ensure_data_dir():
@@ -422,6 +432,9 @@ async def get_watermark(guild_id: int, code: str) -> dict | None:
 
 _guarded_keys_cache: dict[str, set[str]] = {}
 
+# 보호 메시지별 사용자 집계 (임베드마다 따로)
+_usage_cache: dict[str, dict] = {}
+
 
 async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
     """이 길드에서 보호 중인 링크 식별자(개인서버 코드 등)를 색인에 추가합니다."""
@@ -447,6 +460,153 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
         existing.update(keys)
         all_keys[str_gid] = sorted(existing)
         _write_json(GUARDKEY_FILE, all_keys)
+
+
+async def record_link_usage(guild_id: int, message_id: int,
+                            user_id: int, user_name: str) -> tuple[int, bool]:
+    """보호 메시지별로 '누가 링크를 사용했는지'를 기록합니다.
+
+    반환값은 (지금까지 사용한 서로 다른 유저 수, 이번이 첫 사용인지) 입니다.
+    임베드(보호 메시지)마다 따로 집계됩니다.
+    """
+    key = f"{guild_id}:{message_id}"
+    timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    uid = str(user_id)
+
+    bucket = _usage_cache.get(key)
+    if bucket is None:
+        bucket = await _load_usage(key)
+        _usage_cache[key] = bucket
+
+    is_new = uid not in bucket
+    entry = bucket.get(uid) or {"name": user_name, "count": 0, "first": timestamp}
+    entry["name"] = user_name
+    entry["count"] = entry.get("count", 0) + 1
+    entry["last"] = timestamp
+    bucket[uid] = entry
+    total = len(bucket)
+
+    if usage_col is not None:
+        try:
+            usage_col.update_one(
+                {"_id": key},
+                {
+                    "$set": {
+                        "guild_id": str(guild_id),
+                        "message_id": str(message_id),
+                        f"users.{uid}.name": user_name,
+                        f"users.{uid}.last": timestamp,
+                    },
+                    "$inc": {f"users.{uid}.count": 1},
+                    "$setOnInsert": {"created": timestamp},
+                },
+                upsert=True,
+            )
+            return total, is_new
+        except Exception as e:
+            print(f"MongoDB record_link_usage error: {e}, using local file.", flush=True)
+
+    async with _usage_lock:
+        all_usage = _read_json(USAGE_FILE)
+        all_usage[key] = bucket
+        _write_json(USAGE_FILE, all_usage)
+    return total, is_new
+
+
+async def _load_usage(key: str) -> dict:
+    if usage_col is not None:
+        try:
+            doc = usage_col.find_one({"_id": key})
+            if doc:
+                return dict(doc.get("users", {}))
+            return {}
+        except Exception as e:
+            print(f"MongoDB _load_usage error: {e}, using local file.", flush=True)
+
+    async with _usage_lock:
+        all_usage = _read_json(USAGE_FILE)
+    return dict(all_usage.get(key, {}))
+
+
+async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
+    """보호 메시지 하나에 대해 링크를 사용한 유저 목록을 최신순으로 반환합니다."""
+    key = f"{guild_id}:{message_id}"
+
+    bucket = _usage_cache.get(key)
+    if bucket is None:
+        bucket = await _load_usage(key)
+        _usage_cache[key] = bucket
+
+    rows = [
+        {
+            "user_id": uid,
+            "user_name": info.get("name", "?"),
+            "count": info.get("count", 1),
+            "first": info.get("first", info.get("last", "")),
+            "last": info.get("last", ""),
+        }
+        for uid, info in bucket.items()
+    ]
+    rows.sort(key=lambda r: r.get("last", ""), reverse=True)
+    return rows
+
+
+# ── 로그 메시지 ↔ 보호 메시지 연결 ────────────────────────────────────
+#
+# 로그 채널에 올린 임베드의 [링크 사용 유저] 버튼이, 어느 보호 메시지의
+# 집계를 보여줘야 하는지 찾기 위한 매핑입니다.
+
+_logref_cache: dict[str, dict] = {}
+
+
+async def save_log_reference(guild_id: int, log_message_id: int,
+                             protected_message_id: int, channel_id: int) -> None:
+    key = f"{guild_id}:{log_message_id}"
+    entry = {
+        "guild_id": str(guild_id),
+        "log_message_id": str(log_message_id),
+        "protected_message_id": str(protected_message_id),
+        "channel_id": str(channel_id),
+    }
+    _logref_cache[key] = entry
+
+    if logref_col is not None:
+        try:
+            logref_col.update_one({"_id": key}, {"$set": entry}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_log_reference error: {e}, using local file.", flush=True)
+
+    async with _logref_lock:
+        all_refs = _read_json(LOGREF_FILE)
+        all_refs[key] = entry
+        _write_json(LOGREF_FILE, all_refs)
+
+
+async def get_log_reference(guild_id: int, log_message_id: int) -> dict | None:
+    key = f"{guild_id}:{log_message_id}"
+
+    cached = _logref_cache.get(key)
+    if cached is not None:
+        return dict(cached)
+
+    if logref_col is not None:
+        try:
+            doc = logref_col.find_one({"_id": key})
+            if doc:
+                entry = {k: v for k, v in doc.items() if k != "_id"}
+                _logref_cache[key] = entry
+                return dict(entry)
+        except Exception as e:
+            print(f"MongoDB get_log_reference error: {e}, using local file.", flush=True)
+
+    async with _logref_lock:
+        all_refs = _read_json(LOGREF_FILE)
+    entry = all_refs.get(key)
+    if entry:
+        _logref_cache[key] = entry
+        return dict(entry)
+    return None
 
 
 async def get_guarded_keys(guild_id: int) -> set[str]:

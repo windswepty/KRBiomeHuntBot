@@ -11,6 +11,7 @@
 """
 
 import re
+import time
 import asyncio
 import discord
 from discord.ext import commands
@@ -21,11 +22,15 @@ from utils.verify_db import (
     get_verify_settings, add_click_log, get_click_logs,
     make_watermark_code, save_watermark, get_watermark,
     register_guarded_keys, get_guarded_keys,
+    record_link_usage, get_link_usage,
+    save_log_reference, get_log_reference,
 )
 
 # 봇 재시작 후에도 버튼이 살아있도록 고정 custom_id 사용
 # (링크 원본은 재게시된 메시지 ID를 키로 DB에 저장합니다)
 PLINK_BUTTON_ID = "hbh_plink:open"
+# 로그 임베드 밑의 [링크 사용 유저] 버튼
+USAGE_BUTTON_ID = "hbh_usage:open"
 
 MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(\s*(https?://[^\s)]+)\s*\)')
 URL_RE = re.compile(r'https?://[^\s<>"\'`\]\)]+')
@@ -414,12 +419,18 @@ class ProtectedLinkView(discord.ui.View):
         # 기록은 응답을 보낸 뒤에 백그라운드로 남깁니다 (클릭 속도에 영향 없음)
         if gated:
             asyncio.create_task(
-                _after_click(guild, member, links[0], code, settings)
+                _after_click(guild, member, links[0], code, settings,
+                             message_id=interaction.message.id)
             )
 
 
-async def _after_click(guild, member, url: str, code: str, settings: dict) -> None:
-    """클릭 응답을 보낸 뒤 실행되는 뒷정리 — 기록 저장과 로그 채널 발송."""
+async def _after_click(guild, member, url: str, code: str, settings: dict,
+                       message_id: int = 0) -> None:
+    """클릭 응답을 보낸 뒤 실행되는 뒷정리 — 기록 저장과 로그 임베드 집계 갱신.
+
+    수백 명이 동시에 누르는 상황을 고려해, 클릭마다 로그 메시지를 보내지 않습니다.
+    대신 **보호 메시지 하나당 로그 임베드 하나**를 두고 사용 인원만 갱신합니다.
+    """
     try:
         if code:
             await save_watermark(guild.id, code, member.id, member.display_name)
@@ -430,18 +441,153 @@ async def _after_click(guild, member, url: str, code: str, settings: dict) -> No
             detail=f"워터마크 `{code}`" if code else "워터마크 없음"
         )
 
-        embed = discord.Embed(
-            title="👁️ 링크 열람",
-            description=f"{member.mention} 님이 보호된 링크를 열람했습니다.",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="👤 유저", value=f"**{member.display_name}**\n`{member.id}`", inline=True)
-        embed.add_field(name="🔖 워터마크", value=f"`{code}`" if code else "`없음`", inline=True)
-        embed.add_field(name="🔗 링크", value=describe_roblox_link(url), inline=False)
-        embed.timestamp = discord.utils.utcnow()
-        await send_guard_log(guild, settings, embed)
+        if message_id:
+            total, _ = await record_link_usage(guild.id, message_id, member.id, member.display_name)
+            await refresh_usage_log(guild, settings, message_id, total, url)
     except Exception as e:
         print(f"[LinkGuard] 클릭 후처리 오류: {e}", flush=True)
+
+
+# 로그 임베드 갱신 빈도 제한 — 보호 메시지별 마지막 갱신 시각(단조 시계)
+_last_log_refresh: dict[int, float] = {}
+LOG_REFRESH_INTERVAL = 10.0
+
+
+async def refresh_usage_log(guild, settings: dict, message_id: int,
+                            total: int, url: str) -> None:
+    """로그 채널의 해당 임베드에 표시된 '사용 인원'을 갱신합니다.
+
+    클릭이 몰릴 때 API를 과하게 호출하지 않도록 10초에 한 번으로 제한합니다.
+    (정확한 최신 수치는 [👥 링크 사용 유저] 버튼에서 항상 확인할 수 있습니다)
+    """
+    ref = _LOG_MESSAGE_BY_PROTECTED.get(message_id)
+    if not ref:
+        return
+
+    now = time.monotonic()
+    last = _last_log_refresh.get(message_id, 0.0)
+    if now - last < LOG_REFRESH_INTERVAL:
+        return
+    _last_log_refresh[message_id] = now
+
+    channel_id = settings.get("log_channel_id")
+    if not channel_id:
+        return
+    channel = guild.get_channel(int(channel_id))
+    if channel is None:
+        return
+
+    try:
+        log_msg = await channel.fetch_message(ref)
+        if not log_msg.embeds:
+            return
+        embed = log_msg.embeds[0]
+        data = embed.to_dict()
+        for field in data.get("fields", []):
+            if field.get("name", "").startswith("👥"):
+                field["name"] = "👥 사용 인원"
+                field["value"] = f"**{total}명**이 이 링크를 사용했습니다."
+                break
+        await log_msg.edit(embed=discord.Embed.from_dict(data), view=UsageStatsView())
+    except discord.NotFound:
+        _LOG_MESSAGE_BY_PROTECTED.pop(message_id, None)
+    except Exception as e:
+        print(f"[LinkGuard] 로그 임베드 갱신 실패: {e}", flush=True)
+
+
+# 보호 메시지 ID -> 로그 채널에 올린 메시지 ID (봇이 살아있는 동안의 빠른 조회용)
+_LOG_MESSAGE_BY_PROTECTED: dict[int, int] = {}
+
+
+class UsageStatsView(discord.ui.View):
+    """로그 임베드 밑에 붙는 [👥 링크 사용 유저] 버튼 (영구 View)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="👥 링크 사용 유저", style=discord.ButtonStyle.secondary,
+                       custom_id=USAGE_BUTTON_ID)
+    async def usage_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ 이 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        ref = await get_log_reference(guild.id, interaction.message.id)
+        if not ref:
+            await interaction.response.send_message(
+                "⚠️ 이 로그와 연결된 보호 메시지를 찾을 수 없습니다.", ephemeral=True
+            )
+            return
+
+        protected_id = int(ref["protected_message_id"])
+        rows = await get_link_usage(guild.id, protected_id)
+
+        embed = discord.Embed(
+            title="👥 이 링크를 사용한 유저",
+            description=(f"총 **{len(rows)}명**이 사용했습니다."
+                         if rows else "아직 이 링크를 사용한 유저가 없습니다."),
+            color=discord.Color.blurple()
+        )
+        if rows:
+            lines = []
+            for i, r in enumerate(rows[:25], start=1):
+                repeat = f" ×{r['count']}" if r.get("count", 1) > 1 else ""
+                lines.append(f"`{i:2}.` <@{r['user_id']}> **{r['user_name']}**{repeat}\n"
+                             f"     └ `{r.get('last','')}`")
+            embed.add_field(
+                name=f"📋 사용자 목록 (최근순 {min(len(rows), 25)}명)",
+                value="\n".join(lines)[:1024],
+                inline=False
+            )
+            if len(rows) > 25:
+                embed.set_footer(text=f"…외 {len(rows) - 25}명 더 있습니다")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def post_usage_log(guild: discord.Guild, settings: dict,
+                         original: discord.Message, posted: discord.Message,
+                         links: list[str]) -> None:
+    """보호된 링크 하나당 로그 채널에 집계 임베드 + [링크 사용 유저] 버튼을 올립니다."""
+    channel_id = settings.get("log_channel_id")
+    if not channel_id:
+        return
+    log_channel = guild.get_channel(int(channel_id))
+    if log_channel is None:
+        return
+
+    title = ""
+    if posted.embeds and posted.embeds[0].title:
+        title = posted.embeds[0].title
+
+    embed = discord.Embed(
+        title="🛡️ 새 링크 보호 시작",
+        description=(f"{original.channel.mention} 채널의 웹훅 임베드에서 "
+                     f"링크 **{len(links)}개**를 보호했습니다."),
+        color=discord.Color.green()
+    )
+    if title:
+        embed.add_field(name="📌 임베드", value=title[:200], inline=False)
+    embed.add_field(name="🔗 링크", value=describe_roblox_link(links[0]), inline=False)
+    embed.add_field(name="👥 사용 인원", value="**0명**이 이 링크를 사용했습니다.", inline=False)
+    embed.add_field(
+        name="🔍 보호된 메시지",
+        value=f"[바로가기]({posted.jump_url})",
+        inline=False
+    )
+    embed.set_footer(text="아래 버튼으로 이 링크를 사용한 유저를 확인할 수 있습니다")
+    embed.timestamp = discord.utils.utcnow()
+
+    try:
+        log_msg = await log_channel.send(embed=embed, view=UsageStatsView())
+    except Exception as e:
+        print(f"[LinkGuard] 로그 임베드 전송 실패: {e}", flush=True)
+        return
+
+    _LOG_MESSAGE_BY_PROTECTED[posted.id] = log_msg.id
+    await save_log_reference(guild.id, log_msg.id, posted.id, posted.channel.id)
 
 
 async def send_guard_log(guild: discord.Guild, settings: dict, embed: discord.Embed) -> None:
@@ -915,9 +1061,11 @@ class LogChannelSelect(discord.ui.ChannelSelect):
         embed = discord.Embed(
             title="✅ 로그 채널 설정 완료",
             description=f"앞으로 다음 기록이 {channel.mention} 채널로 전송됩니다.\n\n"
-                        "• 🛡️ 새 링크 보호 시작\n"
-                        "• 👁️ 링크 열람 (누가 · 언제 · 워터마크)\n"
-                        "• 🚨 링크 유출 감지 (게시자 · 원 수령자 · 조치 결과)",
+                        "• 🛡️ **새 링크 보호 시작** — 링크마다 임베드 1개\n"
+                        "  └ 👥 사용 인원이 이 임베드에 누적 표시됩니다\n"
+                        "  └ **[👥 링크 사용 유저]** 버튼으로 사용자 명단 확인\n"
+                        "• 🚨 **링크 유출 감지** — 게시자 · 원 수령자 · 조치 결과\n\n"
+                        "-# 클릭할 때마다 메시지를 보내지 않으므로 채널이 도배되지 않습니다.",
             color=discord.Color.green() if can_send else discord.Color.orange()
         )
         if not can_send:
@@ -1426,15 +1574,9 @@ class LinkGuard(commands.Cog):
         # 7. 유출 감시 색인에 등록 (이 링크가 서버 어딘가에 다시 뜨면 잡아냅니다)
         await register_guarded_keys(guild.id, [k for k in (link_key(u) for u in all_links) if k])
 
-        # 8. 새 링크가 보호되기 시작했음을 로그 채널에 알립니다
-        log_embed = discord.Embed(
-            title="🛡️ 새 링크 보호 시작",
-            description=f"{message.channel.mention} 채널의 웹훅 임베드에서 링크 **{len(all_links)}개**를 보호했습니다.",
-            color=discord.Color.green()
-        )
-        log_embed.add_field(name="🔗 링크", value=describe_roblox_link(all_links[0]), inline=False)
-        log_embed.timestamp = discord.utils.utcnow()
-        await send_guard_log(guild, settings, log_embed)
+        # 8. 로그 채널에 이 링크 전용 집계 임베드를 올립니다.
+        #    클릭할 때마다 메시지를 보내는 대신, 이 임베드 하나에 사용 인원을 누적합니다.
+        await post_usage_log(guild, settings, message, sent, all_links)
 
     async def _detect_leak(self, message: discord.Message) -> None:
         """서버 안에서 보호 링크가 다시 뿌려지는지 감시합니다."""
@@ -1584,3 +1726,4 @@ async def setup(bot):
     await bot.add_cog(LinkGuard(bot))
     # 봇 재시작 후에도 링크 버튼이 동작하도록 영구 View 등록
     bot.add_view(ProtectedLinkView())
+    bot.add_view(UsageStatsView())

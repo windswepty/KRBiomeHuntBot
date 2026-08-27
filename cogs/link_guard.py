@@ -780,6 +780,88 @@ class RemoveCategoryView(discord.ui.View):
         self.add_item(RemoveCategorySelect(category_ids, guild))
 
 
+class WatermarkLookupModal(discord.ui.Modal, title="🔎 유출 링크 추적"):
+    target_input = discord.ui.TextInput(
+        label="유출된 링크 또는 워터마크 코드를 붙여넣으세요",
+        style=discord.TextStyle.paragraph,
+        placeholder="https://www.roblox.com/share?code=...#hbh-d41ab726\n또는 d41ab726",
+        required=True,
+        max_length=1000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        raw = self.target_input.value.strip()
+
+        # 링크 전체를 붙여넣었으면 워터마크 부분만 뽑고, 코드만 넣었으면 그대로 사용
+        match = WATERMARK_RE.search(raw)
+        code = match.group(1).lower() if match else None
+        if not code:
+            bare = re.fullmatch(r'[0-9a-fA-F]{8}', raw)
+            code = bare.group(0).lower() if bare else None
+
+        if not code:
+            embed = discord.Embed(
+                title="⚠️ 워터마크를 찾을 수 없습니다",
+                description="붙여넣은 값에 `#hbh-xxxxxxxx` 형태의 표식이 없습니다.\n\n"
+                            "**표식이 없는 경우는 두 가지입니다.**\n"
+                            "• 유출자가 `#` 뒤를 지우고 퍼뜨렸다\n"
+                            "• 워터마크 기능이 꺼져 있을 때 발급된 링크다\n\n"
+                            "이 경우 **링크 열람 기록**에서 해당 시간대에 링크를 받아간\n"
+                            "유저 목록을 확인해 용의자를 좁히실 수 있습니다.",
+                color=discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        info = await get_watermark(guild.id, code)
+        if not info:
+            embed = discord.Embed(
+                title="⚠️ 발급 기록이 없는 워터마크입니다",
+                description=f"코드 `{code}` 로 발급된 기록을 찾지 못했습니다.\n"
+                            "다른 서버에서 발급되었거나, 기록이 남기 전의 링크일 수 있습니다.",
+                color=discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        user_id = info["user_id"]
+        member = guild.get_member(int(user_id))
+
+        embed = discord.Embed(
+            title="🎯 유출자 추적 결과",
+            description=f"이 링크는 아래 유저에게 발급된 것입니다.",
+            color=discord.Color.red()
+        )
+        embed.add_field(
+            name="👤 최초 수령자",
+            value=f"<@{user_id}>\n**{info.get('user_name', '?')}**\n`{user_id}`",
+            inline=True
+        )
+        embed.add_field(name="🔖 워터마크", value=f"`{code}`", inline=True)
+        embed.add_field(
+            name="📌 서버 재적 여부",
+            value="✅ 서버에 있음" if member else "❌ 이미 나감",
+            inline=True
+        )
+
+        logs = await get_click_logs(guild.id, limit=100)
+        mine = [x for x in logs if x.get("user_id") == str(user_id)]
+        if mine:
+            lines = [f"• `{x.get('timestamp','')}` {describe_roblox_link(x.get('url',''))}"
+                     for x in mine[:5]]
+            embed.add_field(name="🕓 이 유저의 최근 열람 기록", value="\n".join(lines)[:1024], inline=False)
+
+        embed.add_field(
+            name="⚠️ 판단 시 참고",
+            value="워터마크는 **링크를 받아간 사람**을 가리킵니다.\n"
+                  "이 유저가 직접 퍼뜨렸을 수도 있고, 이 유저의 화면·기기에서\n"
+                  "제3자가 가져갔을 수도 있습니다. 조치 전에 확인해 주세요.",
+            inline=False
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class LogChannelSelect(discord.ui.ChannelSelect):
     def __init__(self):
         super().__init__(
@@ -902,6 +984,12 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="📋"
             ),
             discord.SelectOption(
+                label="유출 링크 추적 (워터마크 조회)",
+                value="trace",
+                description="외부에서 발견한 유출 링크로 최초 수령자를 찾습니다.",
+                emoji="🎯"
+            ),
+            discord.SelectOption(
                 label="유출 감지 기록",
                 value="leaks",
                 description="서버 안에서 링크를 퍼뜨린 유저 기록을 확인합니다.",
@@ -995,6 +1083,9 @@ class GuardSettingsSelect(discord.ui.Select):
                 view=RemoveGuardChannelView(channel_ids, guild),
                 ephemeral=True
             )
+
+        elif choice == "trace":
+            await interaction.response.send_modal(WatermarkLookupModal())
 
         elif choice == "text":
             await interaction.response.send_modal(GuardTextModal(settings))
@@ -1311,12 +1402,30 @@ class LinkGuard(commands.Cog):
         found_urls = [clean_url(u) for u in URL_RE.findall(content)]
 
         leaked = [u for u in found_urls if link_key(u) in guarded]
-        # URL 없이 워터마크 코드만 붙여넣은 경우도 잡습니다
-        mark_only = not leaked and WATERMARK_RE.search(content)
-        if not leaked and not mark_only:
+
+        # URL 형태가 아니어도 잡습니다.
+        #  · 개인서버 코드만 복사해 전달한 경우 (예: "코드 c26ae66d… 이거 써")
+        #  · 워터마크 코드만 남은 경우
+        bare_code = None
+        if not leaked:
+            lowered = content.lower()
+            for key in guarded:
+                code = key.split(":", 1)[-1]
+                if len(code) >= 8 and code in lowered:
+                    bare_code = code
+                    break
+
+        mark_only = not leaked and not bare_code and WATERMARK_RE.search(content)
+        if not leaked and not bare_code and not mark_only:
             return
 
-        leaked_url = leaked[0] if leaked else content
+        if leaked:
+            leaked_url, how = leaked[0], "링크 게시"
+        elif bare_code:
+            leaked_url, how = f"(코드 직접 게시) {bare_code}", "개인서버 코드만 게시"
+        else:
+            leaked_url, how = content[:200], "워터마크 코드 게시"
+
         source = ""
         mark = WATERMARK_RE.search(leaked_url) or WATERMARK_RE.search(content)
         if mark:
@@ -1332,7 +1441,7 @@ class LinkGuard(commands.Cog):
             except Exception:
                 pass
 
-        detail = f"#{message.channel} 채널에 게시"
+        detail = f"#{message.channel} 채널에 {how}"
         if source:
             detail += " / 원 수령자 추적됨"
         await add_click_log(

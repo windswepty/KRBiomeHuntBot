@@ -616,6 +616,131 @@ class AddCategoryView(discord.ui.View):
         self.add_item(AddCategorySelect())
 
 
+def build_category_result_embed(guild: discord.Guild, category_ids: list[int],
+                                added: list[int], title: str) -> discord.Embed:
+    """카테고리 추가 결과와 권한 상태를 정리한 임베드를 만듭니다."""
+    me = guild.me
+    channels = collect_guarded_channels(guild, {"category_ids": category_ids, "channel_ids": []})
+    blocked = [c for c in channels if not _channel_ready(c, me)]
+
+    embed = discord.Embed(
+        title=title,
+        description=f"새로 추가된 카테고리: **{len(added)}개**\n"
+                    f"현재 감시 카테고리: **{len(category_ids)}개** "
+                    f"→ 텍스트 채널 **{len(channels)}개**\n\n"
+                    "-# 카테고리에 채널을 새로 만들면 자동으로 감시 대상에 포함됩니다.",
+        color=discord.Color.green() if not blocked else discord.Color.orange()
+    )
+
+    if added:
+        names = []
+        for cid in added[:20]:
+            cat = guild.get_channel(cid)
+            names.append(f"• {cat.name}" if isinstance(cat, discord.CategoryChannel) else f"• `{cid}`")
+        embed.add_field(name="➕ 추가된 카테고리", value="\n".join(names)[:1024], inline=False)
+
+    if blocked:
+        embed.add_field(
+            name=f"⚠️ 봇 권한이 없는 채널 {len(blocked)}개",
+            value=("이 채널들은 **감시되지 않습니다.**\n"
+                   + ", ".join(c.mention for c in blocked[:8])
+                   + ("…" if len(blocked) > 8 else "")
+                   + "\n\n카테고리 편집 → 권한에서 봇 역할에\n"
+                   "`채널 보기` · `메시지 보내기` · `메시지 관리` 를 주세요.")[:1024],
+            inline=False
+        )
+    elif channels:
+        embed.add_field(name="🔑 권한 점검", value="✅ 모든 채널에서 정상 동작합니다.", inline=False)
+
+    return embed
+
+
+class CategoryNameModal(discord.ui.Modal, title="🔎 이름으로 카테고리 일괄 추가"):
+    keyword_input = discord.ui.TextInput(
+        label="카테고리 이름에 포함된 단어를 입력하세요",
+        placeholder="예: 매크로 채널   → '매크로 채널 1~15' 전부 추가",
+        required=True,
+        max_length=100
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        keyword = self.keyword_input.value.strip().lower()
+        if not keyword:
+            await interaction.response.send_message("⚠️ 검색할 단어를 입력해 주세요.", ephemeral=True)
+            return
+
+        matched = [c for c in guild.categories if keyword in c.name.lower()]
+        if not matched:
+            await interaction.response.send_message(
+                f"⚠️ 이름에 `{self.keyword_input.value.strip()}` 이(가) 들어간 카테고리를 찾지 못했습니다.\n"
+                "-# 봇이 볼 수 없는 카테고리는 검색되지 않습니다. "
+                "카테고리 권한에 봇 역할을 추가한 뒤 다시 시도해 주세요.",
+                ephemeral=True
+            )
+            return
+
+        settings = await get_linkguard_settings(guild.id)
+        category_ids = list(settings.get("category_ids", []))
+        added = [c.id for c in matched if c.id not in category_ids]
+        category_ids.extend(added)
+
+        await save_linkguard_settings(guild.id, {"category_ids": category_ids})
+        embed = build_category_result_embed(
+            guild, category_ids, added,
+            f"✅ '{self.keyword_input.value.strip()}' 카테고리 {len(matched)}개 검색됨"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CategoryIdModal(discord.ui.Modal, title="🆔 카테고리 ID로 추가"):
+    ids_input = discord.ui.TextInput(
+        label="카테고리 ID를 입력하세요 (여러 개 가능)",
+        style=discord.TextStyle.paragraph,
+        placeholder="쉼표 · 띄어쓰기 · 줄바꿈으로 구분\n예:\n1329788098187624500\n1329788098187624501",
+        required=True,
+        max_length=2000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        raw_ids = [int(m) for m in re.findall(r'\d{17,20}', self.ids_input.value)]
+        if not raw_ids:
+            await interaction.response.send_message(
+                "⚠️ 올바른 카테고리 ID를 찾지 못했습니다.\n"
+                "-# 디스코드 설정 → 고급 → 개발자 모드를 켠 뒤, 카테고리 우클릭 → `ID 복사`",
+                ephemeral=True
+            )
+            return
+
+        settings = await get_linkguard_settings(guild.id)
+        category_ids = list(settings.get("category_ids", []))
+
+        added, not_found = [], []
+        for cid in raw_ids:
+            target = guild.get_channel(cid)
+            if not isinstance(target, discord.CategoryChannel):
+                not_found.append(cid)
+                continue
+            if cid not in category_ids:
+                category_ids.append(cid)
+                added.append(cid)
+
+        await save_linkguard_settings(guild.id, {"category_ids": category_ids})
+        embed = build_category_result_embed(
+            guild, category_ids, added, "✅ 카테고리 ID 추가 완료"
+        )
+        if not_found:
+            embed.add_field(
+                name=f"⚠️ 찾지 못한 ID {len(not_found)}개",
+                value=("\n".join(f"• `{c}`" for c in not_found[:10])
+                       + "\n\n카테고리가 아니거나, **봇이 볼 수 없는 카테고리**입니다.\n"
+                         "카테고리 권한에 봇 역할을 추가해 주세요.")[:1024],
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class RemoveCategorySelect(discord.ui.Select):
     def __init__(self, category_ids: list[int], guild: discord.Guild):
         options = []
@@ -729,10 +854,22 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="⚡"
             ),
             discord.SelectOption(
-                label="감시 카테고리 추가 (권장)",
+                label="이름으로 카테고리 일괄 추가 (권장)",
+                value="addcatname",
+                description="예: '매크로 채널' 입력 → 이름이 겹치는 카테고리 전부 추가",
+                emoji="🔎"
+            ),
+            discord.SelectOption(
+                label="카테고리 목록에서 추가",
                 value="addcat",
-                description="카테고리 안의 모든 채널을 한 번에 감시 대상으로 지정합니다.",
+                description="드롭다운에서 카테고리를 골라 감시 대상으로 지정합니다.",
                 emoji="📂"
+            ),
+            discord.SelectOption(
+                label="카테고리 ID로 추가",
+                value="addcatid",
+                description="목록에 안 보이는 카테고리를 ID로 직접 추가합니다.",
+                emoji="🆔"
             ),
             discord.SelectOption(
                 label="감시 카테고리 해제",
@@ -807,11 +944,19 @@ class GuardSettingsSelect(discord.ui.Select):
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
+        elif choice == "addcatname":
+            await interaction.response.send_modal(CategoryNameModal())
+
+        elif choice == "addcatid":
+            await interaction.response.send_modal(CategoryIdModal())
+
         elif choice == "addcat":
             await interaction.response.send_message(
                 "📂 **감시할 카테고리를 선택하세요.**\n"
                 "-# 카테고리 안의 모든 텍스트 채널(비공개 포함)이 감시 대상이 되며,\n"
-                "-# 나중에 새로 만드는 채널도 자동으로 포함됩니다.",
+                "-# 나중에 새로 만드는 채널도 자동으로 포함됩니다.\n"
+                "-# 목록에 안 보이면 검색창에 이름을 입력하거나, "
+                "**이름으로 일괄 추가** / **ID로 추가**를 사용하세요.",
                 view=AddCategoryView(),
                 ephemeral=True
             )

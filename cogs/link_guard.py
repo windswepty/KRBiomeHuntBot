@@ -395,6 +395,8 @@ class ProtectedLinkView(discord.ui.View):
         # 만료되어 쓸 수 없습니다. 주소를 못 구하면 조용히 직접 링크로 돌아갑니다.
         relay_base = link_tokens.public_base_url() if settings.get("relay_links") else None
         relayed = False
+        # 이 유저에게 실제로 준 대표 주소 — 사용 기록에 남겨 감사에 씁니다
+        issued_url = ""
 
         for idx, link in enumerate(links[:5], start=1):
             marked = apply_watermark(link, code) if code else link
@@ -424,6 +426,8 @@ class ProtectedLinkView(discord.ui.View):
 
             try:
                 link_view.add_item(discord.ui.Button(label=label, url=target, style=discord.ButtonStyle.link))
+                if not issued_url:
+                    issued_url = target
             except Exception:
                 overflow.append(link)
 
@@ -454,12 +458,12 @@ class ProtectedLinkView(discord.ui.View):
         if gated:
             asyncio.create_task(
                 _after_click(guild, member, links, code, settings,
-                             message=interaction.message)
+                             message=interaction.message, issued_url=issued_url)
             )
 
 
 async def _after_click(guild, member, links: list[str], code: str, settings: dict,
-                       message=None) -> None:
+                       message=None, issued_url: str = "") -> None:
     """클릭 응답을 보낸 뒤 실행되는 뒷정리 — 기록 저장과 로그 임베드 집계.
 
     수백 명이 동시에 누르는 상황을 고려해, 클릭마다 로그 메시지를 보내지 않습니다.
@@ -478,7 +482,8 @@ async def _after_click(guild, member, links: list[str], code: str, settings: dic
 
         if message is not None:
             total, _ = await record_link_usage(guild.id, message.id,
-                                               member.id, member.display_name)
+                                               member.id, member.display_name,
+                                               issued_url=issued_url)
             await ensure_usage_log(guild, settings, message, links, total)
     except Exception as e:
         print(f"[LinkGuard] 클릭 후처리 오류: {e}", flush=True)
@@ -669,6 +674,91 @@ async def _apply_usage_refresh(guild, settings: dict, message_id: int,
 _LOG_MESSAGE_BY_PROTECTED: dict[int, int] = {}
 
 
+class UsagePageView(discord.ui.View):
+    """링크 사용 유저 명단 — 한 페이지 10명씩 넘겨보는 뷰.
+
+    관리자에게만 보이는 임시(에페메랄) 응답이라 영구 View 가 아니며,
+    5분 뒤 자동으로 만료됩니다.
+    """
+
+    PER_PAGE = 10
+
+    def __init__(self, rows: list[dict]):
+        super().__init__(timeout=300)
+        self.rows = rows
+        self.page = 0
+        self.pages = max(1, (len(rows) + self.PER_PAGE - 1) // self.PER_PAGE)
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.pages - 1
+
+    def build_embed(self) -> discord.Embed:
+        total = len(self.rows)
+        embed = discord.Embed(
+            title="👤 이 링크를 사용한 유저",
+            description=(f"총 **{total}명**이 사용했습니다."
+                         if total else "아직 이 링크를 사용한 유저가 없습니다."),
+            color=discord.Color.blurple()
+        )
+        if not total:
+            return embed
+
+        begin = self.page * self.PER_PAGE
+        chunk = self.rows[begin:begin + self.PER_PAGE]
+
+        lines: list[str] = []
+        for offset, r in enumerate(chunk, start=begin + 1):
+            repeat = f" ×{r['count']}" if r.get("count", 1) > 1 else ""
+            # 발급 주소는 백틱으로 감싸 **클릭되지 않게** 둡니다.
+            # 링크가 1회용이라, 관리자가 눌러버리면 정작 그 유저가 못 들어갑니다.
+            link = r.get("link") or ""
+            link_line = f"`{link}`" if link else "`(기록 없음)`"
+            lines.append(
+                f"`{offset:2}.` <@{r['user_id']}> {r['user_name']} "
+                f"(`{r['user_id']}`){repeat}\n"
+                f"     └ `{r.get('last', '')}`\n"
+                f"     └ {link_line}"
+            )
+
+        # 임베드 필드는 1024자 상한이라, 10명이 한 필드에 안 들어갑니다.
+        # 넘칠 때마다 필드를 새로 열어 잘림 없이 담습니다.
+        fields: list[list[str]] = [[]]
+        used = 0
+        for line in lines:
+            if used + len(line) + 1 > 1000 and fields[-1]:
+                fields.append([])
+                used = 0
+            fields[-1].append(line)
+            used += len(line) + 1
+
+        for idx, group in enumerate(fields):
+            if not group:
+                continue
+            embed.add_field(
+                name=(f"📋 사용자 목록 ({begin + 1}~{begin + len(chunk)}번)"
+                      if idx == 0 else "\u200b"),
+                value="\n".join(group),
+                inline=False
+            )
+        embed.set_footer(text=f"{self.page + 1} / {self.pages} 페이지 · 최근 사용순")
+        return embed
+
+    async def _turn(self, interaction: discord.Interaction, delta: int) -> None:
+        self.page = max(0, min(self.pages - 1, self.page + delta))
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary, emoji="◀")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn(interaction, -1)
+
+    @discord.ui.button(label="다음", style=discord.ButtonStyle.secondary, emoji="▶")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn(interaction, +1)
+
+
 class UsageStatsView(discord.ui.View):
     """로그 임베드 밑에 붙는 [👥 링크 사용 유저] 버튼 (영구 View)."""
 
@@ -695,50 +785,13 @@ class UsageStatsView(discord.ui.View):
         protected_id = int(ref["protected_message_id"])
         rows = await get_link_usage(guild.id, protected_id)
 
-        embed = discord.Embed(
-            title="👥 이 링크를 사용한 유저",
-            description=(f"총 **{len(rows)}명**이 사용했습니다."
-                         if rows else "아직 이 링크를 사용한 유저가 없습니다."),
-            color=discord.Color.blurple()
+        view = UsagePageView(rows)
+        # 한 페이지에 다 들어가면 넘길 버튼을 보여줄 이유가 없습니다
+        await interaction.response.send_message(
+            embed=view.build_embed(),
+            view=view if view.pages > 1 else discord.utils.MISSING,
+            ephemeral=True
         )
-        if rows:
-            # 임베드 필드는 1024자가 상한입니다. 예전처럼 통째로 잘라내면
-            # 마지막 줄이 문장 중간에서 끊기고, "25명 표시"라고 적어놓고 실제로는
-            # 그보다 적게 보이는 문제가 있었습니다. 들어가는 만큼만 담고
-            # 남은 인원은 정확히 세어 알려줍니다.
-            # 한 필드에 다 담으면 열 명 남짓밖에 안 들어가므로,
-            # 1024자씩 끊어 여러 필드로 나눠 담습니다.
-            MAX_FIELDS = 3
-            chunks: list[list[str]] = [[]]
-            used = 0
-            shown = 0
-            for i, r in enumerate(rows, start=1):
-                repeat = f" ×{r['count']}" if r.get("count", 1) > 1 else ""
-                # ID 는 백틱으로 감싸 복사하기 쉽게 둡니다 (블랙리스트 등록 등에 사용)
-                line = (f"`{i:2}.` <@{r['user_id']}> **{r['user_name']}** "
-                        f"(`{r['user_id']}`){repeat}\n"
-                        f"     └ `{r.get('last','')}`")
-                if used + len(line) + 1 > 1000:
-                    if len(chunks) >= MAX_FIELDS:
-                        break
-                    chunks.append([])
-                    used = 0
-                chunks[-1].append(line)
-                used += len(line) + 1
-                shown += 1
-
-            for idx, chunk in enumerate(chunks):
-                if not chunk:
-                    continue
-                embed.add_field(
-                    name=(f"📋 사용자 목록 (최근순 {shown}명)" if idx == 0 else "​"),
-                    value="\n".join(chunk),
-                    inline=False
-                )
-            remaining = len(rows) - shown
-            if remaining > 0:
-                embed.set_footer(text=f"…외 {remaining}명 더 있습니다")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def post_usage_log(guild: discord.Guild, settings: dict,

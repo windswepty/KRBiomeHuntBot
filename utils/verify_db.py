@@ -629,11 +629,16 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
 
 
 async def record_link_usage(guild_id: int, message_id: int,
-                            user_id: int, user_name: str) -> tuple[int, bool]:
+                            user_id: int, user_name: str,
+                            issued_url: str = "") -> tuple[int, bool]:
     """보호 메시지별로 '누가 링크를 사용했는지'를 기록합니다.
 
     반환값은 (지금까지 사용한 서로 다른 유저 수, 이번이 첫 사용인지) 입니다.
     임베드(보호 메시지)마다 따로 집계됩니다.
+
+    issued_url 은 그 유저에게 실제로 발급한 주소입니다. 나중에 '누구에게
+    무엇을 줬는지' 감사할 수 있도록 남깁니다. 같은 유저가 다시 누르면
+    최신 발급분으로 갱신됩니다.
     """
     key = f"{guild_id}:{message_id}"
     timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -657,6 +662,8 @@ async def record_link_usage(guild_id: int, message_id: int,
     entry["name"] = user_name
     entry["count"] = entry.get("count", 0) + 1
     entry["last"] = timestamp
+    if issued_url:
+        entry["link"] = issued_url
     bucket[uid] = entry
     total = len(bucket)
 
@@ -671,6 +678,7 @@ async def record_link_usage(guild_id: int, message_id: int,
                         "message_id": str(message_id),
                         f"users.{uid}.name": user_name,
                         f"users.{uid}.last": timestamp,
+                        **({f"users.{uid}.link": issued_url} if issued_url else {}),
                         # 클릭할 때마다 갱신 → 계속 쓰이는 링크는 만료되지 않고,
                         # 30일간 아무도 안 누른 것만 자동 삭제됩니다.
                         "updated": _utcnow(),
@@ -730,6 +738,7 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
             "count": info.get("count", 1),
             "first": info.get("first", info.get("last", "")),
             "last": info.get("last", ""),
+            "link": info.get("link", ""),
         }
         for uid, info in bucket.items()
     ]

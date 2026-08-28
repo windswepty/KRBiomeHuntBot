@@ -37,6 +37,11 @@ DISCORD_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
 DISCORD_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_ME = "https://discord.com/api/users/@me"
 
+# 디스코드 API 는 Cloudflare 뒤에 있고, 파이썬 기본 User-Agent
+# (Python-urllib/3.x)는 시그니처 차단(HTTP 403, error code 1010)에 걸립니다.
+# 디스코드 문서도 모든 API 요청에 User-Agent 를 요구합니다.
+USER_AGENT = "KRBiomeHuntBot (https://github.com/windswepty/KRBiomeHuntBot, 1.0)"
+
 
 def client_id() -> str:
     return (os.getenv("DISCORD_CLIENT_ID") or "").strip()
@@ -147,13 +152,22 @@ def exchange_code(code: str, redirect_uri: str) -> int | None:
                 "code": code,
                 "redirect_uri": redirect_uri,
             },
-            {"Content-Type": "application/x-www-form-urlencoded"},
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            },
         )
         access = token.get("access_token")
         if not access:
             return None
         req = urllib.request.Request(
-            DISCORD_ME, headers={"Authorization": f"Bearer {access}"})
+            DISCORD_ME,
+            headers={
+                "Authorization": f"Bearer {access}",
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            })
         with urllib.request.urlopen(req, timeout=10) as resp:
             me = json.loads(resp.read().decode())
         uid = me.get("id")

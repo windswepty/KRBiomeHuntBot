@@ -702,18 +702,42 @@ class UsageStatsView(discord.ui.View):
             color=discord.Color.blurple()
         )
         if rows:
-            lines = []
-            for i, r in enumerate(rows[:25], start=1):
+            # 임베드 필드는 1024자가 상한입니다. 예전처럼 통째로 잘라내면
+            # 마지막 줄이 문장 중간에서 끊기고, "25명 표시"라고 적어놓고 실제로는
+            # 그보다 적게 보이는 문제가 있었습니다. 들어가는 만큼만 담고
+            # 남은 인원은 정확히 세어 알려줍니다.
+            # 한 필드에 다 담으면 열 명 남짓밖에 안 들어가므로,
+            # 1024자씩 끊어 여러 필드로 나눠 담습니다.
+            MAX_FIELDS = 3
+            chunks: list[list[str]] = [[]]
+            used = 0
+            shown = 0
+            for i, r in enumerate(rows, start=1):
                 repeat = f" ×{r['count']}" if r.get("count", 1) > 1 else ""
-                lines.append(f"`{i:2}.` <@{r['user_id']}> **{r['user_name']}**{repeat}\n"
-                             f"     └ `{r.get('last','')}`")
-            embed.add_field(
-                name=f"📋 사용자 목록 (최근순 {min(len(rows), 25)}명)",
-                value="\n".join(lines)[:1024],
-                inline=False
-            )
-            if len(rows) > 25:
-                embed.set_footer(text=f"…외 {len(rows) - 25}명 더 있습니다")
+                # ID 는 백틱으로 감싸 복사하기 쉽게 둡니다 (블랙리스트 등록 등에 사용)
+                line = (f"`{i:2}.` <@{r['user_id']}> **{r['user_name']}** "
+                        f"(`{r['user_id']}`){repeat}\n"
+                        f"     └ `{r.get('last','')}`")
+                if used + len(line) + 1 > 1000:
+                    if len(chunks) >= MAX_FIELDS:
+                        break
+                    chunks.append([])
+                    used = 0
+                chunks[-1].append(line)
+                used += len(line) + 1
+                shown += 1
+
+            for idx, chunk in enumerate(chunks):
+                if not chunk:
+                    continue
+                embed.add_field(
+                    name=(f"📋 사용자 목록 (최근순 {shown}명)" if idx == 0 else "​"),
+                    value="\n".join(chunk),
+                    inline=False
+                )
+            remaining = len(rows) - shown
+            if remaining > 0:
+                embed.set_footer(text=f"…외 {remaining}명 더 있습니다")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

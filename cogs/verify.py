@@ -44,6 +44,39 @@ async def is_verified(guild: discord.Guild, member: discord.Member) -> bool:
 
 # ── 인증 패널 (영구 View) ─────────────────────────────────────────────
 
+def build_panel_embed(settings: dict, guild: discord.Guild) -> discord.Embed:
+    """인증 패널 임베드를 만듭니다.
+
+    인증 자격(필요 역할)이 지정돼 있으면 함께 보여줍니다. 조건을 모른 채
+    버튼을 눌렀다가 거부당하는 것보다, 미리 알려주는 편이 낫습니다.
+    """
+    embed = discord.Embed(
+        title=settings.get("title", "✅ 서버 인증"),
+        description=settings.get("description", ""),
+        color=discord.Color.green()
+    )
+
+    required = [int(r) for r in settings.get("required_role_ids", [])]
+    if required:
+        roles = [guild.get_role(rid) for rid in required]
+        names = " · ".join(r.mention for r in roles if r)
+        if names:
+            embed.add_field(
+                name="🎫 인증 자격",
+                value=f"아래 역할 중 **하나 이상**을 보유해야 인증할 수 있습니다.\n{names}",
+                inline=False
+            )
+        if settings.get("auto_revoke", False):
+            embed.add_field(
+                name="♻️ 자격 유지",
+                value="위 역할을 **모두 잃으면** 인증이 자동으로 해제됩니다.",
+                inline=False
+            )
+
+    embed.set_footer(text="한바헌 서버 인증 시스템")
+    return embed
+
+
 class VerifyPanelView(discord.ui.View):
     def __init__(self, button_label: str = "인증하기"):
         super().__init__(timeout=None)
@@ -224,12 +257,7 @@ class PanelChannelSelect(discord.ui.ChannelSelect):
 
         settings = await get_verify_settings(interaction.guild.id)
 
-        embed = discord.Embed(
-            title=settings.get("title", "✅ 서버 인증"),
-            description=settings.get("description", ""),
-            color=discord.Color.green()
-        )
-        embed.set_footer(text="한바헌 서버 인증 시스템")
+        embed = build_panel_embed(settings, interaction.guild)
 
         view = VerifyPanelView(button_label=settings.get("button_label", "인증하기"))
 

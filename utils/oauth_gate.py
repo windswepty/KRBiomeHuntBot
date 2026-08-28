@@ -121,7 +121,9 @@ def authorize_url(redirect_uri: str, state: str) -> str:
         # 가입한 서버 목록(guilds)은 요청하지 않습니다.
         "scope": "identify",
         "state": state,
-        "prompt": "none",     # 이미 승인한 유저는 동의 화면 없이 통과
+        # prompt 는 지정하지 않습니다. 디스코드는 이미 승인한 앱·같은 권한이면
+        # 알아서 동의 화면을 건너뜁니다. prompt=none 을 주면 아직 승인하지
+        # 않은 유저에게 동의 화면 대신 오류가 돌아올 수 있습니다.
     }
     return f"{DISCORD_AUTHORIZE}?{urllib.parse.urlencode(params)}"
 
@@ -156,6 +158,15 @@ def exchange_code(code: str, redirect_uri: str) -> int | None:
             me = json.loads(resp.read().decode())
         uid = me.get("id")
         return int(uid) if uid else None
+    except urllib.error.HTTPError as e:
+        # 디스코드가 알려주는 사유를 그대로 남깁니다.
+        # (redirect_uri 불일치, client_secret 오류 등이 여기서 드러납니다)
+        try:
+            detail = e.read().decode()[:300]
+        except Exception:
+            detail = ""
+        print(f"[OAuthGate] 코드 교환 실패 HTTP {e.code}: {detail}", flush=True)
+        return None
     except (urllib.error.URLError, ValueError, KeyError, TypeError) as e:
         print(f"[OAuthGate] 코드 교환 실패: {e}", flush=True)
         return None

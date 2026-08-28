@@ -121,24 +121,41 @@ def join(token: str):
 
 @app.route('/auth/callback')
 def auth_callback():
+    # 실패 원인을 로그로 남깁니다. 안내 페이지는 같아도, 관리자는
+    # 어디서 막혔는지 알아야 고칠 수 있습니다.
     if not oauth_gate.enabled():
+        print("[OAuthGate] 콜백 실패: 게이트 비활성(환경 변수 누락)", flush=True)
+        return _page("auth_failed")
+
+    err = request.args.get("error")
+    if err:
+        print(f"[OAuthGate] 콜백 실패: 디스코드가 거부 - {err} "
+              f"({request.args.get('error_description', '')})", flush=True)
         return _page("auth_failed")
 
     token = oauth_gate.read_state(request.args.get("state"))
     if not token:
+        print("[OAuthGate] 콜백 실패: state 검증 실패(만료 또는 서명 불일치)", flush=True)
         return _page("auth_failed")
 
     code = request.args.get("code")
     if not code:
+        print("[OAuthGate] 콜백 실패: code 파라미터 없음", flush=True)
         return _page("auth_failed")
 
-    user_id = oauth_gate.exchange_code(code, _redirect_uri())
+    redirect_uri = _redirect_uri()
+    user_id = oauth_gate.exchange_code(code, redirect_uri)
     if user_id is None:
+        print(f"[OAuthGate] 콜백 실패: 코드 교환 불가 "
+              f"(사용한 redirect_uri={redirect_uri})", flush=True)
         return _page("auth_failed")
 
     signed = oauth_gate.sign_user(user_id)
     if not signed:
+        print("[OAuthGate] 콜백 실패: 쿠키 서명 불가(서명 키 없음)", flush=True)
         return _page("auth_failed")
+
+    print(f"[OAuthGate] 신원 확인 성공: {user_id}", flush=True)
 
     # 신원을 쿠키에 심고, 원래 가려던 링크로 되돌립니다.
     # 다음부터는 이 단계 없이 즉시 통과합니다.

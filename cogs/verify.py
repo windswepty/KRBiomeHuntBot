@@ -81,6 +81,23 @@ class VerifyPanelView(discord.ui.View):
             return
 
         member = interaction.user
+
+        # 인증 자격 검사 — 지정된 역할 중 하나라도 갖고 있어야 합니다.
+        # 비어 있으면 조건 없이 통과합니다(기존 동작).
+        required = [int(r) for r in settings.get("required_role_ids", [])]
+        if required and not any(r.id in required for r in member.roles):
+            have = [guild.get_role(rid) for rid in required]
+            names = " · ".join(r.mention for r in have if r) or "관리자에게 문의"
+            embed = discord.Embed(
+                title="🔒 인증 자격이 없습니다",
+                description="이 서버의 인증은 **아래 역할 중 하나**를 보유한 분만 신청할 수 있습니다.",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="🎫 필요한 역할", value=names, inline=False)
+            embed.set_footer(text="역할을 받는 방법은 관리자에게 문의해 주세요")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
         if any(r.id == role.id for r in member.roles):
             await interaction.response.send_message(
                 f"ℹ️ 이미 인증이 완료된 상태입니다! (보유 역할: {role.mention})",
@@ -238,6 +255,109 @@ class PanelChannelView(discord.ui.View):
         self.add_item(PanelChannelSelect())
 
 
+class RequiredRoleIdModal(discord.ui.Modal, title="🆔 인증 필요 역할 추가"):
+    role_input = discord.ui.TextInput(
+        label="역할 ID를 입력하세요 (여러 개 가능)",
+        placeholder="예: 1329788098187624500, 1329788098187624501",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=600
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        settings = await get_verify_settings(guild.id)
+        current = [int(r) for r in settings.get("required_role_ids", [])]
+
+        found, missing, dupes = [], [], []
+        for raw in re.findall(r"[0-9]{17,20}", self.role_input.value):
+            rid = int(raw)
+            role = guild.get_role(rid)
+            if role is None:
+                missing.append(raw)
+            elif rid in current:
+                dupes.append(role)
+            else:
+                current.append(rid)
+                found.append(role)
+
+        if found:
+            await save_verify_settings(guild.id, {"required_role_ids": current})
+
+        embed = discord.Embed(
+            title="🎫 인증 필요 역할 추가",
+            color=discord.Color.green() if found else discord.Color.orange()
+        )
+        if found:
+            embed.add_field(name="✅ 추가됨",
+                            value="\n".join(f"• {r.mention} (`{r.id}`)" for r in found),
+                            inline=False)
+        if dupes:
+            embed.add_field(name="ℹ️ 이미 있음",
+                            value="\n".join(f"• {r.mention}" for r in dupes), inline=False)
+        if missing:
+            embed.add_field(
+                name="⚠️ 서버에서 찾을 수 없음",
+                value="\n".join(f"• `{m}`" for m in missing)
+                      + "\n-# 역할 우클릭 → ID 복사 로 다시 확인해 주세요",
+                inline=False)
+        if not found and not dupes and not missing:
+            embed.description = "입력에서 역할 ID를 찾지 못했습니다. 17~20자리 숫자를 넣어 주세요."
+
+        embed.add_field(name="📋 현재 지정된 역할 수", value=f"**{len(current)}개**", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class RemoveRequiredRoleSelect(discord.ui.Select):
+    def __init__(self, role_ids: list[int], guild: discord.Guild):
+        options = []
+        for rid in role_ids[:25]:
+            role = guild.get_role(rid)
+            options.append(discord.SelectOption(
+                label=(f"@{role.name}" if role else f"(삭제된 역할)")[:100],
+                value=str(rid),
+                description=str(rid)
+            ))
+        if not options:
+            options = [discord.SelectOption(label="지정된 역할이 없습니다", value="none")]
+        super().__init__(placeholder="해제할 역할을 선택하세요...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("해제할 역할이 없습니다.", ephemeral=True)
+            return
+        guild = interaction.guild
+        settings = await get_verify_settings(guild.id)
+        current = [int(r) for r in settings.get("required_role_ids", [])]
+        rid = int(self.values[0])
+        if rid in current:
+            current.remove(rid)
+            await save_verify_settings(guild.id, {"required_role_ids": current})
+        role = guild.get_role(rid)
+        embed = discord.Embed(
+            title="🎫 인증 필요 역할 해제",
+            description=f"{role.mention if role else f'`{rid}`'} 을(를) 목록에서 제거했습니다.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="📋 남은 역할 수", value=f"**{len(current)}개**", inline=False)
+        if not current:
+            embed.add_field(
+                name="⚠️ 주의",
+                value="지정된 역할이 하나도 없어, **누구나 인증할 수 있는 상태**가 되었습니다.",
+                inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class RequiredRoleView(discord.ui.View):
+    def __init__(self, role_ids: list[int], guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.add_item(RemoveRequiredRoleSelect(role_ids, guild))
+
+    @discord.ui.button(label="역할 ID로 추가", style=discord.ButtonStyle.success, emoji="🆔", row=1)
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RequiredRoleIdModal())
+
+
 class VerifySettingsSelect(discord.ui.Select):
     def __init__(self, current: dict, guild: discord.Guild):
         role_id = current.get("role_id")
@@ -257,6 +377,13 @@ class VerifySettingsSelect(discord.ui.Select):
                 value="role",
                 description=role_desc[:95],
                 emoji="🎭"
+            ),
+            discord.SelectOption(
+                label="인증 필요 역할 관리",
+                value="reqrole",
+                description=(f"현재 {len(current.get('required_role_ids', []))}개 지정됨"
+                             " (비어있으면 누구나 인증 가능)")[:95],
+                emoji="🎫"
             ),
             discord.SelectOption(
                 label="인증 패널 전송",
@@ -284,7 +411,33 @@ class VerifySettingsSelect(discord.ui.Select):
         guild = interaction.guild
         settings = await get_verify_settings(guild.id)
 
-        if choice == "toggle":
+        if choice == "reqrole":
+            required = [int(r) for r in settings.get("required_role_ids", [])]
+            embed = discord.Embed(
+                title="🎫 인증 필요 역할 관리",
+                description=("인증을 신청하려면 **아래 역할 중 하나 이상**을 갖고 있어야 합니다.\n"
+                             "여러 개를 지정하면 그중 하나만 있어도 통과합니다."),
+                color=discord.Color.blurple()
+            )
+            if required:
+                lines = []
+                for rid in required:
+                    role = guild.get_role(rid)
+                    lines.append(f"• {role.mention} (`{rid}`)" if role
+                                 else f"• ⚠️ 서버에 없는 역할 (`{rid}`)")
+                embed.add_field(name=f"📋 지정된 역할 {len(required)}개",
+                                value="\n".join(lines)[:1024], inline=False)
+            else:
+                embed.add_field(
+                    name="⚠️ 현재 조건 없음",
+                    value="지정된 역할이 없어 **서버에 들어온 누구나 인증**할 수 있습니다.\n"
+                          "링크를 노리고 방금 들어온 사람도 즉시 인증됩니다.",
+                    inline=False)
+            embed.set_footer(text="역할 우클릭 → ID 복사 로 ID를 얻을 수 있습니다")
+            await interaction.response.send_message(
+                embed=embed, view=RequiredRoleView(required, guild), ephemeral=True)
+
+        elif choice == "toggle":
             new_state = not settings.get("enabled", True)
             await save_verify_settings(guild.id, {"enabled": new_state})
             state_text = "✅ 활성화" if new_state else "❌ 비활성화"

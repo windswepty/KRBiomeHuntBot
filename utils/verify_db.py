@@ -213,6 +213,10 @@ DEFAULT_VERIFY_SETTINGS = {
     "description": "아래 **[인증하기]** 버튼을 눌러 인증을 완료해 주세요.\n"
                    "인증이 완료되면 보호된 링크를 열람하실 수 있습니다.",
     "button_label": "인증하기",
+    # 인증을 신청하려면 이 중 **하나 이상**을 갖고 있어야 합니다.
+    # 비어 있으면 조건 없이 누구나 인증할 수 있습니다(기존 동작).
+    # 스나이퍼가 서버에 막 들어와 바로 인증받는 것을 막는 장치입니다.
+    "required_role_ids": [],
 }
 
 
@@ -235,6 +239,7 @@ async def get_verify_settings(guild_id: int) -> dict:
             doc = await _db(verify_col.find_one, {"_id": str_gid})
             if doc:
                 result.update({k: v for k, v in doc.items() if k != "_id"})
+            result["required_role_ids"] = [int(r) for r in result.get("required_role_ids", [])]
             _verify_cache[str_gid] = dict(result)
             return dict(result)
         except Exception as e:
@@ -244,6 +249,7 @@ async def get_verify_settings(guild_id: int) -> dict:
         all_settings = _read_json(VERIFY_FILE)
     if str_gid in all_settings:
         result.update(all_settings[str_gid])
+    result["required_role_ids"] = [int(r) for r in result.get("required_role_ids", [])]
     _verify_cache[str_gid] = dict(result)
     return dict(result)
 

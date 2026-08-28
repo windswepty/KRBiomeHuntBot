@@ -254,6 +254,16 @@ async def get_verify_settings(guild_id: int) -> dict:
     return dict(result)
 
 
+def peek_verify_settings(guild_id: int) -> dict | None:
+    """캐시에 있는 인증 설정을 **동기로** 읽습니다.
+
+    Flask 스레드(중계 게이트)에서 호출하므로 await 를 쓸 수 없습니다.
+    캐시에 없으면 None 을 돌려주고, 호출부는 그때 판정을 건너뜁니다.
+    """
+    cached = _verify_cache.get(str(guild_id))
+    return dict(cached) if cached else None
+
+
 async def save_verify_settings(guild_id: int, settings: dict) -> None:
     str_gid = str(guild_id)
 

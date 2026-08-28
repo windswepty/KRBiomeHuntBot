@@ -104,6 +104,21 @@ def redeem(token: str) -> tuple[str | None, str]:
         return info["url"], "ok"
 
 
+def peek_owner(token: str) -> tuple[int, int] | None:
+    """토큰을 **소비하지 않고** 발급 대상만 확인합니다.
+
+    신원 게이트가 "이 링크가 누구 것인지"를 먼저 알아야 하는데,
+    redeem() 을 쓰면 확인만 하고도 링크가 소모돼 버립니다.
+    반환값은 (guild_id, user_id) 이며, 없거나 만료면 None 입니다.
+    """
+    now = time.monotonic()
+    with _lock:
+        info = _tokens.get(token)
+        if info is None or info["expires"] <= now:
+            return None
+        return info["guild_id"], info["user_id"]
+
+
 def stats() -> dict:
     """현재 보관 중인 토큰 수 (진단용)."""
     now = time.monotonic()

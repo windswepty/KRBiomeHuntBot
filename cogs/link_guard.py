@@ -16,11 +16,11 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-from utils import link_tokens
+from utils import link_tokens, oauth_gate
 from utils.verify_db import (
     get_linkguard_settings, save_linkguard_settings,
     save_protected_link, get_protected_link,
-    get_verify_settings, add_click_log, get_click_logs,
+    get_verify_settings, peek_verify_settings, add_click_log, get_click_logs,
     make_watermark_code, save_watermark, get_watermark,
     register_guarded_keys, get_guarded_keys,
     record_link_usage, get_link_usage,
@@ -2186,8 +2186,46 @@ class LinkGuard(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+def _make_member_gate(bot):
+    """중계 게이트가 쓸 판정기 — 서버 멤버이고 인증 역할이 있는지.
+
+    Flask 스레드에서 호출되므로 **동기이고 가벼운** 조회만 합니다.
+    (봇이 이미 메모리에 들고 있는 캐시를 읽을 뿐, API 호출이 없습니다)
+
+    판정할 수 없는 상황(길드 캐시 미로딩 등)에서는 **통과**시킵니다.
+    확인이 안 된다고 정당한 유저를 막으면 자리 경쟁에서 손해가 큽니다.
+    """
+    def gate(guild_id: int, user_id: int) -> tuple[bool, str]:
+        guild = bot.get_guild(int(guild_id))
+        if guild is None:
+            return True, "guild-unknown"
+
+        member = guild.get_member(int(user_id))
+        if member is None:
+            return False, "not-member"      # 서버를 나갔습니다
+
+        settings = peek_verify_settings(guild_id)
+        if not settings:
+            return True, "settings-unknown"
+
+        role_id = settings.get("role_id")
+        if role_id and not any(r.id == int(role_id) for r in member.roles):
+            return False, "no-role"         # 인증 역할이 회수됨
+        return True, "ok"
+
+    return gate
+
+
 async def setup(bot):
     await bot.add_cog(LinkGuard(bot))
     # 봇 재시작 후에도 링크 버튼이 동작하도록 영구 View 등록
     bot.add_view(ProtectedLinkView())
     bot.add_view(UsageStatsView())
+    # 중계 게이트(Flask 스레드)가 멤버·역할을 판정할 수 있도록 연결합니다.
+    # 환경 변수가 없으면 게이트 자체가 꺼져 있어 이 판정기도 호출되지 않습니다.
+    oauth_gate.set_member_gate(_make_member_gate(bot))
+    if oauth_gate.enabled():
+        print("[LinkGuard] 중계 신원 게이트: 활성화 (디스코드 OAuth)", flush=True)
+    else:
+        print("[LinkGuard] 중계 신원 게이트: 비활성 "
+              "(DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET 미설정)", flush=True)

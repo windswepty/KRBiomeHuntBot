@@ -348,10 +348,6 @@ class ChatReward(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Check if user is blacklisted from receiving points
-        if await is_user_blacklisted(message.guild.id, message.author.id):
-            return
-
         # 1. Exclude photos/files/GIF attachments and stickers
         if message.attachments or message.stickers:
             return
@@ -375,6 +371,13 @@ class ChatReward(commands.Cog):
 
         # If nothing remains after removing URLs and emojis, ignore.
         if not without_emojis:
+            return
+
+        # 블랙리스트 검사는 **가장 마지막**에 합니다.
+        # 이 함수는 서버의 모든 메시지마다 호출되는데, 위 필터들은 순수 메모리
+        # 연산이고 이 검사만 저장소를 봅니다. 순서가 반대면 스티커 하나에도
+        # 조회가 일어나 대부분이 낭비됩니다.
+        if await is_user_blacklisted(message.guild.id, message.author.id):
             return
 
         # Process message for chat points (with channel boost support)

@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -26,6 +27,13 @@ _boost_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # MongoDB setup
+# 저장 모드 — 포인트가 어디에 쌓이는지 나타냅니다.
+#   "mongo"      : 영구 보존 (정상)
+#   "local-json" : data/ 폴더의 임시 파일. Render 같은 환경에서는 재시작 시 소멸.
+STORAGE_MODE = "local-json"
+# MONGO_URI 가 설정돼 있는데도 연결에 실패한 경우 True — 명백한 장애 상황입니다.
+MONGO_FAILED = False
+
 mongo_db = None
 users_col = None
 settings_col = None
@@ -34,6 +42,7 @@ gacha_col = None
 logs_col = None
 blacklist_col = None
 boost_col = None
+snapshot_col = None
 
 if MONGO_URI:
     try:
@@ -49,9 +58,39 @@ if MONGO_URI:
         logs_col = mongo_db["activity_logs"]
         blacklist_col = mongo_db["blacklist"]
         boost_col = mongo_db["channel_boosts"]
+        snapshot_col = mongo_db["point_snapshots"]
+        from pymongo import ReturnDocument as _ReturnDocument
+        _AFTER = _ReturnDocument.AFTER
+
+        # 인덱스는 없어도 동작하므로, 실패해도 연결 자체를 포기하지 않습니다.
+        # create_index 는 멱등이라 기동할 때마다 호출해도 안전합니다.
+        try:
+            # 랭킹(/포인트랭킹)이 길드별 포인트 정렬을 풀스캔하지 않도록
+            users_col.create_index([("guild_id", 1), ("points", -1)], name="rank_by_points")
+            # 모든 메시지마다 조회되는 블랙리스트
+            blacklist_col.create_index([("guild_id", 1), ("user_id", 1)], name="bl_lookup")
+            # /로그 조회 및 오래된 로그 정리
+            logs_col.create_index([("guild_id", 1), ("_id", -1)], name="logs_recent")
+            # 포인트 스냅샷 최신순 조회
+            snapshot_col.create_index([("guild_id", 1), ("_id", -1)], name="snap_recent")
+        except Exception as e:
+            print(f"MongoDB index setup warning: {e}", flush=True)
+
+        STORAGE_MODE = "mongo"
         print("Connected to MongoDB successfully for permanent data storage!", flush=True)
     except Exception as e:
-        print(f"MongoDB connection warning: {e}. Falling back to local JSON storage.", flush=True)
+        MONGO_FAILED = True
+        # 포인트는 이 봇의 존재 이유이므로, 조용히 임시 저장소로 넘어가면 안 됩니다.
+        # 이 상태로 운영되면 유저에게 포인트가 0으로 보이고, 그동안 새로 쌓인
+        # 적립분은 재시작과 함께 사라집니다. 로그에서 절대 놓치지 않게 알립니다.
+        print("\n" + "!" * 70, flush=True)
+        print("!! 치명적: MONGO_URI 가 설정돼 있으나 연결에 실패했습니다.", flush=True)
+        print(f"!! 원인: {e}", flush=True)
+        print("!! 포인트가 '임시 파일'에 쌓이며, 재시작하면 전부 사라집니다.", flush=True)
+        print("!! 기존 포인트도 유저에게 0으로 보입니다.", flush=True)
+        print("!! -> 즉시 봇을 정지하고 MONGO_URI / Atlas 상태를 확인하세요.", flush=True)
+        print("!" * 70 + "\n", flush=True)
+        _AFTER = None
         users_col = None
         settings_col = None
         shop_col = None
@@ -59,6 +98,118 @@ if MONGO_URI:
         logs_col = None
         blacklist_col = None
         boost_col = None
+        snapshot_col = None
+
+async def _db(fn, *args, **kwargs):
+    """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
+
+    pymongo 는 동기 라이브러리라 async 함수에서 그대로 부르면 그동안
+    이벤트 루프 전체가 멈춥니다. 채팅 적립은 **서버의 모든 메시지마다**
+    실행되므로, 이 정지가 누적되면 개인서버 링크 버튼 응답까지 느려집니다.
+
+    ⚠️ 스레드로 넘기면 await 중단점이 생기므로, 읽기→수정→쓰기 형태의
+    함수는 반드시 먼저 원자 연산($inc 등)으로 바꿔야 합니다.
+    그렇지 않으면 포인트 중복 차감·채팅 카운트 유실이 발생합니다.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+class _TTLCache:
+    """시간 기반 만료 + 크기 상한이 있는 캐시."""
+
+    __slots__ = ("_data", "_ttl", "_max")
+
+    def __init__(self, ttl_seconds: float, max_items: int):
+        self._data: dict = {}
+        self._ttl = ttl_seconds
+        self._max = max_items
+
+    def get(self, key):
+        item = self._data.get(key)
+        if item is None:
+            return None
+        stamped, value = item
+        if time.monotonic() - stamped > self._ttl:
+            self._data.pop(key, None)
+            return None
+        return value
+
+    def set(self, key, value) -> None:
+        self._data[key] = (time.monotonic(), value)
+        if len(self._data) > self._max:
+            self._evict()
+
+    def pop(self, key, default=None):
+        item = self._data.pop(key, None)
+        return default if item is None else item[1]
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def _evict(self) -> None:
+        now = time.monotonic()
+        for key in [k for k, (ts, _) in self._data.items() if now - ts > self._ttl]:
+            self._data.pop(key, None)
+        if len(self._data) > self._max:
+            for key in list(self._data)[:len(self._data) - self._max // 2]:
+                self._data.pop(key, None)
+
+
+# 모든 메시지마다 조회되므로 캐시가 필수입니다.
+# 추가/해제 시 즉시 무효화하므로 값이 어긋나지 않습니다.
+_blacklist_cache = _TTLCache(ttl_seconds=300, max_items=64)
+# 채널 부스트도 메시지마다 조회됩니다. 설정 변경 시 무효화합니다.
+_boost_cache = _TTLCache(ttl_seconds=30, max_items=500)
+
+
+async def _ensure_user_doc(guild_id: int, user_id: int) -> dict:
+    """유저 문서가 반드시 존재하도록 보장하고 그 내용을 돌려줍니다.
+
+    레거시 문서(_id 가 user_id 인 옛 형식, 현재 191건)를 흡수하는
+    마이그레이션 경로를 그대로 유지합니다. 원자 연산이 대상 문서를 찾지
+    못했을 때만 호출되는 보조 경로입니다.
+    """
+    str_key = _get_user_key(guild_id, user_id)
+    base, _ = await _migrate_old_user_if_needed(guild_id, user_id)
+    base = dict(base)
+    base["_id"] = str_key
+    base.setdefault("guild_id", str(guild_id))
+    base.setdefault("user_id", str(user_id))
+    base.setdefault("points", 0)
+    base.setdefault("chat_count", 0)
+    base.setdefault("last_checkin", "")
+    if users_col is not None:
+        try:
+            # 이미 있으면 건드리지 않고, 없을 때만 만듭니다.
+            # _id 는 불변 필드라 $setOnInsert 페이로드에서 제외합니다
+            # (필터의 _id 로 이미 결정됩니다).
+            seed = {k: v for k, v in base.items() if k != "_id"}
+            await _db(users_col.update_one, {"_id": str_key},
+                      {"$setOnInsert": seed}, upsert=True)
+        except Exception as e:
+            print(f"MongoDB _ensure_user_doc error: {e}", flush=True)
+    return base
+
+
+if not MONGO_URI:
+    print("\n" + "=" * 70, flush=True)
+    print("== 경고: MONGO_URI 가 설정되지 않았습니다.", flush=True)
+    print("== 포인트가 data/ 폴더의 로컬 파일에만 저장됩니다.", flush=True)
+    print("== Render 등 클라우드 환경이라면 재시작마다 전부 사라집니다.", flush=True)
+    print("=" * 70 + "\n", flush=True)
+
+
+def storage_status() -> str:
+    """기동 로그에 찍을 저장 상태 한 줄 요약."""
+    if STORAGE_MODE == "mongo":
+        return "MongoDB (영구 보존)"
+    if MONGO_FAILED:
+        return "로컬 임시 파일 -- !! MONGO_URI 연결 실패 / 재시작 시 소멸 !!"
+    return "로컬 임시 파일 (MONGO_URI 미설정 / 재시작 시 소멸)"
+
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -96,12 +247,12 @@ async def _migrate_old_user_if_needed(guild_id: int, user_id: int, data: dict = 
     # 1. MongoDB
     if users_col is not None:
         try:
-            doc = users_col.find_one({"_id": str_key})
+            doc = await _db(users_col.find_one, {"_id": str_key})
             if doc:
                 return doc, False
 
             # Check for legacy doc without guild_id (with _id == user_id)
-            old_doc = users_col.find_one({"_id": str_uid})
+            old_doc = await _db(users_col.find_one, {"_id": str_uid})
             if old_doc:
                 new_doc = {
                     "_id": str_key,
@@ -111,7 +262,11 @@ async def _migrate_old_user_if_needed(guild_id: int, user_id: int, data: dict = 
                     "last_checkin": old_doc.get("last_checkin", ""),
                     "chat_count": old_doc.get("chat_count", 0)
                 }
-                users_col.replace_one({"_id": str_key}, new_doc, upsert=True)
+                # replace_one 이면 그 사이 다른 코루틴이 적립한 포인트를 덮어씁니다.
+                # $setOnInsert 는 '문서가 없을 때만' 쓰므로 기존 값을 건드리지 않습니다.
+                seed = {k: v for k, v in new_doc.items() if k != "_id"}
+                await _db(users_col.update_one, {"_id": str_key},
+                          {"$setOnInsert": seed}, upsert=True)
                 return new_doc, True
 
             new_doc = {"_id": str_key, "guild_id": str_gid, "user_id": str_uid, "points": 0, "last_checkin": "", "chat_count": 0}
@@ -143,17 +298,27 @@ async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
 
     if users_col is not None:
         try:
-            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
-            if doc.get("last_checkin") == today:
-                return False, doc.get("points", 0)
+            # '오늘 아직 출석 안 함'을 **필터 조건**에 넣어 서버 측에서 원자적으로
+            # 처리합니다. 버튼/명령을 연타해도 100P가 두 번 지급되지 않습니다.
+            award = {"$inc": {"points": 100},
+                     "$set": {"last_checkin": today,
+                              "guild_id": str(guild_id), "user_id": str(user_id)}}
+            doc = await _db(users_col.find_one_and_update,
+                            {"_id": str_key, "last_checkin": {"$ne": today}},
+                            award, return_document=_AFTER)
+            if doc is not None:
+                return True, doc.get("points", 0)
 
-            new_points = doc.get("points", 0) + 100
-            users_col.update_one(
-                {"_id": str_key},
-                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "last_checkin": today, "points": new_points}},
-                upsert=True
-            )
-            return True, new_points
+            # 조건 불일치 = 이미 출석했거나, 문서가 아직 없음(레거시 포함)
+            base = await _ensure_user_doc(guild_id, user_id)
+            if base.get("last_checkin") == today:
+                return False, base.get("points", 0)
+            doc = await _db(users_col.find_one_and_update,
+                            {"_id": str_key, "last_checkin": {"$ne": today}},
+                            award, return_document=_AFTER)
+            if doc is None:
+                return False, base.get("points", 0)
+            return True, doc.get("points", 0)
         except Exception as e:
             print(f"MongoDB checkin error: {e}, using local file.", flush=True)
 
@@ -177,20 +342,29 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
 
     if users_col is not None:
         try:
-            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
-            new_count = doc.get("chat_count", 0) + 1
-            awarded = False
+            # 읽고→더하고→덮어쓰면 동시에 온 메시지끼리 카운트를 서로 지웁니다.
+            # $inc 로 서버 측에서 증가시켜 유실을 없앱니다.
+            bump = {"$inc": {"chat_count": 1},
+                    "$set": {"guild_id": str(guild_id), "user_id": str(user_id)}}
+            doc = await _db(users_col.find_one_and_update,
+                            {"_id": str_key}, bump, return_document=_AFTER)
+            if doc is None:
+                # 문서가 아직 없음(레거시 포함) — 만든 뒤 한 번 더 시도
+                await _ensure_user_doc(guild_id, user_id)
+                doc = await _db(users_col.find_one_and_update,
+                                {"_id": str_key}, bump, return_document=_AFTER)
+                if doc is None:
+                    return 0, False, earned_points, boost_mult
+
+            new_count = doc.get("chat_count", 0)
             new_points = doc.get("points", 0)
-
-            if new_count % 10 == 0:
-                new_points += earned_points
-                awarded = True
-
-            users_col.update_one(
-                {"_id": str_key},
-                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "chat_count": new_count, "points": new_points}},
-                upsert=True
-            )
+            awarded = new_count % 10 == 0
+            if awarded:
+                bumped = await _db(users_col.find_one_and_update,
+                                   {"_id": str_key},
+                                   {"$inc": {"points": earned_points}},
+                                   return_document=_AFTER)
+                new_points = (bumped or {}).get("points", new_points + earned_points)
             return new_points, awarded, earned_points, boost_mult
         except Exception as e:
             print(f"MongoDB chat process error: {e}, using local file.", flush=True)
@@ -225,15 +399,21 @@ async def add_user_points(guild_id: int, user_id: int, amount: int) -> int:
 
     if users_col is not None:
         try:
-            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
-            current_points = doc.get("points", 0)
-            new_points = max(0, current_points + amount)
-            users_col.update_one(
-                {"_id": str_key},
-                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "points": new_points}},
-                upsert=True
-            )
-            return new_points
+            # 음수는 차감이므로 잔액 검사가 있는 전용 함수로 넘깁니다
+            # (여기서 $inc 로 처리하면 포인트가 음수가 될 수 있습니다).
+            if amount < 0:
+                _, remaining = await deduct_user_points(guild_id, user_id, -amount)
+                return remaining
+
+            bump = {"$inc": {"points": amount},
+                    "$set": {"guild_id": str(guild_id), "user_id": str(user_id)}}
+            doc = await _db(users_col.find_one_and_update,
+                            {"_id": str_key}, bump, return_document=_AFTER)
+            if doc is None:
+                await _ensure_user_doc(guild_id, user_id)
+                doc = await _db(users_col.find_one_and_update,
+                                {"_id": str_key}, bump, return_document=_AFTER)
+            return (doc or {}).get("points", 0)
         except Exception as e:
             print(f"MongoDB add_user_points error: {e}, using local file.", flush=True)
 
@@ -250,18 +430,27 @@ async def deduct_user_points(guild_id: int, user_id: int, amount: int) -> tuple[
 
     if users_col is not None:
         try:
-            doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
-            current_points = doc.get("points", 0)
+            # '잔액이 충분함'을 **필터 조건**에 넣습니다. 구매 버튼을 연타해도
+            # 포인트는 한 번만 빠지고, 두 번째 시도는 조건 불일치로 실패합니다.
+            take = {"$inc": {"points": -amount},
+                    "$set": {"guild_id": str(guild_id), "user_id": str(user_id)}}
+            doc = await _db(users_col.find_one_and_update,
+                            {"_id": str_key, "points": {"$gte": amount}},
+                            take, return_document=_AFTER)
+            if doc is not None:
+                return True, doc.get("points", 0)
+
+            # 조건 불일치 = 잔액 부족이거나, 문서가 아직 없음(레거시 포함)
+            base = await _ensure_user_doc(guild_id, user_id)
+            current_points = base.get("points", 0)
             if current_points < amount:
                 return False, current_points
-
-            new_points = current_points - amount
-            users_col.update_one(
-                {"_id": str_key},
-                {"$set": {"guild_id": str(guild_id), "user_id": str(user_id), "points": new_points}},
-                upsert=True
-            )
-            return True, new_points
+            doc = await _db(users_col.find_one_and_update,
+                            {"_id": str_key, "points": {"$gte": amount}},
+                            take, return_document=_AFTER)
+            if doc is None:
+                return False, current_points
+            return True, doc.get("points", 0)
         except Exception as e:
             print(f"MongoDB deduct_user_points error: {e}, using local file.", flush=True)
 
@@ -283,7 +472,8 @@ async def get_top_users(guild_id: int, limit: int = 10) -> list[dict]:
         try:
             # Query guild-specific docs
             result = []
-            cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
+            cursor = await _db(lambda: list(users_col.find({"guild_id": str_gid})
+                                            .sort("points", -1).limit(limit)))
             for doc in cursor:
                 uid_val = doc.get("user_id") or doc["_id"].split(":")[-1]
                 result.append({
@@ -293,28 +483,31 @@ async def get_top_users(guild_id: int, limit: int = 10) -> list[dict]:
 
             # If no guild-specific docs found, try migrating legacy docs (one-time)
             if not result:
-                legacy_cursor = users_col.find({"guild_id": {"$exists": False}})
-                for old_doc in legacy_cursor:
-                    uid_str = old_doc["_id"]
-                    # Skip non-numeric IDs
-                    if not uid_str.isdigit():
-                        continue
-                    target_key = f"{str_gid}:{uid_str}"
-                    if not users_col.find_one({"_id": target_key}):
-                        users_col.replace_one(
+                def _migrate_legacy():
+                    for old_doc in users_col.find({"guild_id": {"$exists": False}}):
+                        uid_str = old_doc["_id"]
+                        # Skip non-numeric IDs
+                        if not uid_str.isdigit():
+                            continue
+                        target_key = f"{str_gid}:{uid_str}"
+                        # 검사 후 replace_one 하면, 그 사이 다른 처리가 만든 문서를
+                        # 통째로 덮어써 포인트가 사라질 수 있습니다.
+                        # $setOnInsert 는 '없을 때만' 쓰므로 기존 값을 절대 건드리지 않습니다.
+                        users_col.update_one(
                             {"_id": target_key},
-                            {
-                                "_id": target_key,
+                            {"$setOnInsert": {
                                 "guild_id": str_gid,
                                 "user_id": uid_str,
                                 "points": old_doc.get("points", 0),
                                 "last_checkin": old_doc.get("last_checkin", ""),
                                 "chat_count": old_doc.get("chat_count", 0)
-                            },
+                            }},
                             upsert=True
                         )
-                # Re-query after migration
-                cursor = users_col.find({"guild_id": str_gid}).sort("points", -1).limit(limit)
+                    # Re-query after migration
+                    return list(users_col.find({"guild_id": str_gid})
+                                .sort("points", -1).limit(limit))
+                cursor = await _db(_migrate_legacy)
                 for doc in cursor:
                     uid_val = doc.get("user_id") or doc["_id"].split(":")[-1]
                     result.append({
@@ -362,7 +555,8 @@ async def get_user_rank(guild_id: int, user_id: int) -> tuple[int, int]:
         try:
             doc, _ = await _migrate_old_user_if_needed(guild_id, user_id)
             user_points = doc.get("points", 0)
-            count_higher = users_col.count_documents({"guild_id": str_gid, "points": {"$gt": user_points}})
+            count_higher = await _db(users_col.count_documents,
+                                     {"guild_id": str_gid, "points": {"$gt": user_points}})
             return count_higher + 1, user_points
         except Exception as e:
             print(f"MongoDB get_user_rank error: {e}, using local file.", flush=True)
@@ -392,7 +586,7 @@ async def get_report_settings(guild_id: int) -> dict:
 
     if settings_col is not None:
         try:
-            doc = settings_col.find_one({"_id": str_gid})
+            doc = await _db(settings_col.find_one, {"_id": str_gid})
             if doc:
                 result = dict(DEFAULT_REPORT_SETTINGS)
                 result.update({k: v for k, v in doc.items() if k != "_id"})
@@ -421,7 +615,8 @@ async def save_report_settings(guild_id: int, settings: dict) -> None:
 
     if settings_col is not None:
         try:
-            settings_col.update_one(
+            await _db(
+                settings_col.update_one,
                 {"_id": str_gid},
                 {"$set": settings},
                 upsert=True
@@ -462,7 +657,7 @@ async def get_shop_settings(guild_id: int) -> dict:
 
     if shop_col is not None:
         try:
-            doc = shop_col.find_one({"_id": str_gid})
+            doc = await _db(shop_col.find_one, {"_id": str_gid})
             if doc:
                 res = dict(DEFAULT_SHOP_SETTINGS)
                 res.update({k: v for k, v in doc.items() if k != "_id"})
@@ -489,7 +684,8 @@ async def save_shop_settings(guild_id: int, settings: dict) -> None:
 
     if shop_col is not None:
         try:
-            shop_col.update_one(
+            await _db(
+                shop_col.update_one,
                 {"_id": str_gid},
                 {"$set": settings},
                 upsert=True
@@ -538,7 +734,7 @@ async def get_gacha_settings(guild_id: int) -> dict:
 
     if gacha_col is not None:
         try:
-            doc = gacha_col.find_one({"_id": str_gid})
+            doc = await _db(gacha_col.find_one, {"_id": str_gid})
             if doc:
                 res = dict(DEFAULT_GACHA_SETTINGS)
                 res.update({k: v for k, v in doc.items() if k != "_id"})
@@ -565,7 +761,8 @@ async def save_gacha_settings(guild_id: int, settings: dict) -> None:
 
     if gacha_col is not None:
         try:
-            gacha_col.update_one(
+            await _db(
+                gacha_col.update_one,
                 {"_id": str_gid},
                 {"$set": settings},
                 upsert=True
@@ -592,7 +789,120 @@ async def save_gacha_settings(guild_id: int, settings: dict) -> None:
             json.dump(all_gacha, f, ensure_ascii=False, indent=2)
 
 
+# ── 재고 원자적 차감 ──────────────────────────────────────────────────
+#
+# 읽고→검사→쓰기를 파이썬에서 하면, 마지막 1개를 두 명이 동시에 사는 순간
+# 둘 다 통과해 **재고 1개로 2개가 팔립니다**. 게다가 목록 전체를 덮어쓰면
+# 다른 상품의 재고 변경까지 사라집니다(lost update).
+# 조건을 MongoDB 필터에 넣어 서버 측에서 원자적으로 처리합니다.
+
+
+def _stock_filter(str_gid: str, item_id):
+    """항목 id 가 숫자/문자 어느 쪽으로 저장돼 있어도 매칭되도록 후보를 만듭니다."""
+    candidates = [item_id]
+    try:
+        candidates.append(int(item_id))
+    except (TypeError, ValueError):
+        pass
+    candidates.append(str(item_id))
+    seen, uniq = set(), []
+    for c in candidates:
+        marker = (type(c).__name__, c)
+        if marker not in seen:
+            seen.add(marker)
+            uniq.append(c)
+    return {"_id": str_gid,
+            "items": {"$elemMatch": {"id": {"$in": uniq}, "stock": {"$gt": 0}}}}
+
+
+async def _consume_stock(col, file_path, lock, guild_id: int, item_id) -> bool:
+    """재고를 원자적으로 1 차감합니다. 재고가 남아있지 않으면 False.
+
+    무제한(-1) 항목은 호출부에서 거르므로 여기서는 다루지 않습니다.
+    """
+    str_gid = str(guild_id)
+    delta = -1
+
+    if col is not None:
+        try:
+            # '재고 > 0' 을 필터 조건에 넣어 서버 측에서 원자적으로 판정합니다
+            res = await _db(col.update_one, _stock_filter(str_gid, item_id),
+                            {"$inc": {"items.$.stock": delta}})
+            return res.modified_count > 0
+        except Exception as e:
+            print(f"MongoDB stock update error: {e}, using local file.", flush=True)
+
+    # 로컬 JSON 폴백 — 단일 프로세스이므로 락이 원자성을 보장합니다
+    _ensure_data_dir()
+    async with lock:
+        all_data = {}
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    all_data = json.load(f)
+        except Exception:
+            pass
+        items = all_data.get(str_gid, {}).get("items", [])
+        for item in items:
+            if str(item.get("id")) != str(item_id):
+                continue
+            current = item.get("stock", -1)
+            if delta < 0 and current <= 0:
+                return False
+            item["stock"] = current + delta
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(all_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"Local stock write error: {e}", flush=True)
+                return False
+            return True
+    return False
+
+
+async def consume_shop_stock(guild_id: int, item_id) -> bool:
+    """상점 재고를 1 차감합니다. 이미 품절이면 False."""
+    return await _consume_stock(shop_col, SHOP_FILE, _shop_lock, guild_id, item_id)
+
+
+async def consume_gacha_stock(guild_id: int, item_id) -> bool:
+    """뽑기 항목 재고를 1 차감합니다. 이미 품절이면 False."""
+    return await _consume_stock(gacha_col, GACHA_FILE, _gacha_lock, guild_id, item_id)
+
+
 # ── Activity Logs DB (per-guild) ──────────────────────────────────────
+
+MAX_ACTIVITY_LOGS = 200
+# 매 삽입마다 정리하면 낭비라, 기동 후 첫 삽입과 이후 N회마다 수행합니다.
+# (재시작이 잦은 환경에서도 최소 한 번은 정리되도록 '첫 삽입'을 포함시켰습니다)
+ACTIVITY_TRIM_EVERY = 50
+_activity_insert_count: dict[str, int] = {}
+
+
+def _maybe_trim_activity_logs(guild_id: int) -> None:
+    """MongoDB의 활동 로그를 길드당 MAX_ACTIVITY_LOGS건으로 유지합니다.
+
+    로컬 JSON 경로에는 원래 200건 상한이 있었지만 Mongo 경로에는 없어서
+    영구 누적되고 있었습니다. 실패해도 기록을 방해하지 않도록 예외를 삼킵니다.
+    """
+    if logs_col is None:
+        return
+    str_gid = str(guild_id)
+    count = _activity_insert_count.get(str_gid, 0) + 1
+    _activity_insert_count[str_gid] = count
+    if count != 1 and count % ACTIVITY_TRIM_EVERY != 0:
+        return
+    try:
+        # ObjectId(_id)는 생성 시각 순으로 증가하므로 최신순 기준으로 씁니다.
+        cursor = (logs_col.find({"guild_id": str_gid}, {"_id": 1})
+                  .sort("_id", -1).skip(MAX_ACTIVITY_LOGS).limit(1))
+        cutoff = next(iter(cursor), None)
+        if cutoff is None:
+            return
+        logs_col.delete_many({"guild_id": str_gid, "_id": {"$lte": cutoff["_id"]}})
+    except Exception as e:
+        print(f"MongoDB activity log trim warning: {e}", flush=True)
+
 
 async def add_activity_log(guild_id: int, log_type: str, user_id: int, user_name: str, details: str) -> None:
     """log_type: 'shop', 'gacha', 'report'"""
@@ -608,10 +918,14 @@ async def add_activity_log(guild_id: int, log_type: str, user_id: int, user_name
 
     if logs_col is not None:
         try:
-            logs_col.insert_one({"guild_id": str_gid, **log_entry})
-            return
+            await _db(logs_col.insert_one, {"guild_id": str_gid, **log_entry})
         except Exception as e:
             print(f"MongoDB add_activity_log error: {e}", flush=True)
+        else:
+            # 삽입 성공 시에만 정리합니다. 정리 실패가 JSON 폴백을 부르면
+            # 같은 기록이 두 곳에 남으므로 except 밖(else)에서 호출합니다.
+            await asyncio.to_thread(_maybe_trim_activity_logs, guild_id)
+            return
 
     _ensure_data_dir()
     async with _logs_lock:
@@ -639,7 +953,9 @@ async def get_activity_logs(guild_id: int, log_type: str = "all", limit: int = 1
             query = {"guild_id": str_gid}
             if log_type != "all":
                 query["type"] = log_type
-            cursor = logs_col.find(query).sort("_id", -1).limit(limit)
+            def _fetch_logs():
+                return list(logs_col.find(query).sort("_id", -1).limit(limit))
+            cursor = await _db(_fetch_logs)
             return list(cursor)
         except Exception as e:
             print(f"MongoDB get_activity_logs error: {e}", flush=True)
@@ -665,10 +981,22 @@ async def is_user_blacklisted(guild_id: int, user_id: int) -> bool:
     str_gid = str(guild_id)
     str_uid = str(user_id)
 
+    # 이 함수는 **서버의 모든 메시지마다** 호출됩니다. 매번 DB를 왕복하면
+    # 이벤트 루프가 계속 막히므로, 길드별 대상 집합을 통째로 캐싱합니다.
+    # 추가/해제 시 즉시 무효화하므로 값이 어긋나지 않습니다.
+    cached = _blacklist_cache.get(str_gid)
+    if cached is not None:
+        return str_uid in cached
+
     if blacklist_col is not None:
         try:
-            doc = blacklist_col.find_one({"guild_id": str_gid, "user_id": str_uid})
-            return doc is not None
+            def _fetch():
+                return [d.get("user_id", "")
+                        for d in blacklist_col.find({"guild_id": str_gid}, {"user_id": 1})]
+            ids = set(await _db(_fetch))
+            ids.discard("")
+            _blacklist_cache.set(str_gid, ids)
+            return str_uid in ids
         except Exception as e:
             print(f"MongoDB is_user_blacklisted error: {e}", flush=True)
 
@@ -678,15 +1006,18 @@ async def is_user_blacklisted(guild_id: int, user_id: int) -> bool:
             if os.path.exists(BLACKLIST_FILE):
                 with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
                     all_bl = json.load(f)
-                guild_bl = all_bl.get(str_gid, {})
-                return str_uid in guild_bl
+                ids = set(all_bl.get(str_gid, {}).keys())
+                _blacklist_cache.set(str_gid, ids)
+                return str_uid in ids
         except Exception:
             pass
+    _blacklist_cache.set(str_gid, set())
     return False
 
 async def add_blacklist_user(guild_id: int, user_id: int, reason: str = "") -> None:
     str_gid = str(guild_id)
     str_uid = str(user_id)
+    _blacklist_cache.pop(str_gid)      # 캐시 무효화 — 다음 조회에서 다시 읽습니다
     timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
     entry = {
@@ -698,7 +1029,8 @@ async def add_blacklist_user(guild_id: int, user_id: int, reason: str = "") -> N
 
     if blacklist_col is not None:
         try:
-            blacklist_col.update_one(
+            await _db(
+                blacklist_col.update_one,
                 {"guild_id": str_gid, "user_id": str_uid},
                 {"$set": entry},
                 upsert=True
@@ -730,10 +1062,11 @@ async def add_blacklist_user(guild_id: int, user_id: int, reason: str = "") -> N
 async def remove_blacklist_user(guild_id: int, user_id: int) -> bool:
     str_gid = str(guild_id)
     str_uid = str(user_id)
+    _blacklist_cache.pop(str_gid)      # 캐시 무효화
 
     if blacklist_col is not None:
         try:
-            res = blacklist_col.delete_one({"guild_id": str_gid, "user_id": str_uid})
+            res = await _db(blacklist_col.delete_one, {"guild_id": str_gid, "user_id": str_uid})
             return res.deleted_count > 0
         except Exception as e:
             print(f"MongoDB remove_blacklist_user error: {e}", flush=True)
@@ -758,7 +1091,7 @@ async def get_blacklist_users(guild_id: int) -> list[dict]:
 
     if blacklist_col is not None:
         try:
-            cursor = blacklist_col.find({"guild_id": str_gid})
+            cursor = await _db(lambda: list(blacklist_col.find({"guild_id": str_gid})))
             result = []
             for doc in cursor:
                 result.append({
@@ -799,13 +1132,19 @@ async def get_channel_boost(guild_id: int, channel_id: int) -> float:
     str_cid = str(channel_id)
     now = datetime.now(timezone.utc)
 
-    boost_info = None
-    if boost_col is not None:
+    # 이것도 메시지마다 호출됩니다. 설정 변경 시 무효화하므로 안전합니다.
+    boost_info = _boost_cache.get(str_cid)
+    cache_hit = boost_info is not None
+    if cache_hit and boost_info == {}:
+        boost_info = None
+
+    if not cache_hit and boost_col is not None:
         try:
-            boost_info = boost_col.find_one({"_id": str_cid})
+            boost_info = await _db(boost_col.find_one, {"_id": str_cid})
         except Exception:
             boost_info = None
-    else:
+        _boost_cache.set(str_cid, boost_info if boost_info else {})
+    elif not cache_hit:
         _ensure_data_dir()
         async with _boost_lock:
             try:
@@ -835,6 +1174,7 @@ async def get_channel_boost(guild_id: int, channel_id: int) -> float:
 async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, duration_seconds: int = 0) -> None:
     str_cid = str(channel_id)
     str_gid = str(guild_id)
+    _boost_cache.pop(str_cid)          # 캐시 무효화 — 설정이 즉시 반영됩니다
 
     expires_at = None
     if duration_seconds > 0:
@@ -852,9 +1192,9 @@ async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, d
     if boost_col is not None:
         try:
             if multiplier <= 1.0:
-                boost_col.delete_one({"_id": str_cid})
+                await _db(boost_col.delete_one, {"_id": str_cid})
             else:
-                boost_col.replace_one({"_id": str_cid}, data_doc, upsert=True)
+                await _db(boost_col.replace_one, {"_id": str_cid}, data_doc, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB set_channel_boost error: {e}", flush=True)
@@ -884,7 +1224,7 @@ async def get_all_active_boosts(guild_id: int) -> list[dict]:
     raw_boosts = []
     if boost_col is not None:
         try:
-            raw_boosts = list(boost_col.find({"guild_id": str_gid}))
+            raw_boosts = await _db(lambda: list(boost_col.find({"guild_id": str_gid})))
         except Exception:
             pass
     else:
@@ -915,22 +1255,28 @@ async def get_all_active_boosts(guild_id: int) -> list[dict]:
 
 async def check_and_clear_expired_boosts() -> list[dict]:
     """만료 시간이 지난 부스트를 DB에서 자동 정리하고 만료된 항목 목록 반환"""
+    _boost_cache.clear()               # 만료 정리 후 캐시가 옛 배율을 주지 않도록
     now = datetime.now(timezone.utc)
     expired = []
 
     if boost_col is not None:
         try:
-            cursor = boost_col.find({"expires_at": {"$ne": None}})
-            for doc in cursor:
-                exp_str = doc.get("expires_at")
-                if exp_str:
+            # 5초마다 도는 백그라운드 루프입니다. 스레드로 넘겨
+            # 이벤트 루프를 주기적으로 막지 않게 합니다.
+            def _sweep():
+                found = []
+                for doc in boost_col.find({"expires_at": {"$ne": None}}):
+                    exp_str = doc.get("expires_at")
+                    if not exp_str:
+                        continue
                     try:
-                        exp_time = datetime.fromisoformat(exp_str)
-                        if now >= exp_time:
-                            expired.append(dict(doc))
+                        if now >= datetime.fromisoformat(exp_str):
+                            found.append(dict(doc))
                             boost_col.delete_one({"_id": doc["_id"]})
                     except Exception:
                         pass
+                return found
+            expired.extend(await _db(_sweep))
         except Exception as e:
             print(f"MongoDB check_and_clear_expired_boosts error: {e}", flush=True)
     else:
@@ -961,3 +1307,227 @@ async def check_and_clear_expired_boosts() -> list[dict]:
     return expired
 
 
+# ── 포인트 스냅샷 (백업 / 복원) ────────────────────────────────────────
+#
+# 포인트는 이 봇의 존재 이유이므로, 로직 사고나 실수로 초기화됐을 때
+# 되돌릴 수단이 반드시 있어야 합니다.
+#
+#   · 매일 1회 자동 스냅샷 (cogs/backup.py 의 백그라운드 작업)
+#   · /포인트백업 으로 수동 스냅샷 · 목록 · 복원 · 파일 내려받기
+#
+# ⚠️ 스냅샷은 같은 Atlas 클러스터 안에 있습니다. 로직 사고는 막아주지만
+#    클러스터·계정 사고까지는 못 막으므로, 파일 내려받기를 함께 쓰세요.
+
+SNAPSHOT_FILE = os.path.join(DATA_DIR, "point_snapshots.json")
+_snapshot_lock = asyncio.Lock()
+MAX_SNAPSHOTS = 30          # 길드당 보관 개수 (1회 약 40KB)
+
+
+def _read_snapshots() -> dict:
+    try:
+        if os.path.exists(SNAPSHOT_FILE):
+            with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _write_snapshots(payload: dict) -> None:
+    _ensure_data_dir()
+    with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _trim_snapshots(str_gid: str) -> None:
+    """길드당 MAX_SNAPSHOTS 개만 남기고 오래된 것부터 삭제합니다."""
+    if snapshot_col is None:
+        return
+    try:
+        cursor = (snapshot_col.find({"guild_id": str_gid}, {"_id": 1})
+                  .sort("_id", -1).skip(MAX_SNAPSHOTS).limit(1))
+        cutoff = next(iter(cursor), None)
+        if cutoff is None:
+            return
+        snapshot_col.delete_many({"guild_id": str_gid, "_id": {"$lte": cutoff["_id"]}})
+    except Exception as e:
+        print(f"MongoDB snapshot trim warning: {e}", flush=True)
+
+
+async def create_point_snapshot(guild_id: int, reason: str = "manual") -> dict:
+    """현재 포인트 전체를 스냅샷으로 저장하고 요약을 돌려줍니다.
+
+    reason: "auto"(매일 자동) / "manual"(관리자) / "pre-restore"(복원 직전 자동)
+    """
+    str_gid = str(guild_id)
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    if users_col is not None and snapshot_col is not None:
+        def _collect():
+            out = {}
+            for d in users_col.find({"guild_id": str_gid}, {"user_id": 1, "points": 1}):
+                uid = d.get("user_id") or str(d["_id"]).split(":")[-1]
+                out[str(uid)] = int(d.get("points", 0) or 0)
+            return out
+        try:
+            users = await _db(_collect)
+            doc = {
+                "guild_id": str_gid,
+                "created": datetime.now(timezone.utc),   # 정렬·조회용 실제 날짜
+                "created_kst": now_kst,
+                "reason": reason,
+                "user_count": len(users),
+                "total_points": sum(users.values()),
+                "users": users,
+            }
+            res = await _db(snapshot_col.insert_one, doc)
+            await asyncio.to_thread(_trim_snapshots, str_gid)
+            return {"ok": True, "id": str(res.inserted_id), "created_kst": now_kst,
+                    "reason": reason, "user_count": doc["user_count"],
+                    "total_points": doc["total_points"]}
+        except Exception as e:
+            print(f"MongoDB create_point_snapshot error: {e}", flush=True)
+            return {"ok": False, "error": str(e)}
+
+    # 로컬 JSON 폴백
+    data = await load_data()
+    users = {}
+    for key, info in data.items():
+        if ":" in key:
+            g, u = key.split(":", 1)
+            if g == str_gid:
+                users[u] = int(info.get("points", 0) or 0)
+    entry = {"id": now_kst.replace(" ", "_").replace(":", ""), "created_kst": now_kst,
+             "reason": reason, "user_count": len(users),
+             "total_points": sum(users.values()), "users": users}
+    async with _snapshot_lock:
+        allsnap = _read_snapshots()
+        bucket = allsnap.setdefault(str_gid, [])
+        bucket.insert(0, entry)
+        del bucket[MAX_SNAPSHOTS:]
+        _write_snapshots(allsnap)
+    return {"ok": True, "id": entry["id"], "created_kst": entry["created_kst"],
+            "reason": entry["reason"], "user_count": entry["user_count"],
+            "total_points": entry["total_points"]}
+
+
+async def list_point_snapshots(guild_id: int, limit: int = 25) -> list[dict]:
+    """최근 스냅샷 목록 (users 본문은 제외한 요약)."""
+    str_gid = str(guild_id)
+    if snapshot_col is not None:
+        try:
+            def _fetch():
+                return list(snapshot_col.find(
+                    {"guild_id": str_gid}, {"users": 0}).sort("_id", -1).limit(limit))
+            return [{"id": str(d["_id"]), "created_kst": d.get("created_kst", "?"),
+                     "reason": d.get("reason", "?"), "user_count": d.get("user_count", 0),
+                     "total_points": d.get("total_points", 0)}
+                    for d in await _db(_fetch)]
+        except Exception as e:
+            print(f"MongoDB list_point_snapshots error: {e}", flush=True)
+
+    async with _snapshot_lock:
+        allsnap = _read_snapshots()
+    return [{k: e.get(k) for k in ("id", "created_kst", "reason", "user_count", "total_points")}
+            for e in allsnap.get(str_gid, [])[:limit]]
+
+
+async def get_point_snapshot(guild_id: int, snapshot_id: str) -> dict | None:
+    """스냅샷 하나를 users 포함해 통째로 가져옵니다."""
+    str_gid = str(guild_id)
+    if snapshot_col is not None:
+        try:
+            from bson import ObjectId
+            doc = await _db(snapshot_col.find_one,
+                            {"_id": ObjectId(snapshot_id), "guild_id": str_gid})
+            if doc:
+                return {"id": str(doc["_id"]), "created_kst": doc.get("created_kst", "?"),
+                        "reason": doc.get("reason", "?"), "users": doc.get("users", {}),
+                        "user_count": doc.get("user_count", 0),
+                        "total_points": doc.get("total_points", 0)}
+            return None
+        except Exception as e:
+            print(f"MongoDB get_point_snapshot error: {e}", flush=True)
+            return None
+
+    async with _snapshot_lock:
+        allsnap = _read_snapshots()
+    for e in allsnap.get(str_gid, []):
+        if e.get("id") == snapshot_id:
+            return e
+    return None
+
+
+async def restore_point_snapshot(guild_id: int, snapshot_id: str) -> dict:
+    """스냅샷 시점의 포인트로 되돌립니다.
+
+    · 복원 직전에 **현재 상태를 자동으로 스냅샷**하므로 복원 자체도 되돌릴 수 있습니다.
+    · 스냅샷에 없는 유저(이후 새로 들어온 유저)는 **건드리지 않습니다**.
+      잘못 되돌려 새 유저의 정당한 적립을 지우는 일이 없도록 한 선택입니다.
+    """
+    snap = await get_point_snapshot(guild_id, snapshot_id)
+    if not snap:
+        return {"ok": False, "error": "해당 백업을 찾을 수 없습니다."}
+
+    safety = await create_point_snapshot(guild_id, reason="pre-restore")
+    str_gid = str(guild_id)
+    users = snap.get("users", {})
+
+    if users_col is not None:
+        def _apply():
+            changed = 0
+            for uid, pts in users.items():
+                res = users_col.update_one(
+                    {"_id": f"{str_gid}:{uid}"},
+                    {"$set": {"points": int(pts), "guild_id": str_gid, "user_id": str(uid)}},
+                    upsert=True)
+                if res.modified_count or res.upserted_id is not None:
+                    changed += 1
+            return changed
+        try:
+            changed = await _db(_apply)
+        except Exception as e:
+            print(f"MongoDB restore_point_snapshot error: {e}", flush=True)
+            return {"ok": False, "error": str(e)}
+    else:
+        data = await load_data()
+        changed = 0
+        for uid, pts in users.items():
+            info = data.setdefault(f"{str_gid}:{uid}",
+                                   {"points": 0, "last_checkin": "", "chat_count": 0})
+            if info.get("points") != int(pts):
+                info["points"] = int(pts)
+                changed += 1
+        await save_data(data)
+
+    return {"ok": True, "restored": changed, "total_in_snapshot": len(users),
+            "snapshot_kst": snap.get("created_kst", "?"),
+            "safety_id": safety.get("id") if safety.get("ok") else None,
+            "total_points": snap.get("total_points", 0)}
+
+
+async def export_points_payload(guild_id: int) -> dict:
+    """파일로 내려받을 백업 본문을 만듭니다 (현재 시점)."""
+    str_gid = str(guild_id)
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    if users_col is not None:
+        def _collect():
+            return [{"user_id": d.get("user_id") or str(d["_id"]).split(":")[-1],
+                     "points": int(d.get("points", 0) or 0),
+                     "chat_count": int(d.get("chat_count", 0) or 0),
+                     "last_checkin": d.get("last_checkin", "")}
+                    for d in users_col.find({"guild_id": str_gid})]
+        try:
+            rows = await _db(_collect)
+        except Exception as e:
+            rows = []
+            print(f"MongoDB export_points_payload error: {e}", flush=True)
+    else:
+        data = await load_data()
+        rows = [{"user_id": k.split(":", 1)[1], "points": int(v.get("points", 0) or 0),
+                 "chat_count": int(v.get("chat_count", 0) or 0),
+                 "last_checkin": v.get("last_checkin", "")}
+                for k, v in data.items() if k.startswith(f"{str_gid}:")]
+    rows.sort(key=lambda r: r["points"], reverse=True)
+    return {"taken_at_kst": now_kst, "guild_id": str_gid, "user_count": len(rows),
+            "total_points": sum(r["points"] for r in rows), "users": rows}

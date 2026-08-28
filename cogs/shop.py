@@ -4,7 +4,8 @@ from discord.ext import commands
 from discord import app_commands
 from utils.database import (
     get_shop_items, save_shop_items, get_shop_settings, save_shop_settings,
-    get_user_points, deduct_user_points, add_activity_log
+    get_user_points, deduct_user_points, add_user_points, add_activity_log,
+    consume_shop_stock
 )
 
 
@@ -91,12 +92,25 @@ class ShopSelect(discord.ui.Select):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # 재고 차감 (stock > 0 인 경우 1 차감)
+        # 재고 차감 — 목록 전체를 덮어쓰지 않고 **원자적으로** 1 차감합니다.
+        # 그렇게 하지 않으면 마지막 1개를 두 명이 동시에 사서 2개가 팔리고,
+        # 다른 상품의 재고 변경까지 덮어써 사라집니다.
         if stock > 0:
-            selected_item["stock"] -= 1
-            await save_shop_items(guild_id, items)
+            got = await consume_shop_stock(guild_id, selected_item.get("id"))
+            if not got:
+                # 포인트 차감과 재고 확보 사이에 다른 유저가 마지막 개를 가져갔습니다.
+                # 유저 잘못이 아니므로 포인트를 그대로 돌려줍니다.
+                await add_user_points(guild_id, interaction.user.id, price)
+                embed = discord.Embed(
+                    title="⚠️ 방금 품절되었습니다",
+                    description=f"**{item_name}** 상품의 마지막 재고가 방금 다른 유저에게 판매되었습니다.\n\n"
+                                f"💰 차감된 **{price:,} P**는 **전액 환불**되었습니다.",
+                    color=discord.Color.orange()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
 
-        new_stock = selected_item.get("stock", -1)
+        new_stock = stock - 1 if stock > 0 else -1
         stock_text = format_stock_str(new_stock)
 
         # 역할 자동 지급 시도

@@ -5,7 +5,8 @@ from discord.ext import commands
 from discord import app_commands
 from utils.database import (
     get_gacha_settings, save_gacha_settings,
-    get_user_points, deduct_user_points, add_user_points, add_activity_log
+    get_user_points, deduct_user_points, add_user_points, add_activity_log,
+    consume_gacha_stock
 )
 
 
@@ -122,16 +123,28 @@ class GachaPlayView(discord.ui.View):
         desc = selected_item.get("description", "")
         stock = selected_item.get("stock", -1)
 
-        # 재고 1 차감 (stock > 0 인 경우)
+        # 재고 1 차감 — 목록 전체를 덮어쓰지 않고 **원자적으로** 처리합니다.
+        # 동시에 뽑은 두 명이 같은 마지막 항목에 당첨되면 2개가 나가기 때문입니다.
         if stock > 0:
+            got = await consume_gacha_stock(guild_id, selected_item.get("id"))
+            if not got:
+                # 그 사이 다른 유저가 마지막 재고를 가져갔습니다 → 전액 환불
+                await add_user_points(guild_id, user_id, price)
+                embed = discord.Embed(
+                    title="⚠️ 방금 품절되었습니다",
+                    description=f"당첨된 **{item_name}** 항목의 마지막 재고가 방금 소진되었습니다.\n\n"
+                                f"💰 차감된 **{price:,} P**는 **전액 환불**되었습니다. 다시 시도해 주세요.",
+                    color=discord.Color.orange()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            # 화면 표시용으로 로컬 사본도 맞춰 둡니다
             for item in items:
                 if item.get("id") == selected_item.get("id"):
-                    item["stock"] -= 1
+                    item["stock"] = stock - 1
                     break
-            settings["items"] = items
-            await save_gacha_settings(guild_id, settings)
 
-        new_stock = selected_item.get("stock", -1)
+        new_stock = stock - 1 if stock > 0 else -1
         stock_text = format_stock_str(new_stock)
 
         # 뽑기 후 남은 가용 항목 재확인하여 다 떨어졌으면 버튼 비활성화

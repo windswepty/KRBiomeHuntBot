@@ -19,6 +19,7 @@
 import os
 import time
 import hashlib
+import http.client
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -158,6 +159,9 @@ def exchange_code(code: str, redirect_uri: str) -> int | None:
                 "Accept": "application/json",
             },
         )
+        if not isinstance(token, dict):
+            print(f"[OAuthGate] 예상치 못한 응답 형태: {type(token).__name__}", flush=True)
+            return None
         access = token.get("access_token")
         if not access:
             return None
@@ -181,8 +185,13 @@ def exchange_code(code: str, redirect_uri: str) -> int | None:
             detail = ""
         print(f"[OAuthGate] 코드 교환 실패 HTTP {e.code}: {detail}", flush=True)
         return None
-    except (urllib.error.URLError, ValueError, KeyError, TypeError) as e:
-        print(f"[OAuthGate] 코드 교환 실패: {e}", flush=True)
+    except (OSError, http.client.HTTPException,
+            ValueError, KeyError, TypeError, AttributeError) as e:
+        # URLError 는 OSError 의 하위라 여기에 함께 잡힙니다. 응답을 기다리다
+        # 나는 TimeoutError / RemoteDisconnected / SSLError 는 URLError 로
+        # 감싸이지 않아, 예전 목록으로는 새어나가 Flask 500 이 됐습니다.
+        # (그러면 준비해 둔 안내 페이지도, 진단 로그도 나오지 않습니다)
+        print(f"[OAuthGate] 코드 교환 실패: {type(e).__name__}: {e}", flush=True)
         return None
 
 

@@ -4,6 +4,7 @@ from threading import Thread
 
 from flask import Flask, redirect, request, Response, make_response
 
+from utils import link_tokens
 from utils.link_tokens import redeem, peek_owner
 from utils import oauth_gate
 
@@ -45,6 +46,10 @@ _MESSAGES = {
     "not_member": ("입장 자격이 없습니다",
                    "서버를 나갔거나 필요한 역할이 없습니다.<br>"
                    "관리자에게 문의해 주세요."),
+    "no_cookie": ("브라우저가 쿠키를 저장하지 않습니다",
+                  "본인 확인 정보를 저장할 수 없어 입장할 수 없습니다.<br>"
+                  "시크릿 모드를 끄거나 쿠키 차단을 해제한 뒤,<br>"
+                  "디스코드로 돌아가 버튼을 다시 눌러 주세요."),
     "auth_failed": ("신원 확인에 실패했습니다",
                     "다시 시도해 주세요.<br>"
                     "문제가 계속되면 디스코드 버튼을 다시 눌러 주세요."),
@@ -90,6 +95,13 @@ def _deliver(token: str) -> Response:
 
 @app.route('/j/<token>')
 def join(token: str):
+    # HEAD 는 링크 미리보기·프리페치·백신 검사 등이 보냅니다.
+    # Flask 는 GET 라우트에 HEAD 를 자동으로 붙이므로, 그대로 두면
+    # **아무도 클릭하지 않았는데 1회용 토큰이 타버립니다.**
+    # 사람이 실제로 연 것이 아니므로 토큰에 손대지 않고 돌려보냅니다.
+    if request.method == "HEAD":
+        return Response(status=204)
+
     # 게이트가 꺼져 있으면 지금까지처럼 토큰만으로 통과시킵니다.
     if not oauth_gate.enabled():
         return _deliver(token)
@@ -103,10 +115,22 @@ def join(token: str):
     viewer = oauth_gate.read_user(request.cookies.get(oauth_gate.COOKIE_NAME))
 
     if viewer is None:
+        # 신원 확인을 이미 마치고 돌아왔는데도 쿠키가 없다면, 브라우저가
+        # 쿠키를 저장하지 못하는 상태입니다. 그대로 다시 보내면 디스코드와
+        # 이 페이지 사이를 무한히 오갑니다. 한 번 왕복한 표시를 보고 멈춥니다.
+        if request.args.get("v") == "1":
+            print("[OAuthGate] 쿠키 저장 실패로 재진입 — 루프 차단", flush=True)
+            return _page("no_cookie", status=403)
+
         # 아직 신원이 없음 → 디스코드로 보내 한 번만 확인받습니다
         state = oauth_gate.sign_state(token)
         if not state:
             return _deliver(token)
+
+        # 디스코드 로그인·동의에 걸리는 시간 동안 토큰이 죽지 않도록
+        # 왕복 예산만큼 수명을 늘립니다. 이게 없으면 신원 확인에 성공하고도
+        # 돌아온 순간 "링크가 만료되었습니다"를 보게 됩니다.
+        link_tokens.extend(token, oauth_gate.STATE_MAX_AGE)
         return redirect(oauth_gate.authorize_url(_redirect_uri(), state), code=302)
 
     if viewer != user_id:
@@ -121,6 +145,10 @@ def join(token: str):
 
 @app.route('/auth/callback')
 def auth_callback():
+    # 인가 코드는 1회용이라 미리보기 요청이 태우면 안 됩니다.
+    if request.method == "HEAD":
+        return Response(status=204)
+
     # 실패 원인을 로그로 남깁니다. 안내 페이지는 같아도, 관리자는
     # 어디서 막혔는지 알아야 고칠 수 있습니다.
     if not oauth_gate.enabled():
@@ -159,7 +187,9 @@ def auth_callback():
 
     # 신원을 쿠키에 심고, 원래 가려던 링크로 되돌립니다.
     # 다음부터는 이 단계 없이 즉시 통과합니다.
-    resp = make_response(redirect(f"/j/{token}", code=302))
+    # ?v=1 은 "신원 확인을 이미 거쳤다"는 표시입니다. 돌아갔는데도 쿠키가
+    # 없으면 브라우저가 쿠키를 막고 있다는 뜻이라, 무한 왕복을 멈춥니다.
+    resp = make_response(redirect(f"/j/{token}?v=1", code=302))
     resp.set_cookie(
         oauth_gate.COOKIE_NAME, signed,
         max_age=oauth_gate.COOKIE_MAX_AGE,

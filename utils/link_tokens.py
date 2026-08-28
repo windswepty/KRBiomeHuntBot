@@ -119,6 +119,25 @@ def peek_owner(token: str) -> tuple[int, int] | None:
         return info["guild_id"], info["user_id"]
 
 
+def extend(token: str, seconds: int) -> bool:
+    """살아있는 토큰의 수명을 연장합니다.
+
+    OAuth 신원 확인으로 보내는 동안 토큰이 죽어버리면, 확인에 성공하고도
+    "링크가 만료되었습니다"를 보게 됩니다. 디스코드 로그인·동의를 거치는
+    첫 이용자에게 특히 자주 일어납니다. 그래서 게이트로 내보내기 직전에
+    왕복 예산만큼 늘려 줍니다.
+
+    1회용(MAX_USES)과 소유자 검증은 그대로라 유출 내성은 유지됩니다.
+    """
+    now = time.monotonic()
+    with _lock:
+        info = _tokens.get(token)
+        if info is None or info["expires"] <= now:
+            return False
+        info["expires"] = now + seconds
+        return True
+
+
 def stats() -> dict:
     """현재 보관 중인 토큰 수 (진단용)."""
     now = time.monotonic()

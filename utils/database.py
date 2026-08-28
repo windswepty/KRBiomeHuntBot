@@ -59,7 +59,7 @@ if MONGO_URI:
         blacklist_col = mongo_db["blacklist"]
         boost_col = mongo_db["channel_boosts"]
         snapshot_col = mongo_db["point_snapshots"]
-        from pymongo import ReturnDocument as _ReturnDocument
+        from pymongo import ReturnDocument as _ReturnDocument, UpdateOne as _UpdateOne
         _AFTER = _ReturnDocument.AFTER
 
         # 인덱스는 없어도 동작하므로, 실패해도 연결 자체를 포기하지 않습니다.
@@ -91,6 +91,7 @@ if MONGO_URI:
         print("!! -> 즉시 봇을 정지하고 MONGO_URI / Atlas 상태를 확인하세요.", flush=True)
         print("!" * 70 + "\n", flush=True)
         _AFTER = None
+        _UpdateOne = None
         users_col = None
         settings_col = None
         shop_col = None
@@ -1475,14 +1476,24 @@ async def restore_point_snapshot(guild_id: int, snapshot_id: str) -> dict:
 
     if users_col is not None:
         def _apply():
-            changed = 0
-            for uid, pts in users.items():
-                res = users_col.update_one(
+            # 한 명씩 update_one 을 돌리면 유저 수만큼 왕복이 생깁니다.
+            # 838명 기준 약 9초가 걸려 복원 버튼이 한참 멈춰 보였습니다.
+            # bulk_write 로 묶어 왕복을 수백 분의 1로 줄입니다.
+            ops = [
+                _UpdateOne(
                     {"_id": f"{str_gid}:{uid}"},
-                    {"$set": {"points": int(pts), "guild_id": str_gid, "user_id": str(uid)}},
+                    {"$set": {"points": int(pts),
+                              "guild_id": str_gid, "user_id": str(uid)}},
                     upsert=True)
-                if res.modified_count or res.upserted_id is not None:
-                    changed += 1
+                for uid, pts in users.items()
+            ]
+            if not ops:
+                return 0
+            changed = 0
+            CHUNK = 500          # 한 번에 너무 많이 보내지 않도록 나눠 전송
+            for i in range(0, len(ops), CHUNK):
+                res = users_col.bulk_write(ops[i:i + CHUNK], ordered=False)
+                changed += res.modified_count + len(res.upserted_ids or {})
             return changed
         try:
             changed = await _db(_apply)

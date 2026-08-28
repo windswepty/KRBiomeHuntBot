@@ -60,6 +60,24 @@ if MONGO_URI:
         guardkey_col = _db["guarded_keys"]
         usage_col = _db["link_usage"]
         logref_col = _db["log_references"]
+
+        # 인덱스는 없어도 기능은 동작하므로, 생성에 실패해도 Mongo 연결 자체를
+        # 포기하지 않도록 별도의 try로 감쌉니다. create_index는 멱등이라
+        # 기동할 때마다 호출해도 안전합니다.
+        try:
+            # 보호 메시지 ID로 로그 참조를 역방향 조회할 때 사용 (풀스캔 방지)
+            logref_col.create_index(
+                [("guild_id", 1), ("protected_message_id", 1)],
+                name="logref_by_protected"
+            )
+            # 길드별 최신순 조회 및 오래된 클릭 로그 정리에 사용
+            clicklog_col.create_index(
+                [("guild_id", 1), ("_id", -1)],
+                name="clicklog_recent"
+            )
+        except Exception as e:
+            print(f"MongoDB index setup warning: {e}", flush=True)
+
         print("Connected to MongoDB successfully for verify/linkguard storage!", flush=True)
     except Exception as e:
         print(f"MongoDB (verify) connection warning: {e}. Falling back to local JSON storage.", flush=True)
@@ -311,6 +329,45 @@ MAX_CLICK_LOGS = 500
 
 # event_type: "view" = 정상 열람 / "leak" = 서버 내 유출 감지
 
+# 오래된 클릭 로그 정리 주기.
+# 삽입할 때마다 정리하면 낭비라, 프로세스 기동 후 첫 삽입과 이후 N회마다 수행합니다.
+# (Render 무료 플랜처럼 재시작이 잦은 환경에서도 최소 한 번은 정리되도록
+#  '첫 삽입'을 포함시켰습니다)
+CLICKLOG_TRIM_EVERY = 50
+_clicklog_insert_count: dict[str, int] = {}
+
+
+def _maybe_trim_click_logs(guild_id: int) -> None:
+    """MongoDB의 클릭 로그를 길드당 MAX_CLICK_LOGS건으로 유지합니다.
+
+    로컬 JSON 경로에는 원래 캡이 걸려 있었지만 Mongo 경로에는 없어서
+    클릭 1회당 1문서가 영구 누적되고 있었습니다. 이 함수가 그 격차를 메웁니다.
+
+    기록 자체를 방해하면 안 되므로 예외를 모두 삼키고 경고만 남깁니다.
+    """
+    if clicklog_col is None:
+        return
+
+    str_gid = str(guild_id)
+    n = _clicklog_insert_count.get(str_gid, 0) + 1
+    _clicklog_insert_count[str_gid] = n
+    if n != 1 and n % CLICKLOG_TRIM_EVERY != 0:
+        return
+
+    try:
+        # ObjectId(_id)는 생성 시각 순으로 증가하므로 최신순 정렬 기준으로 씁니다.
+        # (get_click_logs도 동일하게 _id 역순을 최신순으로 사용합니다)
+        cursor = (clicklog_col.find({"guild_id": str_gid}, {"_id": 1})
+                  .sort("_id", -1).skip(MAX_CLICK_LOGS).limit(1))
+        cutoff = next(iter(cursor), None)
+        if cutoff is None:
+            return  # 아직 상한에 도달하지 않음
+        clicklog_col.delete_many(
+            {"guild_id": str_gid, "_id": {"$lte": cutoff["_id"]}}
+        )
+    except Exception as e:
+        print(f"MongoDB click log trim warning: {e}", flush=True)
+
 
 async def add_click_log(
     guild_id: int,
@@ -335,9 +392,13 @@ async def add_click_log(
     if clicklog_col is not None:
         try:
             clicklog_col.insert_one(dict(entry))
-            return
         except Exception as e:
             print(f"MongoDB add_click_log error: {e}, using local file.", flush=True)
+        else:
+            # 삽입에 성공했을 때만 정리합니다. 정리 실패가 JSON 폴백을 부르면
+            # 같은 기록이 두 곳에 남으므로, except 밖(else)에서 호출합니다.
+            _maybe_trim_click_logs(guild_id)
+            return
 
     async with _clicklog_lock:
         all_logs = _read_json(CLICKLOG_FILE)
@@ -558,6 +619,9 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
 
 _logref_cache: dict[str, dict] = {}
 
+# protected_message_id -> 참조 (역방향 조회용, get_log_reference_by_protected 전용 캐시)
+_logref_by_protected_cache: dict[str, dict] = {}
+
 
 async def save_log_reference(guild_id: int, log_message_id: int,
                              protected_message_id: int, channel_id: int) -> None:
@@ -569,6 +633,7 @@ async def save_log_reference(guild_id: int, log_message_id: int,
         "channel_id": str(channel_id),
     }
     _logref_cache[key] = entry
+    _logref_by_protected_cache[f"{guild_id}:{protected_message_id}"] = entry
 
     if logref_col is not None:
         try:
@@ -606,6 +671,43 @@ async def get_log_reference(guild_id: int, log_message_id: int) -> dict | None:
     if entry:
         _logref_cache[key] = entry
         return dict(entry)
+    return None
+
+
+async def get_log_reference_by_protected(guild_id: int, protected_message_id: int) -> dict | None:
+    """보호 메시지 ID로 로그 메시지 참조를 역방향 조회합니다.
+
+    link_guard.py의 `_LOG_MESSAGE_BY_PROTECTED`(프로세스 메모리 캐시)가
+    비어있을 때(봇 재시작 직후 등) 영속 저장소에서 매핑을 복원하기 위한 용도입니다.
+    이 함수 자체도 별도 캐시(`_logref_by_protected_cache`)를 먼저 확인하므로,
+    같은 프로세스에서 반복 호출해도 DB를 다시 때리지 않습니다.
+    """
+    key = f"{guild_id}:{protected_message_id}"
+
+    cached = _logref_by_protected_cache.get(key)
+    if cached is not None:
+        return dict(cached)
+
+    str_gid = str(guild_id)
+    str_pmid = str(protected_message_id)
+
+    if logref_col is not None:
+        try:
+            doc = logref_col.find_one({"guild_id": str_gid, "protected_message_id": str_pmid})
+            if doc:
+                entry = {k: v for k, v in doc.items() if k != "_id"}
+                _logref_by_protected_cache[key] = entry
+                return dict(entry)
+            return None
+        except Exception as e:
+            print(f"MongoDB get_log_reference_by_protected error: {e}, using local file.", flush=True)
+
+    async with _logref_lock:
+        all_refs = _read_json(LOGREF_FILE)
+    for entry in all_refs.values():
+        if entry.get("guild_id") == str_gid and entry.get("protected_message_id") == str_pmid:
+            _logref_by_protected_cache[key] = entry
+            return dict(entry)
     return None
 
 

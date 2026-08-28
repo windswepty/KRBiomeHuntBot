@@ -23,7 +23,7 @@ from utils.verify_db import (
     make_watermark_code, save_watermark, get_watermark,
     register_guarded_keys, get_guarded_keys,
     record_link_usage, get_link_usage,
-    save_log_reference, get_log_reference,
+    save_log_reference, get_log_reference, get_log_reference_by_protected,
 )
 
 # 봇 재시작 후에도 버튼이 살아있도록 고정 custom_id 사용
@@ -464,6 +464,29 @@ _last_log_refresh: dict[int, float] = {}
 LOG_REFRESH_INTERVAL = 10.0
 
 
+async def _resolve_log_ref(guild_id: int, message_id: int) -> int | None:
+    """protected message id -> 로그 메시지 id 를 영속 저장소에서 복원합니다.
+
+    `_LOG_MESSAGE_BY_PROTECTED`는 프로세스 메모리 캐시라 봇 재시작 시 비워지므로,
+    캐시 미스일 때만 이 함수로 DB/로컬 JSON을 조회해 다시 채웁니다.
+
+    반환값: 로그 메시지 ID(양수) / 0 = 저장소에 기록 자체가 없음(확정, 캐시 가능) /
+    None = 조회가 실패함(일시적 오류일 수 있어 캐시하지 않고 다음 호출에 재시도).
+    """
+    try:
+        found = await get_log_reference_by_protected(guild_id, message_id)
+    except Exception as e:
+        print(f"[LinkGuard] 로그 참조 복원 실패: {e}", flush=True)
+        return None
+
+    if not found:
+        return 0
+    try:
+        return int(found["log_message_id"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
 async def refresh_usage_log(guild, settings: dict, message_id: int,
                             total: int, url: str) -> None:
     """로그 채널의 해당 임베드에 표시된 '사용 인원'을 갱신합니다.
@@ -472,6 +495,15 @@ async def refresh_usage_log(guild, settings: dict, message_id: int,
     (정확한 최신 수치는 [👥 링크 사용 유저] 버튼에서 항상 확인할 수 있습니다)
     """
     ref = _LOG_MESSAGE_BY_PROTECTED.get(message_id)
+    if ref is None:
+        # 메모리 캐시 미스 — 봇 재시작 직후 등. 영속 저장소에서 한 번만 복원하고,
+        # 그 결과(있음/없음 모두)를 캐시에 남겨 다음 클릭부터는 다시 조회하지 않습니다.
+        resolved = await _resolve_log_ref(guild.id, message_id)
+        if resolved is None:
+            return  # 조회 실패 — 캐시하지 않고 다음 클릭에 재시도
+        ref = resolved
+        _LOG_MESSAGE_BY_PROTECTED[message_id] = ref
+
     if not ref:
         return
 
@@ -501,12 +533,14 @@ async def refresh_usage_log(guild, settings: dict, message_id: int,
                 break
         await log_msg.edit(embed=discord.Embed.from_dict(data), view=UsageStatsView())
     except discord.NotFound:
-        _LOG_MESSAGE_BY_PROTECTED.pop(message_id, None)
+        # 로그 메시지가 삭제된 경우: 0으로 확정 캐시해 재시작 전까지 재조회를 막습니다.
+        _LOG_MESSAGE_BY_PROTECTED[message_id] = 0
     except Exception as e:
         print(f"[LinkGuard] 로그 임베드 갱신 실패: {e}", flush=True)
 
 
 # 보호 메시지 ID -> 로그 채널에 올린 메시지 ID (봇이 살아있는 동안의 빠른 조회용)
+# 0 = "저장소 조회 결과 기록 없음"으로 확정된 상태(재조회 방지용 음성 캐시)
 _LOG_MESSAGE_BY_PROTECTED: dict[int, int] = {}
 
 

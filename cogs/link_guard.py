@@ -483,7 +483,8 @@ async def _after_click(guild, member, links: list[str], code: str, settings: dic
         if message is not None:
             total, _ = await record_link_usage(guild.id, message.id,
                                                member.id, member.display_name,
-                                               issued_url=issued_url)
+                                               issued_url=issued_url,
+                                               watermark=code)
             await ensure_usage_log(guild, settings, message, links, total)
     except Exception as e:
         print(f"[LinkGuard] 클릭 후처리 오류: {e}", flush=True)
@@ -674,6 +675,100 @@ async def _apply_usage_refresh(guild, settings: dict, message_id: int,
 _LOG_MESSAGE_BY_PROTECTED: dict[int, int] = {}
 
 
+class ClickLogPageView(discord.ui.View):
+    """열람 / 유출 기록 — 한 페이지 10건씩 넘겨보는 뷰.
+
+    예전에는 최근 20건을 한 필드에 몰아넣고 1024자에서 통째로 잘라내,
+    '총 20건'이라 적어놓고 실제로는 그보다 적게 보였습니다.
+    """
+
+    PER_PAGE = 10
+    MAX_PAGES = 10          # 최대 100건까지 넘겨봅니다
+
+    def __init__(self, logs: list[dict], is_leak: bool):
+        super().__init__(timeout=300)
+        self.logs = logs[:self.PER_PAGE * self.MAX_PAGES]
+        self.is_leak = is_leak
+        self.page = 0
+        self.pages = max(1, (len(self.logs) + self.PER_PAGE - 1) // self.PER_PAGE)
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.pages - 1
+
+    def build_embed(self) -> discord.Embed:
+        total = len(self.logs)
+        embed = discord.Embed(
+            title="🚨 유출 감지 기록" if self.is_leak else "🔍 링크 열람 기록",
+            description=("서버 안에서 보호 링크를 **다시 게시한** 유저 기록입니다."
+                         if self.is_leak else
+                         "개인서버 링크를 **열람한** 유저 기록입니다. "
+                         "유출 시 용의자를 좁히는 데 씁니다."),
+            color=discord.Color.red() if self.is_leak else discord.Color.dark_teal()
+        )
+        if not total:
+            embed.add_field(
+                name="\u2139\ufe0f 안내",
+                value=("아직 감지된 유출이 없습니다." if self.is_leak
+                       else "아직 기록된 열람 이력이 없습니다."),
+                inline=False
+            )
+            return embed
+
+        begin = self.page * self.PER_PAGE
+        chunk = self.logs[begin:begin + self.PER_PAGE]
+
+        lines = []
+        for offset, log in enumerate(chunk, start=begin + 1):
+            who = log.get("user_name", "알 수 없음")
+            uid = log.get("user_id", "")
+            ts = log.get("timestamp", "")
+            summary = describe_roblox_link(log.get("url", ""))
+            extra = log.get("detail", "")
+            lines.append(
+                f"`{offset:2}.` **{who}** <@{uid}> (`{uid}`)\n"
+                f"     └ `{ts}`" + (f" · {extra}" if extra else "") + "\n"
+                f"     └ {summary}"
+            )
+
+        # 임베드 필드 1024자 상한 — 넘칠 때마다 필드를 새로 엽니다
+        fields = [[]]
+        used = 0
+        for line in lines:
+            if used + len(line) + 1 > 1000 and fields[-1]:
+                fields.append([])
+                used = 0
+            fields[-1].append(line)
+            used += len(line) + 1
+
+        for idx, group in enumerate(fields):
+            if not group:
+                continue
+            embed.add_field(
+                name=(f"📋 {begin + 1}~{begin + len(chunk)}번 (총 {total}건)"
+                      if idx == 0 else "\u200b"),
+                value="\n".join(group),
+                inline=False
+            )
+        embed.set_footer(text=f"{self.page + 1} / {self.pages} 페이지 · "
+                              "최신순 · 링크 코드는 일부만 표시됩니다")
+        return embed
+
+    async def _turn(self, interaction: discord.Interaction, delta: int) -> None:
+        self.page = max(0, min(self.pages - 1, self.page + delta))
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary, emoji="◀")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn(interaction, -1)
+
+    @discord.ui.button(label="다음", style=discord.ButtonStyle.secondary, emoji="▶")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn(interaction, +1)
+
+
 class UsagePageView(discord.ui.View):
     """링크 사용 유저 명단 — 한 페이지 10명씩 넘겨보는 뷰.
 
@@ -715,10 +810,13 @@ class UsagePageView(discord.ui.View):
             # 링크가 1회용이라, 관리자가 눌러버리면 정작 그 유저가 못 들어갑니다.
             link = r.get("link") or ""
             link_line = f"`{link}`" if link else "`(기록 없음)`"
+            # 워터마크는 유출된 링크에서 사람을 특정하는 열쇠라, 명단에서
+            # 바로 대조할 수 있게 시각 옆에 함께 보여줍니다.
+            wm = r.get("watermark") or ""
+            wm_part = f" · 표식 `{wm}`" if wm else " · 표식 없음"
             lines.append(
-                f"`{offset:2}.` <@{r['user_id']}> {r['user_name']} "
-                f"(`{r['user_id']}`){repeat}\n"
-                f"     └ `{r.get('last', '')}`\n"
+                f"`{offset:2}.` <@{r['user_id']}> (`{r['user_id']}`){repeat}\n"
+                f"     └ `{r.get('last', '')}`{wm_part}\n"
                 f"     └ {link_line}"
             )
 
@@ -1706,34 +1804,17 @@ class GuardSettingsSelect(discord.ui.Select):
 
         elif choice in ("clicks", "leaks"):
             is_leak = (choice == "leaks")
-            logs = await get_click_logs(guild.id, limit=20, event_type="leak" if is_leak else "view")
-
-            embed = discord.Embed(
-                title="🚨 유출 감지 기록 (최근 20건)" if is_leak else "🔍 링크 열람 기록 (최근 20건)",
-                description=("서버 안에서 보호 링크를 **다시 게시한** 유저 기록입니다."
-                             if is_leak else
-                             "개인서버 링크를 **열람한** 유저 기록입니다. 유출 시 용의자를 좁히는 데 씁니다."),
-                color=discord.Color.red() if is_leak else discord.Color.dark_teal()
+            logs = await get_click_logs(
+                guild.id,
+                limit=ClickLogPageView.PER_PAGE * ClickLogPageView.MAX_PAGES,
+                event_type="leak" if is_leak else "view"
             )
-            if not logs:
-                embed.add_field(
-                    name="ℹ️ 안내",
-                    value="아직 감지된 유출이 없습니다." if is_leak else "아직 기록된 열람 이력이 없습니다.",
-                    inline=False
-                )
-            else:
-                lines = []
-                for log in logs:
-                    who = log.get("user_name", "알 수 없음")
-                    uid = log.get("user_id", "")
-                    ts = log.get("timestamp", "")
-                    summary = describe_roblox_link(log.get("url", ""))
-                    extra = log.get("detail", "")
-                    lines.append(f"• `{ts}` **{who}** (<@{uid}>)\n  └ {summary}"
-                                 + (f" · {extra}" if extra else ""))
-                embed.add_field(name=f"📋 총 {len(logs)}건", value="\n".join(lines)[:1024], inline=False)
-            embed.set_footer(text="링크 코드는 일부만 표시됩니다")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            view = ClickLogPageView(logs, is_leak)
+            await interaction.response.send_message(
+                embed=view.build_embed(),
+                view=view if view.pages > 1 else discord.utils.MISSING,
+                ephemeral=True
+            )
 
         elif choice == "status":
             embed = build_status_embed(guild, settings, await get_verify_settings(guild.id))

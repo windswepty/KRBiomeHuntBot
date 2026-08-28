@@ -630,7 +630,7 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
 
 async def record_link_usage(guild_id: int, message_id: int,
                             user_id: int, user_name: str,
-                            issued_url: str = "") -> tuple[int, bool]:
+                            issued_url: str = "", watermark: str = "") -> tuple[int, bool]:
     """보호 메시지별로 '누가 링크를 사용했는지'를 기록합니다.
 
     반환값은 (지금까지 사용한 서로 다른 유저 수, 이번이 첫 사용인지) 입니다.
@@ -664,6 +664,8 @@ async def record_link_usage(guild_id: int, message_id: int,
     entry["last"] = timestamp
     if issued_url:
         entry["link"] = issued_url
+    if watermark:
+        entry["wm"] = watermark
     bucket[uid] = entry
     total = len(bucket)
 
@@ -679,6 +681,7 @@ async def record_link_usage(guild_id: int, message_id: int,
                         f"users.{uid}.name": user_name,
                         f"users.{uid}.last": timestamp,
                         **({f"users.{uid}.link": issued_url} if issued_url else {}),
+                        **({f"users.{uid}.wm": watermark} if watermark else {}),
                         # 클릭할 때마다 갱신 → 계속 쓰이는 링크는 만료되지 않고,
                         # 30일간 아무도 안 누른 것만 자동 삭제됩니다.
                         "updated": _utcnow(),
@@ -739,6 +742,7 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
             "first": info.get("first", info.get("last", "")),
             "last": info.get("last", ""),
             "link": info.get("link", ""),
+            "watermark": info.get("wm", ""),
         }
         for uid, info in bucket.items()
     ]

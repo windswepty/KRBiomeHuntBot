@@ -28,6 +28,9 @@ from utils.database import (
 KST = datetime.timezone(datetime.timedelta(hours=9))
 # 활동이 가장 적은 시간대에 자동 백업
 AUTO_BACKUP_TIME = datetime.time(hour=5, minute=0, tzinfo=KST)
+# 마지막 백업이 이보다 오래됐으면 기동 시 즉시 한 번 백업합니다.
+# 하루 주기(24h)에 여유 1시간을 둬, 정상 운영 중에는 발동하지 않습니다.
+CATCHUP_AFTER_HOURS = 25
 
 REASON_LABEL = {
     "auto": "🕔 자동",
@@ -260,6 +263,19 @@ class PointBackup(commands.Cog):
     def cog_unload(self):
         self.daily_snapshot.cancel()
 
+    async def _snapshot_age_hours(self, guild_id: int) -> float | None:
+        """마지막 백업이 몇 시간 전인지. 백업이 없거나 시각을 못 읽으면 None."""
+        recent = await list_point_snapshots(guild_id, limit=1)
+        if not recent:
+            return None
+        try:
+            last = datetime.datetime.strptime(
+                recent[0].get("created_kst", ""), "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=KST)
+        except (ValueError, TypeError):
+            return None
+        return (datetime.datetime.now(KST) - last).total_seconds() / 3600
+
     @tasks.loop(time=AUTO_BACKUP_TIME)
     async def daily_snapshot(self):
         """매일 새벽 5시(KST)에 전 길드의 포인트를 자동 백업합니다."""
@@ -275,6 +291,32 @@ class PointBackup(commands.Cog):
                           f"{result.get('error', '알 수 없음')}", flush=True)
             except Exception as e:
                 print(f"[Backup] {guild.name}: 자동 백업 중 오류 - {e}", flush=True)
+
+    @daily_snapshot.before_loop
+    async def before_daily_snapshot(self):
+        """기동 직후, 마지막 백업이 너무 오래됐으면 즉시 한 번 백업합니다.
+
+        새벽 5시 정각에 재배포·재시작이 겹치면 그날 자동 백업이 통째로
+        건너뛰어집니다. 이 보강이 그 빈틈을 메웁니다.
+        백업이 하나도 없는 첫 배포에서도 즉시 하나를 만들어 둡니다.
+        """
+        await self.bot.wait_until_ready()
+        for guild in self.bot.guilds:
+            try:
+                age = await self._snapshot_age_hours(guild.id)
+                if age is not None and age < CATCHUP_AFTER_HOURS:
+                    continue    # 최근 백업이 있으니 건너뜁니다
+                reason = "백업 없음" if age is None else f"마지막 백업 {age:.0f}시간 전"
+                result = await create_point_snapshot(guild.id, reason="auto")
+                if result.get("ok"):
+                    print(f"[Backup] {guild.name}: 기동 시 따라잡기 백업 완료 "
+                          f"({reason} / {result['user_count']}명 / "
+                          f"{result['total_points']}P)", flush=True)
+                else:
+                    print(f"[Backup] {guild.name}: 따라잡기 백업 실패 - "
+                          f"{result.get('error', '알 수 없음')}", flush=True)
+            except Exception as e:
+                print(f"[Backup] {guild.name}: 따라잡기 백업 중 오류 - {e}", flush=True)
 
     @app_commands.command(
         name="포인트백업",

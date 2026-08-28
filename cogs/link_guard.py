@@ -16,6 +16,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
+from utils import link_tokens
 from utils.verify_db import (
     get_linkguard_settings, save_linkguard_settings,
     save_protected_link, get_protected_link,
@@ -389,9 +390,27 @@ class ProtectedLinkView(discord.ui.View):
         overflow: list[str] = []
         has_private_server = False
 
+        # 중계가 켜져 있고 공개 주소가 잡히면, 로블록스 링크 대신 1회성 토큰
+        # 주소를 전달합니다. 실제 링크가 디스코드에 남지 않고, 퍼뜨려도 곧
+        # 만료되어 쓸 수 없습니다. 주소를 못 구하면 조용히 직접 링크로 돌아갑니다.
+        relay_base = link_tokens.public_base_url() if settings.get("relay_links") else None
+        relayed = False
+
         for idx, link in enumerate(links[:5], start=1):
             marked = apply_watermark(link, code) if code else link
-            if len(marked) > MAX_URL_LENGTH:
+
+            target = marked
+            if relay_base:
+                try:
+                    token = link_tokens.issue(marked, member.id, guild.id)
+                    target = f"{relay_base}/j/{token}"
+                    relayed = True
+                except Exception as e:
+                    # 중계 실패가 입장 자체를 막으면 안 됩니다
+                    print(f"[LinkGuard] 중계 토큰 발급 실패, 직접 링크로 대체: {e}", flush=True)
+                    target = marked
+
+            if len(target) > MAX_URL_LENGTH:
                 overflow.append(link)
                 continue
 
@@ -404,7 +423,7 @@ class ProtectedLinkView(discord.ui.View):
                 label = "바로 가기" if len(links) == 1 else f"바로 가기 {idx}"
 
             try:
-                link_view.add_item(discord.ui.Button(label=label, url=marked, style=discord.ButtonStyle.link))
+                link_view.add_item(discord.ui.Button(label=label, url=target, style=discord.ButtonStyle.link))
             except Exception:
                 overflow.append(link)
 
@@ -420,6 +439,10 @@ class ProtectedLinkView(discord.ui.View):
                        "-# 외부로 유출되면 누가 퍼뜨렸는지 확인됩니다.")
         else:
             content = headline + "\n-# 이 메시지는 본인에게만 보이며, 열람 기록이 남습니다."
+
+        if relayed:
+            content += (f"\n-# 이 버튼은 회원님 전용이며 {link_tokens.TOKEN_TTL_SECONDS}초 뒤 만료됩니다. "
+                        "남에게 넘겨도 열리지 않습니다.")
 
         if overflow:
             content += "\n\n⚠️ 버튼으로 만들 수 없는 링크:\n" + "\n".join(f"• {u}" for u in overflow[:3])
@@ -1412,6 +1435,12 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="🎮"
             ),
             discord.SelectOption(
+                label="링크 중계 (유출 링크 무효화)",
+                value="relay",
+                description="로블록스 링크를 노출하지 않고 만료되는 주소로 전달합니다.",
+                emoji="🛰️"
+            ),
+            discord.SelectOption(
                 label="워터마크 / 자동삭제 설정",
                 value="protect",
                 description="유출자 추적 표식과 유출 메시지 자동 삭제를 켜고 끕니다.",
@@ -1509,6 +1538,54 @@ class GuardSettingsSelect(discord.ui.Select):
                                "⚠️ 매크로 홍보 링크까지 버튼에 섞여 들어갈 수 있습니다."),
                 color=discord.Color.green() if new_state else discord.Color.orange()
             )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif choice == "relay":
+            new_state = not settings.get("relay_links", False)
+            base = link_tokens.public_base_url()
+            await save_linkguard_settings(guild.id, {"relay_links": new_state})
+
+            embed = discord.Embed(
+                title="🛰️ 링크 중계 설정 변경",
+                description=f"링크 중계가 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.",
+                color=discord.Color.green() if new_state else discord.Color.orange()
+            )
+            if new_state:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value=f"• 로블록스 링크 대신 **{link_tokens.TOKEN_TTL_SECONDS}초 뒤 만료되는 주소**를 전달합니다\n"
+                          "• 실제 링크가 디스코드에 남지 않습니다\n"
+                          "• 그 주소를 남에게 넘겨도 만료·횟수 제한으로 열리지 않습니다",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚠️ 알아두실 점",
+                    value="• 봇의 웹 서버를 한 번 거치므로 **약 0.3~0.5초** 느려집니다\n"
+                          "• 웹 서버가 죽으면 **아무도 입장할 수 없습니다**. 문제가 생기면 "
+                          "이 메뉴에서 즉시 끄세요\n"
+                          "• 링크를 받은 본인이 주소창에서 복사하는 것까지는 막지 못합니다 "
+                          "(워터마크로 추적)",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value="로블록스 링크를 **그대로** 버튼에 담아 전달합니다.\n"
+                          "가장 빠르지만, 유출된 링크는 계속 유효합니다.",
+                    inline=False
+                )
+
+            if new_state and not base:
+                embed.add_field(
+                    name="🚨 공개 주소를 찾지 못했습니다",
+                    value="`RENDER_EXTERNAL_URL` 또는 `PUBLIC_BASE_URL` 환경 변수가 필요합니다.\n"
+                          "주소를 찾지 못하면 **자동으로 기존 방식(직접 링크)으로 동작**하므로 "
+                          "입장이 막히지는 않습니다.",
+                    inline=False
+                )
+            elif new_state:
+                embed.add_field(name="🌐 중계 주소", value=f"`{base}/j/...`", inline=False)
+
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
         elif choice == "trace":

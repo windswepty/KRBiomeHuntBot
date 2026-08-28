@@ -8,6 +8,7 @@
 
 import os
 import json
+import time
 import asyncio
 import hashlib
 from datetime import datetime, timezone, timedelta
@@ -75,6 +76,22 @@ if MONGO_URI:
                 [("guild_id", 1), ("_id", -1)],
                 name="clicklog_recent"
             )
+
+            # ── 자동 청소(TTL) ──
+            # MongoDB가 60초마다 스스로 만료 문서를 지웁니다. 봇이 꺼져 있어도
+            # 동작하므로 별도 청소 코드나 스케줄러가 필요 없습니다.
+            #   protected_links : 버튼의 실사용 수명은 바이옴 지속시간(2~10분)이라
+            #                     7일이면 충분한 여유입니다.
+            #   link_usage / log_references : 유출 조사용이라 넉넉히 30일.
+            plink_col.create_index(
+                "updated", name="plink_ttl", expireAfterSeconds=7 * 24 * 3600
+            )
+            usage_col.create_index(
+                "updated", name="usage_ttl", expireAfterSeconds=30 * 24 * 3600
+            )
+            logref_col.create_index(
+                "updated", name="logref_ttl", expireAfterSeconds=30 * 24 * 3600
+            )
         except Exception as e:
             print(f"MongoDB index setup warning: {e}", flush=True)
 
@@ -89,6 +106,80 @@ if MONGO_URI:
         guardkey_col = None
         usage_col = None
         logref_col = None
+
+
+def _utcnow():
+    """TTL 인덱스가 인식하는 BSON Date 를 만듭니다.
+
+    기존 `created`/`timestamp` 필드는 사람이 읽기 위한 **문자열**이라
+    TTL이 동작하지 않습니다. TTL은 Date 타입 필드에만 걸립니다.
+    그래서 표시용 문자열은 그대로 두고, 만료 판정용 필드를 따로 둡니다.
+    """
+    return datetime.now(timezone.utc)
+
+
+class _TTLCache:
+    """시간 기반 만료 + 크기 상한이 있는 캐시.
+
+    두 가지를 막습니다.
+      1) MongoDB TTL이 문서를 지운 뒤에도 메모리 캐시가 옛 값을 계속 돌려주는 것
+         (캐시 수명을 DB TTL보다 짧게 잡아 어긋나지 않게 합니다)
+      2) 캐시가 무한히 늘어나 메모리를 잠식하는 것
+    """
+
+    __slots__ = ("_data", "_ttl", "_max")
+
+    def __init__(self, ttl_seconds: float, max_items: int):
+        self._data: dict = {}
+        self._ttl = ttl_seconds
+        self._max = max_items
+
+    def get(self, key):
+        item = self._data.get(key)
+        if item is None:
+            return None
+        stamped, value = item
+        if time.monotonic() - stamped > self._ttl:
+            self._data.pop(key, None)
+            return None
+        return value
+
+    def set(self, key, value) -> None:
+        self._data[key] = (time.monotonic(), value)
+        if len(self._data) > self._max:
+            self._evict()
+
+    def pop(self, key, default=None):
+        item = self._data.pop(key, None)
+        return default if item is None else item[1]
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def _evict(self) -> None:
+        now = time.monotonic()
+        for key in [k for k, (ts, _) in self._data.items() if now - ts > self._ttl]:
+            self._data.pop(key, None)
+        if len(self._data) > self._max:
+            # dict는 삽입 순서를 유지하므로 앞쪽이 가장 오래된 항목입니다
+            for key in list(self._data)[:len(self._data) - self._max // 2]:
+                self._data.pop(key, None)
+
+
+async def _db(fn, *args, **kwargs):
+    """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
+
+    pymongo는 동기 라이브러리라 async 함수 안에서 그냥 호출하면 그동안
+    이벤트 루프 전체가 멈춥니다. 개인서버 자리를 두고 수십 명이 동시에
+    버튼을 누르는 상황에서는 이 정지가 다른 유저의 응답을 지연시키고,
+    디스코드 상호작용 3초 제한을 넘겨 '상호작용 실패'까지 유발합니다.
+
+    MongoClient는 스레드 안전하므로 스레드로 넘기는 것이 안전합니다.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def _ensure_data_dir():
@@ -141,7 +232,7 @@ async def get_verify_settings(guild_id: int) -> dict:
 
     if verify_col is not None:
         try:
-            doc = verify_col.find_one({"_id": str_gid})
+            doc = await _db(verify_col.find_one, {"_id": str_gid})
             if doc:
                 result.update({k: v for k, v in doc.items() if k != "_id"})
             _verify_cache[str_gid] = dict(result)
@@ -167,7 +258,7 @@ async def save_verify_settings(guild_id: int, settings: dict) -> None:
 
     if verify_col is not None:
         try:
-            verify_col.update_one({"_id": str_gid}, {"$set": settings}, upsert=True)
+            await _db(verify_col.update_one, {"_id": str_gid}, {"$set": settings}, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB save_verify_settings error: {e}, using local file.", flush=True)
@@ -214,7 +305,7 @@ async def get_linkguard_settings(guild_id: int) -> dict:
 
     if linkguard_col is not None:
         try:
-            doc = linkguard_col.find_one({"_id": str_gid})
+            doc = await _db(linkguard_col.find_one, {"_id": str_gid})
             if doc:
                 result.update({k: v for k, v in doc.items() if k != "_id"})
             result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
@@ -245,7 +336,7 @@ async def save_linkguard_settings(guild_id: int, settings: dict) -> None:
 
     if linkguard_col is not None:
         try:
-            linkguard_col.update_one({"_id": str_gid}, {"$set": settings}, upsert=True)
+            await _db(linkguard_col.update_one, {"_id": str_gid}, {"$set": settings}, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB save_linkguard_settings error: {e}, using local file.", flush=True)
@@ -258,7 +349,8 @@ async def save_linkguard_settings(guild_id: int, settings: dict) -> None:
 
 # ── 보호된 링크 저장소 (메시지 ID 기준) ───────────────────────────────
 
-_plink_cache: dict[str, list[str]] = {}
+# 버튼 클릭의 핫패스. DB TTL(7일)보다 짧게 잡아 지워진 값을 돌려주지 않게 합니다.
+_plink_cache = _TTLCache(ttl_seconds=6 * 3600, max_items=3000)
 
 
 async def save_protected_link(guild_id: int, message_id: int, links: list[str]) -> None:
@@ -266,16 +358,15 @@ async def save_protected_link(guild_id: int, message_id: int, links: list[str]) 
     key = f"{guild_id}:{message_id}"
 
     # 버튼 클릭 시 DB를 타지 않도록 메모리에 먼저 올려둡니다
-    _plink_cache[key] = list(links)
-    if len(_plink_cache) > 1000:
-        for old_key in list(_plink_cache)[:500]:
-            _plink_cache.pop(old_key, None)
+    _plink_cache.set(key, list(links))
 
     if plink_col is not None:
         try:
-            plink_col.update_one(
+            await _db(
+                plink_col.update_one,
                 {"_id": key},
-                {"$set": {"guild_id": str(guild_id), "message_id": str(message_id), "links": links}},
+                {"$set": {"guild_id": str(guild_id), "message_id": str(message_id),
+                          "links": links, "updated": _utcnow()}},
                 upsert=True
             )
             return
@@ -302,10 +393,10 @@ async def get_protected_link(guild_id: int, message_id: int) -> list[str]:
 
     if plink_col is not None:
         try:
-            doc = plink_col.find_one({"_id": key})
+            doc = await _db(plink_col.find_one, {"_id": key})
             if doc:
                 links = list(doc.get("links", []))
-                _plink_cache[key] = list(links)
+                _plink_cache.set(key, list(links))
                 return links
         except Exception as e:
             print(f"MongoDB get_protected_link error: {e}, using local file.", flush=True)
@@ -315,7 +406,7 @@ async def get_protected_link(guild_id: int, message_id: int) -> list[str]:
     entry = all_links.get(key)
     if entry:
         links = list(entry.get("links", []))
-        _plink_cache[key] = list(links)
+        _plink_cache.set(key, list(links))
         return links
     return []
 
@@ -391,13 +482,13 @@ async def add_click_log(
 
     if clicklog_col is not None:
         try:
-            clicklog_col.insert_one(dict(entry))
+            await _db(clicklog_col.insert_one, dict(entry))
         except Exception as e:
             print(f"MongoDB add_click_log error: {e}, using local file.", flush=True)
         else:
             # 삽입에 성공했을 때만 정리합니다. 정리 실패가 JSON 폴백을 부르면
             # 같은 기록이 두 곳에 남으므로, except 밖(else)에서 호출합니다.
-            _maybe_trim_click_logs(guild_id)
+            await asyncio.to_thread(_maybe_trim_click_logs, guild_id)
             return
 
     async with _clicklog_lock:
@@ -415,8 +506,10 @@ async def get_click_logs(guild_id: int, limit: int = 30, event_type: str = "all"
             query: dict = {"guild_id": str(guild_id)}
             if event_type != "all":
                 query["type"] = event_type
-            cursor = clicklog_col.find(query).sort("_id", -1).limit(limit)
-            return [{k: v for k, v in doc.items() if k != "_id"} for doc in cursor]
+            def _fetch():
+                cur = clicklog_col.find(query).sort("_id", -1).limit(limit)
+                return [{k: v for k, v in d.items() if k != "_id"} for d in cur]
+            return await _db(_fetch)
         except Exception as e:
             print(f"MongoDB get_click_logs error: {e}, using local file.", flush=True)
 
@@ -447,11 +540,17 @@ async def save_watermark(guild_id: int, code: str, user_id: int, user_name: str)
     """워터마크 코드 → 유저 매핑을 저장합니다 (역추적용)."""
     key = f"{guild_id}:{code}"
     entry = {"guild_id": str(guild_id), "code": code, "user_id": str(user_id), "user_name": user_name}
+
+    # 워터마크 코드는 hash(길드+유저)라 유저마다 고정입니다. 이미 같은 내용이
+    # 저장돼 있으면 다시 쓸 이유가 없으므로, 몰림 상황에서 불필요한 쓰기를
+    # 통째로 건너뜁니다 (재방문 유저는 클릭당 DB 쓰기가 1회 줄어듭니다).
+    if _watermark_cache.get(key) == entry:
+        return
     _watermark_cache[key] = entry
 
     if watermark_col is not None:
         try:
-            watermark_col.update_one({"_id": key}, {"$set": entry}, upsert=True)
+            await _db(watermark_col.update_one, {"_id": key}, {"$set": entry}, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB save_watermark error: {e}, using local file.", flush=True)
@@ -472,7 +571,7 @@ async def get_watermark(guild_id: int, code: str) -> dict | None:
 
     if watermark_col is not None:
         try:
-            doc = watermark_col.find_one({"_id": key})
+            doc = await _db(watermark_col.find_one, {"_id": key})
             if doc:
                 entry = {k: v for k, v in doc.items() if k != "_id"}
                 _watermark_cache[key] = entry
@@ -494,7 +593,7 @@ async def get_watermark(guild_id: int, code: str) -> dict | None:
 _guarded_keys_cache: dict[str, set[str]] = {}
 
 # 보호 메시지별 사용자 집계 (임베드마다 따로)
-_usage_cache: dict[str, dict] = {}
+_usage_cache = _TTLCache(ttl_seconds=3600, max_items=2000)
 
 
 async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
@@ -505,12 +604,14 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
 
     if guardkey_col is not None:
         try:
-            for key in keys:
-                guardkey_col.update_one(
-                    {"_id": f"{guild_id}:{key}"},
-                    {"$set": {"guild_id": str_gid, "key": key}},
-                    upsert=True
-                )
+            def _write():
+                for key in keys:
+                    guardkey_col.update_one(
+                        {"_id": f"{guild_id}:{key}"},
+                        {"$set": {"guild_id": str_gid, "key": key}},
+                        upsert=True
+                    )
+            await _db(_write)
             return
         except Exception as e:
             print(f"MongoDB register_guarded_keys error: {e}, using local file.", flush=True)
@@ -536,8 +637,16 @@ async def record_link_usage(guild_id: int, message_id: int,
 
     bucket = _usage_cache.get(key)
     if bucket is None:
-        bucket = await _load_usage(key)
-        _usage_cache[key] = bucket
+        loaded = await _load_usage(key)
+        # 위 await 동안 다른 클릭이 먼저 캐시를 채웠을 수 있습니다.
+        # 수십 명이 동시에 누르면 전원이 '빈 집계'를 각자 불러와 서로 덮어써서
+        # 인원이 1명으로 뭉개지므로, 여기서 다시 확인해 **하나의 집계 객체를
+        # 공유**하도록 합니다. 아래 재확인~set 사이에는 await 가 없으므로
+        # 이벤트 루프 관점에서 원자적입니다.
+        bucket = _usage_cache.get(key)
+        if bucket is None:
+            bucket = loaded
+    _usage_cache.set(key, bucket)
 
     is_new = uid not in bucket
     entry = bucket.get(uid) or {"name": user_name, "count": 0, "first": timestamp}
@@ -549,7 +658,8 @@ async def record_link_usage(guild_id: int, message_id: int,
 
     if usage_col is not None:
         try:
-            usage_col.update_one(
+            await _db(
+                usage_col.update_one,
                 {"_id": key},
                 {
                     "$set": {
@@ -557,6 +667,9 @@ async def record_link_usage(guild_id: int, message_id: int,
                         "message_id": str(message_id),
                         f"users.{uid}.name": user_name,
                         f"users.{uid}.last": timestamp,
+                        # 클릭할 때마다 갱신 → 계속 쓰이는 링크는 만료되지 않고,
+                        # 30일간 아무도 안 누른 것만 자동 삭제됩니다.
+                        "updated": _utcnow(),
                     },
                     "$inc": {f"users.{uid}.count": 1},
                     "$setOnInsert": {"created": timestamp},
@@ -577,7 +690,7 @@ async def record_link_usage(guild_id: int, message_id: int,
 async def _load_usage(key: str) -> dict:
     if usage_col is not None:
         try:
-            doc = usage_col.find_one({"_id": key})
+            doc = await _db(usage_col.find_one, {"_id": key})
             if doc:
                 return dict(doc.get("users", {}))
             return {}
@@ -595,8 +708,16 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
 
     bucket = _usage_cache.get(key)
     if bucket is None:
-        bucket = await _load_usage(key)
-        _usage_cache[key] = bucket
+        loaded = await _load_usage(key)
+        # 위 await 동안 다른 클릭이 먼저 캐시를 채웠을 수 있습니다.
+        # 수십 명이 동시에 누르면 전원이 '빈 집계'를 각자 불러와 서로 덮어써서
+        # 인원이 1명으로 뭉개지므로, 여기서 다시 확인해 **하나의 집계 객체를
+        # 공유**하도록 합니다. 아래 재확인~set 사이에는 await 가 없으므로
+        # 이벤트 루프 관점에서 원자적입니다.
+        bucket = _usage_cache.get(key)
+        if bucket is None:
+            bucket = loaded
+    _usage_cache.set(key, bucket)
 
     rows = [
         {
@@ -617,10 +738,10 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
 # 로그 채널에 올린 임베드의 [링크 사용 유저] 버튼이, 어느 보호 메시지의
 # 집계를 보여줘야 하는지 찾기 위한 매핑입니다.
 
-_logref_cache: dict[str, dict] = {}
+_logref_cache = _TTLCache(ttl_seconds=3600, max_items=2000)
 
 # protected_message_id -> 참조 (역방향 조회용, get_log_reference_by_protected 전용 캐시)
-_logref_by_protected_cache: dict[str, dict] = {}
+_logref_by_protected_cache = _TTLCache(ttl_seconds=3600, max_items=2000)
 
 
 async def save_log_reference(guild_id: int, log_message_id: int,
@@ -632,12 +753,15 @@ async def save_log_reference(guild_id: int, log_message_id: int,
         "protected_message_id": str(protected_message_id),
         "channel_id": str(channel_id),
     }
-    _logref_cache[key] = entry
-    _logref_by_protected_cache[f"{guild_id}:{protected_message_id}"] = entry
+    _logref_cache.set(key, entry)
+    _logref_by_protected_cache.set(f"{guild_id}:{protected_message_id}", entry)
 
     if logref_col is not None:
         try:
-            logref_col.update_one({"_id": key}, {"$set": entry}, upsert=True)
+            # entry 는 로컬 JSON 저장에도 쓰이므로 datetime 을 섞지 않습니다
+            # (json.dump 가 직렬화하지 못합니다). Mongo 쪽에만 덧붙입니다.
+            await _db(logref_col.update_one, {"_id": key},
+                      {"$set": {**entry, "updated": _utcnow()}}, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB save_log_reference error: {e}, using local file.", flush=True)
@@ -657,10 +781,10 @@ async def get_log_reference(guild_id: int, log_message_id: int) -> dict | None:
 
     if logref_col is not None:
         try:
-            doc = logref_col.find_one({"_id": key})
+            doc = await _db(logref_col.find_one, {"_id": key})
             if doc:
                 entry = {k: v for k, v in doc.items() if k != "_id"}
-                _logref_cache[key] = entry
+                _logref_cache.set(key, entry)
                 return dict(entry)
         except Exception as e:
             print(f"MongoDB get_log_reference error: {e}, using local file.", flush=True)
@@ -669,7 +793,7 @@ async def get_log_reference(guild_id: int, log_message_id: int) -> dict | None:
         all_refs = _read_json(LOGREF_FILE)
     entry = all_refs.get(key)
     if entry:
-        _logref_cache[key] = entry
+        _logref_cache.set(key, entry)
         return dict(entry)
     return None
 
@@ -693,10 +817,10 @@ async def get_log_reference_by_protected(guild_id: int, protected_message_id: in
 
     if logref_col is not None:
         try:
-            doc = logref_col.find_one({"guild_id": str_gid, "protected_message_id": str_pmid})
+            doc = await _db(logref_col.find_one, {"guild_id": str_gid, "protected_message_id": str_pmid})
             if doc:
                 entry = {k: v for k, v in doc.items() if k != "_id"}
-                _logref_by_protected_cache[key] = entry
+                _logref_by_protected_cache.set(key, entry)
                 return dict(entry)
             return None
         except Exception as e:
@@ -706,7 +830,7 @@ async def get_log_reference_by_protected(guild_id: int, protected_message_id: in
         all_refs = _read_json(LOGREF_FILE)
     for entry in all_refs.values():
         if entry.get("guild_id") == str_gid and entry.get("protected_message_id") == str_pmid:
-            _logref_by_protected_cache[key] = entry
+            _logref_by_protected_cache.set(key, entry)
             return dict(entry)
     return None
 
@@ -723,8 +847,9 @@ async def get_guarded_keys(guild_id: int) -> set[str]:
 
     if guardkey_col is not None:
         try:
-            for doc in guardkey_col.find({"guild_id": str_gid}):
-                result.add(doc.get("key", ""))
+            def _fetch():
+                return [d.get("key", "") for d in guardkey_col.find({"guild_id": str_gid})]
+            result = set(await _db(_fetch))
             result.discard("")
             _guarded_keys_cache[str_gid] = set(result)
             return set(result)

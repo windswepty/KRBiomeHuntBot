@@ -430,18 +430,19 @@ class ProtectedLinkView(discord.ui.View):
         # 기록은 응답을 보낸 뒤에 백그라운드로 남깁니다 (클릭 속도에 영향 없음)
         if gated:
             asyncio.create_task(
-                _after_click(guild, member, links[0], code, settings,
-                             message_id=interaction.message.id)
+                _after_click(guild, member, links, code, settings,
+                             message=interaction.message)
             )
 
 
-async def _after_click(guild, member, url: str, code: str, settings: dict,
-                       message_id: int = 0) -> None:
-    """클릭 응답을 보낸 뒤 실행되는 뒷정리 — 기록 저장과 로그 임베드 집계 갱신.
+async def _after_click(guild, member, links: list[str], code: str, settings: dict,
+                       message=None) -> None:
+    """클릭 응답을 보낸 뒤 실행되는 뒷정리 — 기록 저장과 로그 임베드 집계.
 
     수백 명이 동시에 누르는 상황을 고려해, 클릭마다 로그 메시지를 보내지 않습니다.
     대신 **보호 메시지 하나당 로그 임베드 하나**를 두고 사용 인원만 갱신합니다.
     """
+    url = links[0] if links else ""
     try:
         if code:
             await save_watermark(guild.id, code, member.id, member.display_name)
@@ -452,16 +453,33 @@ async def _after_click(guild, member, url: str, code: str, settings: dict,
             detail=f"워터마크 `{code}`" if code else "워터마크 없음"
         )
 
-        if message_id:
-            total, _ = await record_link_usage(guild.id, message_id, member.id, member.display_name)
-            await refresh_usage_log(guild, settings, message_id, total, url)
+        if message is not None:
+            total, _ = await record_link_usage(guild.id, message.id,
+                                               member.id, member.display_name)
+            await ensure_usage_log(guild, settings, message, links, total)
     except Exception as e:
         print(f"[LinkGuard] 클릭 후처리 오류: {e}", flush=True)
 
 
 # 로그 임베드 갱신 빈도 제한 — 보호 메시지별 마지막 갱신 시각(단조 시계)
 _last_log_refresh: dict[int, float] = {}
+# 디바운스 창이 닫힌 뒤 반영할 '마지막 값'
+_pending_total: dict[int, int] = {}
+# 창이 닫히기를 기다리는 트레일링 갱신 태스크 (메시지당 1개)
+_trailing_tasks: dict[int, asyncio.Task] = {}
+# 동시 클릭이 로그 임베드를 중복 생성하지 않도록 하는 메시지별 잠금
+_log_create_locks: dict[int, asyncio.Lock] = {}
 LOG_REFRESH_INTERVAL = 10.0
+
+
+def _cap(d: dict, limit: int) -> None:
+    """메모리 누수 방지 — 한도를 넘으면 오래된 항목부터 버립니다.
+
+    파이썬 dict는 삽입 순서를 유지하므로 앞쪽이 가장 오래된 항목입니다.
+    """
+    if len(d) > limit:
+        for key in list(d)[:len(d) - limit // 2]:
+            d.pop(key, None)
 
 
 async def _resolve_log_ref(guild_id: int, message_id: int) -> int | None:
@@ -487,31 +505,115 @@ async def _resolve_log_ref(guild_id: int, message_id: int) -> int | None:
         return 0
 
 
+async def ensure_usage_log(guild, settings: dict, message,
+                           links: list[str], total: int) -> None:
+    """첫 클릭이면 로그 임베드를 만들고, 이미 있으면 사용 인원만 갱신합니다.
+
+    임베드가 떠도 실제로 누르는 사람은 극소수(측정상 2%)이므로, 보호할 때마다
+    로그를 올리면 로그 채널이 '0명 사용' 알림으로 뒤덮입니다. 그래서 **실제로
+    처음 눌린 순간**에만 로그 임베드를 만듭니다.
+    """
+    if not settings.get("log_channel_id"):
+        return
+
+    mid = message.id
+    ref = _LOG_MESSAGE_BY_PROTECTED.get(mid)
+
+    if ref is None:
+        # 프로세스 메모리에 없음 = 첫 클릭이거나 봇 재시작 직후.
+        # 수십 명이 동시에 누르면 로그 임베드가 그 수만큼 생길 수 있으므로
+        # 메시지별 잠금으로 한 번만 만들어지도록 보장합니다.
+        lock = _log_create_locks.setdefault(mid, asyncio.Lock())
+        _cap(_log_create_locks, 200)
+        async with lock:
+            ref = _LOG_MESSAGE_BY_PROTECTED.get(mid)
+            if ref is None:
+                resolved = await _resolve_log_ref(guild.id, mid)
+                if resolved is None:
+                    return          # 조회 실패 — 다음 클릭에 재시도
+                if resolved:
+                    ref = resolved
+                    _LOG_MESSAGE_BY_PROTECTED[mid] = ref
+                    _cap(_LOG_MESSAGE_BY_PROTECTED, 1000)
+                else:
+                    # 저장소에도 없음 = 아직 아무도 안 누른 링크 → 지금 만듭니다
+                    await post_usage_log(guild, settings, message, links, total)
+                    return
+
+    if not ref:
+        return
+    await refresh_usage_log(guild, settings, mid, total, links[0] if links else "")
+
+
 async def refresh_usage_log(guild, settings: dict, message_id: int,
                             total: int, url: str) -> None:
-    """로그 채널의 해당 임베드에 표시된 '사용 인원'을 갱신합니다.
+    """로그 임베드의 '사용 인원'을 갱신합니다 (10초 디바운스).
 
-    클릭이 몰릴 때 API를 과하게 호출하지 않도록 10초에 한 번으로 제한합니다.
-    (정확한 최신 수치는 [👥 링크 사용 유저] 버튼에서 항상 확인할 수 있습니다)
+    몰릴 때 API를 과하게 호출하지 않도록 10초에 한 번만 실제 수정하되,
+    **마지막 클릭이 반영되지 않고 끝나는 것을 막기 위해** 창이 닫힌 뒤
+    최신 값으로 한 번 더 갱신합니다(트레일링).
+
+    스로틀 검사를 저장소 조회보다 **먼저** 합니다. 순서가 반대면 동시에 누른
+    수십 명이 전부 조회를 한 뒤에야 걸러져 조회가 폭증합니다.
     """
+    # 동시 클릭은 완료 순서가 뒤섞이므로 '마지막에 도착한 값'이 가장 큰 값이라는
+    # 보장이 없습니다. 사용 인원은 단조 증가하므로 최댓값을 유지합니다.
+    # (이렇게 하지 않으면 20명이 눌렀는데 임베드에 13명으로 남는 일이 생깁니다)
+    previous = _pending_total.get(message_id)
+    _pending_total[message_id] = total if previous is None else max(previous, total)
+    _cap(_pending_total, 500)
+
+    now = time.monotonic()
+    last = _last_log_refresh.get(message_id, 0.0)
+    wait = LOG_REFRESH_INTERVAL - (now - last)
+    if wait > 0:
+        _schedule_trailing(guild, settings, message_id, url, wait)
+        return
+
+    _last_log_refresh[message_id] = now
+    _cap(_last_log_refresh, 500)
+    await _apply_usage_refresh(guild, settings, message_id,
+                               _pending_total.pop(message_id, total), url)
+
+
+def _schedule_trailing(guild, settings: dict, message_id: int,
+                       url: str, delay: float) -> None:
+    """디바운스 창이 닫힌 뒤 '마지막 값'으로 한 번 더 갱신하도록 예약합니다."""
+    if message_id in _trailing_tasks:
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(delay)
+            total = _pending_total.pop(message_id, None)
+            if total is None:
+                return
+            _last_log_refresh[message_id] = time.monotonic()
+            await _apply_usage_refresh(guild, settings, message_id, total, url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[LinkGuard] 로그 임베드 지연 갱신 실패: {e}", flush=True)
+        finally:
+            _trailing_tasks.pop(message_id, None)
+
+    _trailing_tasks[message_id] = asyncio.create_task(_runner())
+
+
+async def _apply_usage_refresh(guild, settings: dict, message_id: int,
+                               total: int, url: str) -> None:
+    """실제로 로그 임베드의 '사용 인원' 필드를 수정합니다."""
     ref = _LOG_MESSAGE_BY_PROTECTED.get(message_id)
     if ref is None:
-        # 메모리 캐시 미스 — 봇 재시작 직후 등. 영속 저장소에서 한 번만 복원하고,
-        # 그 결과(있음/없음 모두)를 캐시에 남겨 다음 클릭부터는 다시 조회하지 않습니다.
         resolved = await _resolve_log_ref(guild.id, message_id)
         if resolved is None:
             return  # 조회 실패 — 캐시하지 않고 다음 클릭에 재시도
         ref = resolved
         _LOG_MESSAGE_BY_PROTECTED[message_id] = ref
+        _cap(_LOG_MESSAGE_BY_PROTECTED, 1000)
 
     if not ref:
         return
-
-    now = time.monotonic()
-    last = _last_log_refresh.get(message_id, 0.0)
-    if now - last < LOG_REFRESH_INTERVAL:
-        return
-    _last_log_refresh[message_id] = now
 
     channel_id = settings.get("log_channel_id")
     if not channel_id:
@@ -593,14 +695,21 @@ class UsageStatsView(discord.ui.View):
 
 
 async def post_usage_log(guild: discord.Guild, settings: dict,
-                         original: discord.Message, posted: discord.Message,
-                         links: list[str]) -> None:
-    """보호된 링크 하나당 로그 채널에 집계 임베드 + [링크 사용 유저] 버튼을 올립니다."""
+                         posted: discord.Message, links: list[str],
+                         total: int = 0) -> None:
+    """이 링크가 **처음 사용된 시점**에 로그 채널로 집계 임베드를 올립니다.
+
+    보호할 때가 아니라 첫 클릭 때 만드는 이유: 임베드는 10분마다 새로 뜨지만
+    실제로 눌리는 것은 극소수라, 보호 시점에 올리면 로그 채널이 '0명 사용'
+    알림으로 도배되고 디스코드 API도 그만큼 낭비됩니다.
+    """
     channel_id = settings.get("log_channel_id")
     if not channel_id:
         return
     log_channel = guild.get_channel(int(channel_id))
     if log_channel is None:
+        return
+    if not links:
         return
 
     title = ""
@@ -608,15 +717,16 @@ async def post_usage_log(guild: discord.Guild, settings: dict,
         title = posted.embeds[0].title
 
     embed = discord.Embed(
-        title="🛡️ 새 링크 보호 시작",
-        description=(f"{original.channel.mention} 채널의 웹훅 임베드에서 "
-                     f"링크 **{len(links)}개**를 보호했습니다."),
+        title="🛡️ 링크 사용 시작",
+        description=(f"{posted.channel.mention} 채널의 보호된 임베드에서 "
+                     f"링크 **{len(links)}개** 중 첫 사용이 감지되었습니다."),
         color=discord.Color.green()
     )
     if title:
         embed.add_field(name="📌 임베드", value=title[:200], inline=False)
     embed.add_field(name="🔗 링크", value=describe_roblox_link(links[0]), inline=False)
-    embed.add_field(name="👥 사용 인원", value="**0명**이 이 링크를 사용했습니다.", inline=False)
+    embed.add_field(name="👥 사용 인원",
+                    value=f"**{total}명**이 이 링크를 사용했습니다.", inline=False)
     embed.add_field(
         name="🔍 보호된 메시지",
         value=f"[바로가기]({posted.jump_url})",
@@ -632,6 +742,9 @@ async def post_usage_log(guild: discord.Guild, settings: dict,
         return
 
     _LOG_MESSAGE_BY_PROTECTED[posted.id] = log_msg.id
+    _cap(_LOG_MESSAGE_BY_PROTECTED, 1000)
+    _last_log_refresh[posted.id] = time.monotonic()
+    _cap(_last_log_refresh, 500)
     await save_log_reference(guild.id, log_msg.id, posted.id, posted.channel.id)
 
 
@@ -1689,9 +1802,10 @@ class LinkGuard(commands.Cog):
         # 7. 유출 감시 색인에 등록 (이 링크가 서버 어딘가에 다시 뜨면 잡아냅니다)
         await register_guarded_keys(guild.id, [k for k in (link_key(u) for u in all_links) if k])
 
-        # 8. 로그 채널에 이 링크 전용 집계 임베드를 올립니다.
-        #    클릭할 때마다 메시지를 보내는 대신, 이 임베드 하나에 사용 인원을 누적합니다.
-        await post_usage_log(guild, settings, message, sent, all_links)
+        # 8. 로그 임베드는 여기서 만들지 않습니다.
+        #    임베드는 10분마다 새로 뜨지만 실제로 눌리는 것은 극소수라, 보호할 때마다
+        #    올리면 로그 채널이 '0명 사용' 알림으로 도배됩니다. 대신 **첫 클릭 시점**에
+        #    ensure_usage_log() 가 만들고, 이후로는 그 임베드에 인원을 누적합니다.
 
     async def _detect_leak(self, message: discord.Message) -> None:
         """서버 안에서 보호 링크가 다시 뿌려지는지 감시합니다."""

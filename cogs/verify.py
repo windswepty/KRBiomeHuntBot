@@ -386,6 +386,13 @@ class VerifySettingsSelect(discord.ui.Select):
                 emoji="🎫"
             ),
             discord.SelectOption(
+                label="자격 상실 시 인증 자동 회수",
+                value="autorevoke",
+                description=("현재: ✅ 켜짐" if current.get("auto_revoke")
+                             else "현재: ❌ 꺼짐"),
+                emoji="♻️"
+            ),
+            discord.SelectOption(
                 label="인증 패널 전송",
                 value="panel",
                 description="선택한 채널에 인증 버튼 임베드를 전송합니다.",
@@ -436,6 +443,50 @@ class VerifySettingsSelect(discord.ui.Select):
             embed.set_footer(text="역할 우클릭 → ID 복사 로 ID를 얻을 수 있습니다")
             await interaction.response.send_message(
                 embed=embed, view=RequiredRoleView(required, guild), ephemeral=True)
+
+        elif choice == "autorevoke":
+            required = [int(r) for r in settings.get("required_role_ids", [])]
+            new_state = not settings.get("auto_revoke", False)
+
+            if new_state and not required:
+                embed = discord.Embed(
+                    title="⚠️ 먼저 인증 필요 역할을 지정하세요",
+                    description="필요 역할이 하나도 없으면 '자격 상실'을 판단할 수 없습니다.\n"
+                                "`🎫 인증 필요 역할 관리` 에서 먼저 지정해 주세요.",
+                    color=discord.Color.orange()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            await save_verify_settings(guild.id, {"auto_revoke": new_state})
+            embed = discord.Embed(
+                title="♻️ 인증 자동 회수 설정 변경",
+                description=f"자동 회수가 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.",
+                color=discord.Color.green() if new_state else discord.Color.red()
+            )
+            if new_state:
+                names = " · ".join(
+                    r.mention for r in (guild.get_role(rid) for rid in required) if r)
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value=f"유저가 {names} 를 **전부 잃으면**, 인증 역할을 자동으로 회수합니다.\n"
+                          "역할이 다시 생기면 인증 버튼을 눌러 재인증할 수 있습니다.",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚠️ 주의",
+                    value="• 필요 역할을 잘못 지정하면 **멀쩡한 인증자까지 풀립니다**\n"
+                          "• 봇 역할이 인증 역할보다 **위**에 있어야 회수할 수 있습니다\n"
+                          "• 회수 기록은 링크 보호 로그 채널에 남습니다",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value="필요 역할을 잃어도 인증 역할은 **그대로 유지**됩니다.",
+                    inline=False
+                )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
         elif choice == "toggle":
             new_state = not settings.get("enabled", True)
@@ -660,7 +711,87 @@ class Verify(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+class VerifyRevoke(commands.Cog):
+    """필요 역할을 잃은 유저의 인증 역할을 자동으로 회수합니다."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        # 이 이벤트는 닉네임 변경 등으로도 자주 발생합니다.
+        # 역할이 실제로 바뀐 경우가 아니면 즉시 빠져나갑니다.
+        if before.roles == after.roles:
+            return
+
+        try:
+            settings = await get_verify_settings(after.guild.id)
+            if not settings.get("auto_revoke", False):
+                return
+
+            required = [int(r) for r in settings.get("required_role_ids", [])]
+            role_id = settings.get("role_id")
+            if not required or not role_id:
+                return
+
+            verify_role = after.guild.get_role(int(role_id))
+            if verify_role is None:
+                return
+
+            # 인증 역할이 없으면 회수할 것도 없습니다
+            if not any(r.id == verify_role.id for r in after.roles):
+                return
+            # 필요 역할이 하나라도 남아 있으면 유지합니다
+            if any(r.id in required for r in after.roles):
+                return
+
+            await after.remove_roles(verify_role, reason="인증 필요 역할 상실 (자동 회수)")
+            print(f"[Verify] {after.guild.name}: {after.display_name}"
+                  f"({after.id}) 인증 역할 자동 회수", flush=True)
+
+            lost = [r.name for r in before.roles
+                    if r.id in required and r not in after.roles]
+            embed = discord.Embed(
+                title="♻️ 인증 역할 자동 회수",
+                description=f"{after.mention} 님이 인증 자격을 잃어 "
+                            f"{verify_role.mention} 역할을 회수했습니다.",
+                color=discord.Color.orange()
+            )
+            embed.add_field(name="🙋 대상",
+                            value=f"**{after.display_name}**\n`{after.id}`", inline=True)
+            if lost:
+                embed.add_field(name="📉 잃은 역할",
+                                value=" · ".join(f"`{x}`" for x in lost), inline=True)
+            embed.timestamp = discord.utils.utcnow()
+            await _send_verify_log(after.guild, embed)
+
+        except discord.Forbidden:
+            print(f"[Verify] {after.guild.name}: 인증 역할 회수 실패 "
+                  "(봇 권한 또는 역할 서열 부족)", flush=True)
+        except Exception as e:
+            print(f"[Verify] 자동 회수 처리 오류: {e}", flush=True)
+
+
+async def _send_verify_log(guild, embed) -> None:
+    """링크 보호 로그 채널로 회수 기록을 보냅니다 (미설정이면 조용히 넘어갑니다).
+
+    인증과 링크 보호는 같은 하위 시스템이라 로그 채널을 공유합니다.
+    """
+    try:
+        settings = await get_linkguard_settings(guild.id)
+        channel_id = settings.get("log_channel_id")
+        if not channel_id:
+            return
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            return
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[Verify] 회수 로그 전송 실패: {e}", flush=True)
+
+
 async def setup(bot):
     await bot.add_cog(Verify(bot))
+    await bot.add_cog(VerifyRevoke(bot))
     # 봇 재시작 후에도 인증 버튼이 동작하도록 영구 View 등록
     bot.add_view(VerifyPanelView())

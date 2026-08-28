@@ -7,3 +7,8 @@ services:
     envVars:
       - key: DISCORD_TOKEN
         sync: false
+      # MongoDB 연결 문자열. 비어 있으면 봇이 로컬 JSON 폴백으로 조용히 전환되는데,
+      # Render 파일시스템은 휘발성이라 재배포·재시작마다 전 데이터가 사라집니다.
+      # (봇은 정상 동작하는 것처럼 보이므로 알아채기 어렵습니다)
+      - key: MONGO_URI
+        sync: false

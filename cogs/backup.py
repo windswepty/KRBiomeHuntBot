@@ -4,7 +4,7 @@
 되돌릴 수단을 제공합니다.
 
   · 매일 새벽 5시(KST) 자동 스냅샷 — 최근 30개 보관
-  · /포인트백업 으로 수동 스냅샷 · 목록 · 복원 · 파일 내려받기
+  · /백업설정 으로 수동 스냅샷 · 목록 · 복원 · 파일 내려받기 · 채널 지정
 
 ⚠️ 스냅샷은 같은 MongoDB 클러스터 안에 저장됩니다.
    로직 사고는 막아주지만 **클러스터·계정 사고까지는 막지 못하므로**,
@@ -859,18 +859,18 @@ class PointBackup(commands.Cog):
                 print(f"[Backup] {guild.name}: 따라잡기 백업 중 오류 - {e}", flush=True)
 
     @app_commands.command(
-        name="포인트백업",
-        description="[관리자 전용] 포인트 백업 · 복원 센터를 엽니다."
+        name="백업설정",
+        description="[관리자 전용] 백업 · 복원 · 백업 채널 · 봇 상태 알림을 관리합니다."
     )
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
-    async def point_backup(self, interaction: discord.Interaction):
+    async def backup_settings(self, interaction: discord.Interaction):
         snapshots = await list_point_snapshots(interaction.guild.id, limit=25)
         latest = snapshots[0]["created_kst"] if snapshots else "없음"
 
         embed = discord.Embed(
-            title="💾 포인트 백업 · 복원 센터",
-            description="포인트가 초기화되거나 잘못 변경됐을 때 되돌릴 수 있습니다.",
+            title="💾 백업 · 복원 센터",
+            description="포인트 백업·복원과 전체 백업, 봇 상태 알림을 여기서 관리합니다.",
             color=discord.Color.blurple()
         )
         embed.add_field(name="🗂️ 보관 중인 백업", value=f"**{len(snapshots)}개**", inline=True)
@@ -884,50 +884,6 @@ class PointBackup(commands.Cog):
                 inline=False)
         embed.set_footer(text="매일 새벽 5시 자동 백업 · 최근 30개 보관")
         await interaction.response.send_message(embed=embed, view=BackupView(), ephemeral=True)
-
-
-    @app_commands.command(
-        name="백업채널",
-        description="[관리자 전용] 백업 · 상태 알림 채널을 검색해서 지정합니다."
-    )
-    @app_commands.describe(종류="어떤 용도의 채널인지", 채널="이름을 입력해 검색할 수 있습니다")
-    @app_commands.choices(종류=[
-        app_commands.Choice(name="전체 백업 파일 업로드", value="backup"),
-        app_commands.Choice(name="봇 상태 알림", value="status"),
-    ])
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def backup_channel(self, interaction: discord.Interaction,
-                             종류: app_commands.Choice[str],
-                             채널: discord.TextChannel):
-        """드롭다운 대신 검색으로 채널을 지정합니다."""
-        perms = 채널.permissions_for(interaction.guild.me)
-        missing = []
-        if not perms.send_messages:
-            missing.append("메시지 보내기")
-        if 종류.value == "backup" and not perms.attach_files:
-            missing.append("파일 첨부")
-        if missing:
-            await interaction.response.send_message(
-                f"⚠️ {채널.mention} 에 **{' · '.join(missing)}** 권한이 없습니다.",
-                ephemeral=True)
-            return
-
-        if 종류.value == "backup":
-            await save_backup_channel(interaction.guild.id, 채널.id)
-            note = ("백업 파일에는 **유저 ID · 포인트 · 워터마크**가 들어 있습니다." + NL
-                    + "관리자만 볼 수 있는 채널로 두세요.")
-        else:
-            await save_status_channel(interaction.guild.id, 채널.id)
-            note = ("봇이 켜질 때마다, 그리고 1분마다 상태 임베드가 갱신됩니다." + NL
-                    + "메시지 수정이라 알림은 울리지 않습니다.")
-
-        embed = discord.Embed(
-            title=f"✅ {종류.name} 채널 설정 완료",
-            description=f"{채널.mention} 으로 지정했습니다.",
-            color=discord.Color.green())
-        embed.add_field(name="🔒 참고", value=note, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot):

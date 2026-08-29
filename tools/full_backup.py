@@ -1,6 +1,6 @@
 """전체 백업 · 복원 도구 (설정 · 포인트 · 연동 · 로그 전부).
 
-`/포인트백업` 은 이름 그대로 **포인트만** 다룹니다. 상점 구성 · 인증 설정 ·
+`/백업설정` 의 **스냅샷은 포인트만** 담습니다. 상점 구성 · 인증 설정 ·
 링크 보호 설정 · 로블록스 연동은 들어가지 않아, 설정이 날아가면 손으로 다시
 맞춰야 합니다. 이 도구는 DB 전체를 파일 하나로 뜨고 되돌립니다.
 
@@ -115,7 +115,7 @@ def dump(tag: str = "full") -> str:
 def _latest() -> str:
     """가장 최근 전체 백업. 이름순이 아니라 수정 시각으로 고릅니다.
 
-    `backups/` 에는 `/포인트백업` 이 내려준 포인트 전용 파일(`users-*.json`)도
+    `backups/` 에는 `/백업설정` 이 내려준 포인트 전용 파일(`users-*.json`)도
     섞여 있습니다. 형식이 달라 여기서 읽으면 안 되므로 우리 파일만 봅니다.
     """
     files = [f for pat in ("full_*.json", "pre-restore_*.json")
@@ -137,8 +137,8 @@ def _load(path: str) -> dict:
     if not isinstance(payload, dict) or "data" not in payload:
         hint = ""
         if isinstance(payload, dict) and "documents" in payload:
-            hint = ("\n  이 파일은 `/포인트백업` 이 내려준 **포인트 전용** 백업입니다."
-                    "\n  복원은 디스코드에서 `/포인트백업` -> 복원 으로 하세요.")
+            hint = ("\n  이 파일은 `/백업설정` 의 **포인트 전용** 백업입니다."
+                    "\n  복원은 디스코드에서 `/백업설정` -> 복원 으로 하세요.")
         sys.exit(f"전체 백업 형식이 아닙니다: {path}{hint}")
     return payload
 

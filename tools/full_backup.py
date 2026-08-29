@@ -30,12 +30,13 @@ import datetime
 
 from bson import ObjectId
 from dotenv import load_dotenv
-from pymongo import MongoClient
+from pymongo import MongoClient, ReplaceOne
 
 load_dotenv()
 
 DB_NAME = "krbiomehuntbot"
 BACKUP_DIR = "backups"
+CHUNK = 500        # 한 번에 밀어 넣을 문서 수 (M0 에서 안전한 크기)
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 
@@ -199,14 +200,28 @@ def restore(path: str, only: list[str] | None, wipe: bool, yes: bool) -> None:
     for name in targets:
         docs = [_decode(d) for d in data[name]]
         col = db[name]
+
+        # 봇이 살아 있으면 복원 중에도 문서를 새로 만듭니다. 예전에는
+        # delete_many 뒤에 insert_many 를 했는데, 그 사이에 봇이 끼어들어
+        # _id 가 겹치면 **중간에서 통째로 실패**했습니다(E11000).
+        # 그래서 항상 upsert 로 씁니다. 몇 번을 다시 돌려도 같은 결과가 되고,
+        # 동시에 들어온 쓰기와도 부딪히지 않습니다.
+        for i in range(0, len(docs), CHUNK):
+            part = docs[i:i + CHUNK]
+            if part:
+                col.bulk_write([ReplaceOne({"_id": d["_id"]}, d, upsert=True)
+                                for d in part], ordered=False)
+
+        # --wipe 는 '파일 시점으로 정확히' 를 뜻합니다. 위에서 파일 내용을
+        # 먼저 올린 뒤, 파일에 없는 문서만 지웁니다. 순서를 이렇게 해야
+        # 중간에 실패해도 데이터가 빈 채로 남지 않습니다.
+        removed = 0
         if wipe:
-            col.delete_many({})
-            if docs:
-                col.insert_many(docs)
-        else:
-            for d in docs:
-                col.replace_one({"_id": d["_id"]}, d, upsert=True)
-        print(f"    {name:22} {len(docs):6,}건 복원")
+            keep = [d["_id"] for d in docs]
+            removed = col.delete_many({"_id": {"$nin": keep}}).deleted_count
+
+        extra = f"  (파일에 없는 {removed:,}건 삭제)" if removed else ""
+        print(f"    {name:22} {len(docs):6,}건 복원{extra}")
 
     print("\n  완료. 봇을 재시작해 캐시를 비우세요 (Render: Manual Deploy).")
 

@@ -33,6 +33,29 @@ def parse_role_id(raw_input: str) -> int | None:
     return None
 
 
+def role_mentions(guild: discord.Guild, role_ids, limit: int = 1000) -> str:
+    """역할 ID 목록을 멘션 문자열로 만듭니다. 임베드 필드 상한을 넘지 않게 자릅니다.
+
+    임베드 필드는 1024자가 상한입니다. 역할 멘션 하나가 구분자까지 26자라
+    **39개부터 상한을 넘겨 패널 전송이 통째로 실패**합니다.
+    잘릴 때는 몇 개가 빠졌는지 반드시 밝힙니다 (조용히 자르면 다 보이는 줄 압니다).
+    """
+    parts, used, shown = [], 0, 0
+    resolved = [r for r in (guild.get_role(int(i)) for i in role_ids) if r]
+    for r in resolved:
+        piece = r.mention
+        # 남은 자리에 "…외 NN개" 안내까지 들어갈 여유를 남겨 둡니다
+        if used + len(piece) + 3 > limit - 20:
+            break
+        parts.append(piece)
+        used += len(piece) + 3
+        shown += 1
+    text = " · ".join(parts)
+    if shown < len(resolved):
+        text += f" …외 {len(resolved) - shown}개"
+    return text
+
+
 async def is_verified(guild: discord.Guild, member: discord.Member) -> bool:
     """멤버가 인증 역할을 보유하고 있는지 확인합니다."""
     if member is None:
@@ -60,8 +83,7 @@ def build_panel_embed(settings: dict, guild: discord.Guild) -> discord.Embed:
 
     required = [int(r) for r in settings.get("required_role_ids", [])]
     if required:
-        roles = [guild.get_role(rid) for rid in required]
-        names = " · ".join(r.mention for r in roles if r)
+        names = role_mentions(guild, required)
         if names:
             embed.add_field(
                 name="🎫 인증 자격",
@@ -129,8 +151,7 @@ class VerifyPanelView(discord.ui.View):
         # 비어 있으면 조건 없이 통과합니다(기존 동작).
         required = [int(r) for r in settings.get("required_role_ids", [])]
         if required and not any(r.id in required for r in member.roles):
-            have = [guild.get_role(rid) for rid in required]
-            names = " · ".join(r.mention for r in have if r) or "관리자에게 문의"
+            names = role_mentions(guild, required) or "관리자에게 문의"
             embed = discord.Embed(
                 title="🔒 인증 자격이 없습니다",
                 description="이 서버의 인증은 **아래 역할 중 하나**를 보유한 분만 신청할 수 있습니다.",
@@ -406,16 +427,22 @@ class RequiredRoleIdModal(discord.ui.Modal, title="🆔 인증 필요 역할 추
 class RemoveRequiredRoleSelect(discord.ui.Select):
     def __init__(self, role_ids: list[int], guild: discord.Guild):
         options = []
+        # 드롭다운은 25개가 상한입니다. 넘치면 나머지는 화면에서 해제할 수
+        # 없으므로, 몇 개가 가려졌는지 반드시 알립니다.
+        # (조용히 자르면 목록이 다 보이는 줄 알고 잘못 판단합니다)
+        self.hidden = max(0, len(role_ids) - 25)
         for rid in role_ids[:25]:
             role = guild.get_role(rid)
             options.append(discord.SelectOption(
-                label=(f"@{role.name}" if role else f"(삭제된 역할)")[:100],
+                label=(f"@{role.name}" if role else "(삭제된 역할)")[:100],
                 value=str(rid),
                 description=str(rid)
             ))
         if not options:
             options = [discord.SelectOption(label="지정된 역할이 없습니다", value="none")]
-        super().__init__(placeholder="해제할 역할을 선택하세요...", options=options)
+        placeholder = ("해제할 역할을 선택하세요..." if not self.hidden
+                       else f"해제할 역할 선택 (⚠️ {self.hidden}개는 목록에 없음)")
+        super().__init__(placeholder=placeholder, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "none":
@@ -655,8 +682,7 @@ class VerifySettingsSelect(discord.ui.Select):
                 color=discord.Color.green() if new_state else discord.Color.red()
             )
             if new_state:
-                names = " · ".join(
-                    r.mention for r in (guild.get_role(rid) for rid in required) if r)
+                names = role_mentions(guild, required)
                 embed.add_field(
                     name="🔎 이렇게 동작합니다",
                     value=f"유저가 {names} 를 **전부 잃으면**, 인증 역할을 자동으로 회수합니다.\n"
@@ -916,6 +942,12 @@ class VerifyRevoke(commands.Cog):
 
         try:
             settings = await get_verify_settings(after.guild.id)
+
+            # 전원 검사가 가장 먼저입니다. 정지 상태에서는 '기능이 없는 것과
+            # 같아야' 하는데, 여기서 회수가 계속 돌면 관리자가 껐다고 믿는 동안
+            # 조용히 인증이 풀립니다. (비상 정지의 의미가 사라집니다)
+            if not settings.get("enabled", True):
+                return
             if not settings.get("auto_revoke", False):
                 return
 
@@ -927,6 +959,20 @@ class VerifyRevoke(commands.Cog):
             verify_role = after.guild.get_role(int(role_id))
             if verify_role is None:
                 return
+
+            # 서버에서 삭제된 역할은 판단 근거가 될 수 없습니다.
+            # discord.py 는 역할이 삭제돼도 member.roles 에서 조용히 빼기만 할 뿐
+            # on_member_update 를 쏘지 않습니다. 그래서 삭제 당시에는 아무 일도
+            # 없다가, 그 뒤 **아무 역할 변경에나** 걸려 한 명씩 인증이 풀립니다.
+            # 남아있는 역할이 하나도 없으면 '자격 상실'을 판정할 수 없으므로
+            # 회수하지 않습니다. (설정이 고쳐질 때까지 현상 유지)
+            alive = [rid for rid in required if after.guild.get_role(rid) is not None]
+            if not alive:
+                print(f"[Verify] {after.guild.name}: 필요 역할이 모두 삭제되어 "
+                      "자동 회수를 건너뜁니다 (/인증설정 에서 목록을 정리하세요)",
+                      flush=True)
+                return
+            required = alive
 
             # 인증 역할이 없으면 회수할 것도 없습니다
             if not any(r.id == verify_role.id for r in after.roles):

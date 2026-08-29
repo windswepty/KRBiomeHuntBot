@@ -717,51 +717,5 @@ class Quest(commands.Cog):
             ephemeral=True)
 
 
-    @app_commands.command(
-        name="퀘스트채널",
-        description="[관리자 전용] 퀘스트가 쓸 채널을 검색해서 지정합니다."
-    )
-    @app_commands.describe(종류="어떤 용도의 채널인지", 채널="이름을 입력해 검색할 수 있습니다")
-    @app_commands.choices(종류=[
-        app_commands.Choice(name="지정 채널 퀘스트 (여기서 대화하기)", value="channel_id"),
-        app_commands.Choice(name="공동 목표 진행도 안내", value="goal_channel_id"),
-    ])
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def quest_channel(self, interaction: discord.Interaction,
-                            종류: app_commands.Choice[str],
-                            채널: discord.TextChannel):
-        """드롭다운 대신 검색으로 채널을 지정합니다.
-
-        채널이 많은 서버에서는 드롭다운이 잘려 찾기 어렵습니다.
-        슬래시 명령어의 채널 파라미터는 디스코드가 검색을 붙여줍니다.
-        """
-        field = 종류.value
-        if field == "goal_channel_id" and not 채널.permissions_for(
-                interaction.guild.me).send_messages:
-            await interaction.response.send_message(
-                f"⚠️ {채널.mention} 에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
-            return
-
-        await save_quest_settings(interaction.guild.id, {field: str(채널.id)})
-        embed = discord.Embed(
-            title=f"✅ {종류.name} 설정 완료",
-            description=f"{채널.mention} 으로 지정했습니다.",
-            color=discord.Color.green())
-        if field == "channel_id":
-            embed.add_field(
-                name="💡 참고",
-                value="이 채널에서 대화해야 `지정 채널` 퀘스트가 올라갑니다." + NL
-                      + "바꾸면 원하는 채널로 사람을 모을 수 있습니다.",
-                inline=False)
-        else:
-            embed.add_field(
-                name="💡 참고",
-                value="진행도 임베드 하나가 2분마다 갱신됩니다." + NL
-                      + "메시지 수정이라 알림은 울리지 않습니다.",
-                inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 async def setup(bot):
     await bot.add_cog(Quest(bot))

@@ -44,6 +44,7 @@ blacklist_col = None
 boost_col = None
 snapshot_col = None
 backup_set_col = None
+checkin_set_col = None
 
 if MONGO_URI:
     try:
@@ -61,6 +62,7 @@ if MONGO_URI:
         boost_col = mongo_db["channel_boosts"]
         snapshot_col = mongo_db["point_snapshots"]
         backup_set_col = mongo_db["backup_settings"]
+        checkin_set_col = mongo_db["checkin_settings"]
         from pymongo import ReturnDocument as _ReturnDocument, UpdateOne as _UpdateOne
         _AFTER = _ReturnDocument.AFTER
 
@@ -103,6 +105,7 @@ if MONGO_URI:
         boost_col = None
         snapshot_col = None
         backup_set_col = None
+        checkin_set_col = None
 
 async def _db(fn, *args, **kwargs):
     """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
@@ -185,6 +188,7 @@ async def _ensure_user_doc(guild_id: int, user_id: int) -> dict:
     base.setdefault("points", 0)
     base.setdefault("chat_count", 0)
     base.setdefault("last_checkin", "")
+    base.setdefault("streak", 0)
     if users_col is not None:
         try:
             # 이미 있으면 건드리지 않고, 없을 때만 만듭니다.
@@ -296,33 +300,73 @@ async def _migrate_old_user_if_needed(guild_id: int, user_id: int, data: dict = 
 
     return {"points": 0, "last_checkin": "", "chat_count": 0}, False
 
-async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
+async def checkin_user(guild_id: int, user_id: int) -> dict:
+    """출석 처리. 연속일수를 세고 그에 맞는 보상을 지급합니다.
+
+    반환값:
+        {"ok": bool, "points": 총보유, "streak": 연속일수,
+         "base": int, "bonus": int, "milestone": int, "gained": int}
+    ok=False 면 이미 오늘 출석한 것이며 streak 등은 현재 값입니다.
+
+    ⚠️ 원자성: '오늘 아직 출석 안 함'을 **필터 조건**에 넣어 서버 측에서
+    판정합니다. 연타해도 두 번 지급되지 않습니다. 연속 판정은 어제 날짜를
+    필터에 넣은 시도를 **먼저** 하고, 실패하면 연속이 끊긴 것으로 봅니다.
+
+    보너스는 기본 지급이 성공한 뒤 **두 번째 `$inc`** 로 얹습니다.
+    첫 연산이 이미 last_checkin 을 오늘로 바꿔놓아 동시 요청은 거기서
+    걸리므로, 보너스가 중복 지급될 수 없습니다.
+    """
     str_key = _get_user_key(guild_id, user_id)
-    today = get_today_str()
+    today, yesterday = get_today_str(), get_yesterday_str()
+    settings = await get_checkin_settings(guild_id)
+    base = int(settings.get("base", 100))
+
+    def _result(ok, points, streak):
+        b, bo, ms = streak_reward(streak, settings) if ok else (0, 0, 0)
+        return {"ok": ok, "points": points, "streak": streak,
+                "base": b, "bonus": bo, "milestone": ms, "gained": b + bo + ms}
 
     if users_col is not None:
         try:
-            # '오늘 아직 출석 안 함'을 **필터 조건**에 넣어 서버 측에서 원자적으로
-            # 처리합니다. 버튼/명령을 연타해도 100P가 두 번 지급되지 않습니다.
-            award = {"$inc": {"points": 100},
-                     "$set": {"last_checkin": today,
-                              "guild_id": str(guild_id), "user_id": str(user_id)}}
+            common = {"last_checkin": today, "guild_id": str(guild_id),
+                      "user_id": str(user_id)}
+            # ① 어제 출석했다면 연속 이어가기
             doc = await _db(users_col.find_one_and_update,
-                            {"_id": str_key, "last_checkin": {"$ne": today}},
-                            award, return_document=_AFTER)
-            if doc is not None:
-                return True, doc.get("points", 0)
-
-            # 조건 불일치 = 이미 출석했거나, 문서가 아직 없음(레거시 포함)
-            base = await _ensure_user_doc(guild_id, user_id)
-            if base.get("last_checkin") == today:
-                return False, base.get("points", 0)
-            doc = await _db(users_col.find_one_and_update,
-                            {"_id": str_key, "last_checkin": {"$ne": today}},
-                            award, return_document=_AFTER)
+                            {"_id": str_key, "last_checkin": yesterday},
+                            {"$inc": {"points": base, "streak": 1}, "$set": common},
+                            return_document=_AFTER)
             if doc is None:
-                return False, base.get("points", 0)
-            return True, doc.get("points", 0)
+                # ② 연속이 끊겼거나 첫 출석 — streak 을 1로 초기화
+                doc = await _db(users_col.find_one_and_update,
+                                {"_id": str_key, "last_checkin": {"$ne": today}},
+                                {"$inc": {"points": base},
+                                 "$set": {**common, "streak": 1}},
+                                return_document=_AFTER)
+            if doc is None:
+                # 문서가 아직 없을 수 있습니다(레거시 포함). 만들고 다시 시도합니다.
+                cur = await _ensure_user_doc(guild_id, user_id)
+                if cur.get("last_checkin") == today:
+                    return _result(False, cur.get("points", 0),
+                                   int(cur.get("streak", 0) or 0))
+                doc = await _db(users_col.find_one_and_update,
+                                {"_id": str_key, "last_checkin": {"$ne": today}},
+                                {"$inc": {"points": base},
+                                 "$set": {**common, "streak": 1}},
+                                return_document=_AFTER)
+                if doc is None:
+                    return _result(False, cur.get("points", 0),
+                                   int(cur.get("streak", 0) or 0))
+
+            streak = int(doc.get("streak", 1) or 1)
+            _, bonus, milestone = streak_reward(streak, settings)
+            extra = bonus + milestone
+            if extra > 0:
+                bumped = await _db(users_col.find_one_and_update,
+                                   {"_id": str_key}, {"$inc": {"points": extra}},
+                                   return_document=_AFTER)
+                if bumped is not None:
+                    doc = bumped
+            return _result(True, doc.get("points", 0), streak)
         except Exception as e:
             print(f"MongoDB checkin error: {e}, using local file.", flush=True)
 
@@ -330,13 +374,17 @@ async def checkin_user(guild_id: int, user_id: int) -> tuple[bool, int]:
     data = await load_data()
     user_info, _ = await _migrate_old_user_if_needed(guild_id, user_id, data)
     if user_info.get("last_checkin") == today:
-        return False, user_info.get("points", 0)
+        return _result(False, user_info.get("points", 0),
+                       int(user_info.get("streak", 0) or 0))
 
+    streak = (int(user_info.get("streak", 0) or 0) + 1
+              if user_info.get("last_checkin") == yesterday else 1)
+    _, bonus, milestone = streak_reward(streak, settings)
     user_info["last_checkin"] = today
-    user_info["points"] = user_info.get("points", 0) + 100
+    user_info["streak"] = streak
+    user_info["points"] = user_info.get("points", 0) + base + bonus + milestone
     await save_data(data)
-
-    return True, user_info["points"]
+    return _result(True, user_info["points"], streak)
 
 async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0) -> tuple[int, bool, int, float]:
     """Returns (new_points, awarded, earned_points, boost_mult)"""
@@ -1872,4 +1920,81 @@ async def mark_full_backup(guild_id: int, stamp: str) -> None:
             allset = {}
         allset.setdefault(str(guild_id), {})["last_full_backup_kst"] = stamp
         with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
+            json.dump(allset, f, ensure_ascii=False, indent=2)
+
+
+# ── 연속 출석 ─────────────────────────────────────────────────────────
+#
+# 채팅과 출석만으로는 포인트가 잘 모이지 않아 수급처를 넓히는 작업입니다.
+# 연속으로 나올수록 더 주되, **수치는 전부 설정값**입니다. 운영진이
+# `/출석설정` 으로 직접 조정하므로 코드에 박아두면 안 됩니다.
+
+CHECKIN_SET_FILE = os.path.join(DATA_DIR, "checkin_settings.json")
+_checkin_set_lock = asyncio.Lock()
+
+DEFAULT_CHECKIN_SETTINGS = {
+    "base": 100,          # 기본 지급량 (기존과 동일)
+    "step": 10,           # 연속 하루당 가산
+    "max_bonus": 100,     # 가산 상한 (무한히 벌어지지 않도록)
+    # 특정 연속일수에 한 번만 주는 추가 보상. 키는 문자열(일수).
+    "milestones": {"7": 300, "14": 700, "30": 2000},
+}
+
+
+def get_yesterday_str() -> str:
+    return (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def streak_reward(streak: int, settings: dict) -> tuple[int, int, int]:
+    """연속일수에 대한 보상을 계산합니다.
+
+    반환값은 (기본, 연속가산, 마일스톤) 입니다. 나눠서 돌려주는 이유는
+    유저에게 "왜 이만큼 받았는지"를 그대로 보여주기 위해서입니다.
+    """
+    base = int(settings.get("base", 100))
+    step = int(settings.get("step", 0))
+    cap = int(settings.get("max_bonus", 0))
+    # 첫날(streak=1)은 가산이 없습니다. 이틀째부터 붙습니다.
+    bonus = min(max(streak - 1, 0) * step, cap) if step > 0 else 0
+    milestone = int((settings.get("milestones") or {}).get(str(streak), 0) or 0)
+    return base, bonus, milestone
+
+
+async def get_checkin_settings(guild_id: int) -> dict:
+    merged = dict(DEFAULT_CHECKIN_SETTINGS)
+    if checkin_set_col is not None:
+        try:
+            doc = await _db(checkin_set_col.find_one, {"_id": str(guild_id)})
+            if doc:
+                merged.update({k: v for k, v in doc.items() if k != "_id"})
+            return merged
+        except Exception as e:
+            print(f"MongoDB get_checkin_settings error: {e}, using local file.", flush=True)
+    async with _checkin_set_lock:
+        try:
+            if os.path.exists(CHECKIN_SET_FILE):
+                with open(CHECKIN_SET_FILE, "r", encoding="utf-8") as f:
+                    merged.update(json.load(f).get(str(guild_id), {}))
+        except Exception:
+            pass
+    return merged
+
+
+async def save_checkin_settings(guild_id: int, patch: dict) -> None:
+    if checkin_set_col is not None:
+        try:
+            await _db(checkin_set_col.update_one, {"_id": str(guild_id)},
+                      {"$set": patch}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_checkin_settings error: {e}, using local file.", flush=True)
+    async with _checkin_set_lock:
+        _ensure_data_dir()
+        try:
+            with open(CHECKIN_SET_FILE, "r", encoding="utf-8") as f:
+                allset = json.load(f)
+        except Exception:
+            allset = {}
+        allset.setdefault(str(guild_id), {}).update(patch)
+        with open(CHECKIN_SET_FILE, "w", encoding="utf-8") as f:
             json.dump(allset, f, ensure_ascii=False, indent=2)

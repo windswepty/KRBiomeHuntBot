@@ -1,10 +1,26 @@
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
 from utils.database import (
     checkin_user, get_user_points, get_top_users, get_user_rank,
-    is_user_blacklisted, add_user_points, deduct_user_points, add_activity_log
+    is_user_blacklisted, add_user_points, deduct_user_points, add_activity_log,
+    get_checkin_settings, save_checkin_settings, streak_reward,
 )
+
+def _next_milestone(streak: int, settings: dict) -> tuple[int, int] | None:
+    """지금 연속일수 기준으로 다음에 올 마일스톤. 없으면 None."""
+    ms = settings.get("milestones") or {}
+    upcoming = []
+    for k, v in ms.items():
+        try:
+            day = int(k)
+        except (TypeError, ValueError):
+            continue
+        if day > streak and int(v or 0) > 0:
+            upcoming.append((day, int(v)))
+    return min(upcoming) if upcoming else None
+
 
 class PointGuideSelect(discord.ui.Select):
     def __init__(self):
@@ -66,11 +82,140 @@ class PointGuideView(discord.ui.View):
         self.add_item(PointGuideSelect())
 
 
+class CheckinRewardModal(discord.ui.Modal, title="🔥 연속 출석 보상 설정"):
+    """수치를 코드에 박지 않고 운영진이 직접 조정합니다."""
+
+    base = discord.ui.TextInput(label="기본 지급량 (P)", placeholder="예: 100",
+                                required=True, max_length=6)
+    step = discord.ui.TextInput(label="연속 하루당 가산 (P) · 0이면 사용 안 함",
+                                placeholder="예: 10", required=True, max_length=6)
+    max_bonus = discord.ui.TextInput(label="가산 상한 (P)", placeholder="예: 100",
+                                     required=True, max_length=6)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            base = int(str(self.base.value).strip())
+            step = int(str(self.step.value).strip())
+            cap = int(str(self.max_bonus.value).strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ 숫자만 입력해 주세요.", ephemeral=True)
+            return
+        if base < 0 or step < 0 or cap < 0:
+            await interaction.response.send_message(
+                "⚠️ 0 이상만 입력할 수 있습니다.", ephemeral=True)
+            return
+
+        await save_checkin_settings(interaction.guild.id,
+                                    {"base": base, "step": step, "max_bonus": cap})
+        settings = await get_checkin_settings(interaction.guild.id)
+        embed = discord.Embed(title="🔥 연속 출석 보상 변경 완료",
+                              color=discord.Color.green())
+        embed.add_field(name="기본", value=f"{base:,} P", inline=True)
+        embed.add_field(name="하루당 가산", value=f"+{step:,} P", inline=True)
+        embed.add_field(name="가산 상한", value=f"{cap:,} P", inline=True)
+        embed.add_field(name="📈 이렇게 지급됩니다",
+                        value=_reward_preview(settings), inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class MilestoneModal(discord.ui.Modal, title="🎯 연속 달성 보상 설정"):
+    raw = discord.ui.TextInput(
+        label="연속일수:보상 (쉼표로 구분)",
+        placeholder="예: 7:300, 14:700, 30:2000",
+        style=discord.TextStyle.paragraph, required=False, max_length=300)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = str(self.raw.value or "").strip()
+        milestones = {}
+        if text:
+            for chunk in re.split(r"[,\n]+", text):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                m = re.match(r"^(\d+)\s*[:=]\s*(\d+)$", chunk)
+                if not m:
+                    await interaction.response.send_message(
+                        f"⚠️ `{chunk[:40]}` 형식을 읽을 수 없습니다.\n"
+                        "`일수:보상` 형태로 적어 주세요. 예) `7:300, 30:2000`",
+                        ephemeral=True)
+                    return
+                milestones[str(int(m.group(1)))] = int(m.group(2))
+
+        await save_checkin_settings(interaction.guild.id, {"milestones": milestones})
+        embed = discord.Embed(
+            title="🎯 연속 달성 보상 변경 완료",
+            description=("설정된 목표가 없습니다. (달성 보상 미사용)" if not milestones else
+                         "\n".join(f"• **{d}일** 연속 → **+{v:,} P**"
+                                     for d, v in sorted(milestones.items(), key=lambda x: int(x[0])))),
+            color=discord.Color.green())
+        embed.set_footer(text="달성 보상은 그 날 한 번만 지급됩니다")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def _reward_preview(settings: dict) -> str:
+    """설정값이 실제로 얼마가 되는지 미리 보여줍니다."""
+    rows = []
+    for d in (1, 2, 7, 14, 30):
+        b, bo, ms = streak_reward(d, settings)
+        tag = f"  🎉+{ms:,}" if ms else ""
+        rows.append(f"`{d:2}일차`  {b + bo + ms:,} P  (기본 {b:,} + 가산 {bo:,}){tag}")
+    return "\n".join(rows)
+
+
+class CheckinSettingsSelect(discord.ui.Select):
+    def __init__(self, settings: dict):
+        super().__init__(
+            placeholder="출석 보상 설정을 선택하세요...",
+            options=[
+                discord.SelectOption(
+                    label="연속 출석 보상", value="reward", emoji="🔥",
+                    description=(f"기본 {settings.get('base', 100)} P · "
+                                 f"하루당 +{settings.get('step', 0)} P")[:95]),
+                discord.SelectOption(
+                    label="연속 달성 보상", value="milestone", emoji="🎯",
+                    description=(f"현재 {len(settings.get('milestones') or {})}개 지정됨")[:95]),
+                discord.SelectOption(
+                    label="현재 설정 확인", value="view", emoji="📋",
+                    description="지금 값으로 며칠차에 얼마를 주는지 봅니다."),
+            ])
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "reward":
+            await interaction.response.send_modal(CheckinRewardModal())
+        elif choice == "milestone":
+            await interaction.response.send_modal(MilestoneModal())
+        else:
+            settings = await get_checkin_settings(interaction.guild.id)
+            embed = discord.Embed(title="📋 현재 출석 보상 설정",
+                                  color=discord.Color.blurple())
+            embed.add_field(name="기본", value=f"{settings.get('base', 0):,} P", inline=True)
+            embed.add_field(name="하루당 가산", value=f"+{settings.get('step', 0):,} P", inline=True)
+            embed.add_field(name="가산 상한", value=f"{settings.get('max_bonus', 0):,} P", inline=True)
+            ms = settings.get("milestones") or {}
+            embed.add_field(
+                name="🎯 연속 달성 보상",
+                value=("\n".join(f"• **{d}일** → **+{int(v):,} P**"
+                                   for d, v in sorted(ms.items(), key=lambda x: int(x[0])))
+                       if ms else "없음"),
+                inline=False)
+            embed.add_field(name="📈 실제 지급 예시", value=_reward_preview(settings),
+                            inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CheckinSettingsView(discord.ui.View):
+    def __init__(self, settings: dict):
+        super().__init__(timeout=180)
+        self.add_item(CheckinSettingsSelect(settings))
+
+
 class CheckIn(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="출석", description="하루에 한 번 출석체크를 하고 100포인트를 획득합니다.")
+    @app_commands.command(name="출석", description="하루에 한 번 출석체크를 하고 포인트를 획득합니다. (연속할수록 더 많이)")
     async def check_in(self, interaction: discord.Interaction):
         # 블랙리스트 유저 확인
         if await is_user_blacklisted(interaction.guild.id, interaction.user.id):
@@ -83,20 +228,59 @@ class CheckIn(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        success, total_points = await checkin_user(interaction.guild.id, interaction.user.id)
+        result = await checkin_user(interaction.guild.id, interaction.user.id)
+        total_points = result["points"]
+        streak = result["streak"]
 
-        if success:
+        if result["ok"]:
+            # 어떻게 이 숫자가 나왔는지 그대로 보여줍니다. 연속이 이득이라는
+            # 걸 눈으로 봐야 다음 날 또 오게 됩니다.
+            parts = [f"기본 **{result['base']} P**"]
+            if result["bonus"]:
+                parts.append(f"연속 보너스 **+{result['bonus']} P**")
+            if result["milestone"]:
+                parts.append(f"🎉 {streak}일 달성 **+{result['milestone']} P**")
+
             embed = discord.Embed(
                 title="✅ 출석체크 완료!",
-                description=f"🎉 오늘 출석체크로 **+100 P**를 획득하셨습니다!\n\n💰 **현재 총 보유 포인트**: **{total_points:,}** P",
+                description=f"오늘 출석으로 **+{result['gained']:,} P** 를 획득하셨습니다!",
                 color=discord.Color.green()
             )
+            embed.add_field(name="🔥 연속 출석", value=f"**{streak}일째**", inline=True)
+            embed.add_field(name="💰 보유 포인트",
+                            value=f"**{total_points:,} P**", inline=True)
+            embed.add_field(name="🧮 지급 내역", value="  ·  ".join(parts), inline=False)
+
+            settings = await get_checkin_settings(interaction.guild.id)
+            nxt = _next_milestone(streak, settings)
+            if nxt:
+                days, reward = nxt
+                embed.add_field(
+                    name="🎯 다음 목표",
+                    value=f"**{days}일** 연속까지 **{days - streak}일** 남았습니다 "
+                          f"(보상 **+{reward:,} P**)",
+                    inline=False)
+            embed.set_footer(text="하루라도 거르면 연속이 처음부터 다시 시작됩니다")
+
+            if result["milestone"]:
+                # 마일스톤은 드물고 특별하므로 기록에 남깁니다. 매일 출석까지
+                # 남기면 로그 상한(200)이 금세 찹니다.
+                try:
+                    await add_activity_log(
+                        interaction.guild.id, "checkin", interaction.user.id,
+                        interaction.user.display_name,
+                        f"연속 출석 {streak}일 달성 (+{result['milestone']} P)")
+                except Exception as e:
+                    print(f"[CheckIn] 활동 로그 기록 실패: {e}", flush=True)
         else:
             embed = discord.Embed(
                 title="⚠️ 출석체크 이미 완료됨",
-                description=f"오늘 출석체크는 이미 완료하셨습니다. 내일 다시 시도해 주세요!\n\n💰 **현재 총 보유 포인트**: **{total_points:,}** P",
+                description="오늘 출석체크는 이미 완료하셨습니다. 내일 다시 시도해 주세요!",
                 color=discord.Color.gold()
             )
+            embed.add_field(name="🔥 연속 출석", value=f"**{streak}일째**", inline=True)
+            embed.add_field(name="💰 보유 포인트",
+                            value=f"**{total_points:,} P**", inline=True)
 
         # ephemeral=True makes the response visible ONLY to the user!
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -241,6 +425,25 @@ class CheckIn(commands.Cog):
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="출석설정",
+        description="[관리자 전용] 연속 출석 보상을 설정합니다."
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def checkin_settings(self, interaction: discord.Interaction):
+        settings = await get_checkin_settings(interaction.guild.id)
+        embed = discord.Embed(
+            title="🔥 연속 출석 보상 설정",
+            description="연속으로 출석할수록 더 많이 받도록 조정할 수 있습니다.",
+            color=discord.Color.blurple())
+        embed.add_field(name="📈 지금 설정으로는", value=_reward_preview(settings),
+                        inline=False)
+        embed.set_footer(text="하루라도 거르면 연속은 1일로 초기화됩니다")
+        await interaction.response.send_message(
+            embed=embed, view=CheckinSettingsView(settings), ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(CheckIn(bot))

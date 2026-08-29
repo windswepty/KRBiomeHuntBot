@@ -1744,10 +1744,13 @@ async def record_boot(guild_id: int) -> dict:
 
     if backup_set_col is not None:
         try:
+            # 기동 이력을 최근 8개만 남깁니다. 임베드 하나에 다 보여주면서도
+            # 재시작이 몰렸는지 한눈에 보이는 정도의 길이입니다.
             doc = await _db(backup_set_col.find_one_and_update,
                             {"_id": str(guild_id)},
                             {"$set": {"last_boot_kst": now_s},
-                             "$inc": {"boot_count": 1}},
+                             "$inc": {"boot_count": 1},
+                             "$push": {"boot_history": {"$each": [now_s], "$slice": -8}}},
                             upsert=True)
             previous = (doc or {}).get("last_boot_kst")
         except Exception as e:
@@ -1764,6 +1767,9 @@ async def record_boot(guild_id: int) -> dict:
             previous = row.get("last_boot_kst")
             row["last_boot_kst"] = now_s
             row["boot_count"] = int(row.get("boot_count", 0)) + 1
+            hist = list(row.get("boot_history", []))[-7:]
+            hist.append(now_s)
+            row["boot_history"] = hist
             with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
                 json.dump(allset, f, ensure_ascii=False, indent=2)
 
@@ -1776,3 +1782,78 @@ async def record_boot(guild_id: int) -> dict:
             gap_minutes = None
 
     return {"now_kst": now_s, "previous_kst": previous, "gap_minutes": gap_minutes}
+
+
+async def get_status_state(guild_id: int) -> dict:
+    """상태 임베드에 필요한 값들 (메시지 ID · 기동 이력 · 누적 횟수)."""
+    if backup_set_col is not None:
+        try:
+            doc = await _db(backup_set_col.find_one, {"_id": str(guild_id)}) or {}
+        except Exception as e:
+            print(f"MongoDB get_status_state error: {e}, using local file.", flush=True)
+            doc = {}
+    else:
+        doc = {}
+        async with _backup_set_lock:
+            try:
+                if os.path.exists(BACKUP_SET_FILE):
+                    with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                        doc = json.load(f).get(str(guild_id), {})
+            except Exception:
+                pass
+    mid = doc.get("status_message_id")
+    return {
+        "message_id": int(mid) if mid else None,
+        "boot_history": list(doc.get("boot_history", [])),
+        "boot_count": int(doc.get("boot_count", 0) or 0),
+        "last_boot_kst": doc.get("last_boot_kst"),
+        "last_full_backup_kst": doc.get("last_full_backup_kst"),
+    }
+
+
+async def set_status_message(guild_id: int, message_id: int | None) -> None:
+    """상태 임베드의 메시지 ID를 기억합니다.
+
+    링크 보호가 쓰는 방식과 같습니다 — custom_id 에 값을 넣지 않고,
+    **메시지 ID를 키로 DB를 찾습니다.** 봇이 재시작해도 같은 메시지를
+    계속 수정할 수 있어야 채널이 알림으로 도배되지 않습니다.
+    """
+    value = str(message_id) if message_id else None
+    if backup_set_col is not None:
+        try:
+            await _db(backup_set_col.update_one, {"_id": str(guild_id)},
+                      {"$set": {"status_message_id": value}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB set_status_message error: {e}, using local file.", flush=True)
+    async with _backup_set_lock:
+        _ensure_data_dir()
+        try:
+            with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                allset = json.load(f)
+        except Exception:
+            allset = {}
+        allset.setdefault(str(guild_id), {})["status_message_id"] = value
+        with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
+            json.dump(allset, f, ensure_ascii=False, indent=2)
+
+
+async def mark_full_backup(guild_id: int, stamp: str) -> None:
+    """마지막 전체 백업 시각을 기록합니다 (상태 임베드에 표시)."""
+    if backup_set_col is not None:
+        try:
+            await _db(backup_set_col.update_one, {"_id": str(guild_id)},
+                      {"$set": {"last_full_backup_kst": stamp}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB mark_full_backup error: {e}, using local file.", flush=True)
+    async with _backup_set_lock:
+        _ensure_data_dir()
+        try:
+            with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                allset = json.load(f)
+        except Exception:
+            allset = {}
+        allset.setdefault(str(guild_id), {})["last_full_backup_kst"] = stamp
+        with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
+            json.dump(allset, f, ensure_ascii=False, indent=2)

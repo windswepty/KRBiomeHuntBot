@@ -26,6 +26,7 @@ from utils.database import (
     export_full_payload, full_backup_bytes,
     get_backup_channel, save_backup_channel,
     get_status_channel, save_status_channel, record_boot,
+    get_status_state, set_status_message, mark_full_backup,
 )
 from utils import health
 
@@ -202,71 +203,109 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
     embed.timestamp = discord.utils.utcnow()
 
     await channel.send(embed=embed, file=discord.File(io.BytesIO(data), filename=filename))
+    await mark_full_backup(guild.id, meta.get("created_kst", ""))
     return True, filename
 
 
 # 재시작이 이 간격보다 짧으면 '루프'로 보고 경고합니다.
 # 정상 운영에서는 재배포할 때만 재시작되므로 여기 걸리지 않습니다.
 RESTART_LOOP_MINUTES = 15
+# 상태 임베드를 몇 분마다 새로 고칠지. 메시지 수정은 채널을 올리지 않으므로
+# 알림이 울리지 않습니다. 짧게 잡아도 유저에게 방해가 되지 않습니다.
+STATUS_REFRESH_MINUTES = 10
 
 
-async def announce_boot(bot, guild) -> bool:
-    """기동 결과를 상태 채널에 남깁니다.
+def _ago(stamp: str | None) -> str:
+    """KST 문자열을 '몇 분 전' 형태로. 못 읽으면 원문 그대로."""
+    if not stamp:
+        return "기록 없음"
+    try:
+        dt = datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+    except (ValueError, TypeError):
+        return f"`{stamp}`"
+    mins = (datetime.datetime.now(KST) - dt).total_seconds() / 60
+    if mins < 1:
+        return f"`{stamp}` (방금)"
+    if mins < 60:
+        return f"`{stamp}` ({mins:.0f}분 전)"
+    if mins < 1440:
+        return f"`{stamp}` ({mins/60:.1f}시간 전)"
+    return f"`{stamp}` ({mins/1440:.1f}일 전)"
 
-    UptimeRobot 은 밖에서 응답 여부만 봅니다. 포인트가 임시 저장소에
-    쌓이는 중인지, 기능 일부가 로드에 실패했는지, 재시작을 반복하는지는
-    **밖에서 알 수 없습니다.** 그래서 봇이 직접 남깁니다.
 
-    나중에 채널만 훑어도 그동안 무슨 일이 있었는지 파악되는 것이 목적입니다.
+def _uptime(seconds: int) -> str:
+    d, r = divmod(int(seconds), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d:
+        return f"{d}일 {h}시간"
+    if h:
+        return f"{h}시간 {m}분"
+    return f"{m}분"
+
+
+async def build_status_embed(bot, guild) -> discord.Embed:
+    """지금 상태를 하나의 임베드로 만듭니다.
+
+    매번 새 메시지를 보내면 채널이 도배되고, 정작 중요한 신호가 묻힙니다.
+    그래서 **메시지 하나를 계속 수정**합니다. 대신 재시작 이력을 임베드 안에
+    남겨, 도배 없이도 '재시작이 몰렸는지'를 볼 수 있게 합니다.
     """
-    channel_id = await get_status_channel(guild.id)
-    if not channel_id:
-        return False
-    channel = guild.get_channel(int(channel_id))
-    if channel is None:
-        return False
-    perms = channel.permissions_for(guild.me)
-    if not perms.send_messages:
-        return False
-
-    boot = await record_boot(guild.id)
     st = health.snapshot()
+    state = await get_status_state(guild.id)
+
     storage_ok = st.get("storage") == "mongo"
     notes = st.get("notes") or []
-    looping = (boot["gap_minutes"] is not None
-               and boot["gap_minutes"] < RESTART_LOOP_MINUTES)
+
+    history = state["boot_history"] or ([state["last_boot_kst"]]
+                                        if state["last_boot_kst"] else [])
+    looping = False
+    if len(history) >= 2:
+        try:
+            a = datetime.datetime.strptime(history[-1], "%Y-%m-%d %H:%M:%S")
+            b = datetime.datetime.strptime(history[-2], "%Y-%m-%d %H:%M:%S")
+            looping = (a - b).total_seconds() / 60 < RESTART_LOOP_MINUTES
+        except (ValueError, TypeError):
+            looping = False
 
     problem = (not storage_ok) or notes or looping
-    embed = discord.Embed(
-        title="🔴 봇 시작됨 (확인 필요)" if problem else "🔄 봇 시작됨",
-        color=discord.Color.red() if problem else discord.Color.green(),
-    )
+    connected = st.get("connected")
+
+    if problem:
+        title, color = "🔴 봇 상태 — 확인이 필요합니다", discord.Color.red()
+    elif not connected:
+        title, color = "🟡 봇 상태 — 재연결 중", discord.Color.orange()
+    else:
+        title, color = "🟢 봇 상태 — 정상", discord.Color.green()
+
+    embed = discord.Embed(title=title, color=color)
     embed.add_field(
         name="💽 포인트 저장",
-        value=("✅ MongoDB (영구 보존)" if storage_ok
-               else f"🚨 **{st.get('storage')}** — 재시작하면 사라집니다"),
+        value=("✅ MongoDB" if storage_ok
+               else f"🚨 **{st.get('storage')}**\n재시작하면 사라집니다"),
         inline=True)
-    embed.add_field(name="⚙️ 기능",
-                    value=f"{len(bot.cogs)}개 로드", inline=True)
-    embed.add_field(name="📡 서버",
-                    value=f"{len(bot.guilds)}개 연결", inline=True)
+    embed.add_field(name="⏱️ 연속 가동",
+                    value=_uptime(st.get("uptime_seconds", 0)), inline=True)
+    embed.add_field(
+        name="📶 응답 속도",
+        value=(f"{st['latency_ms']:.0f} ms" if st.get("latency_ms") else "측정 전"),
+        inline=True)
+    embed.add_field(name="⚙️ 기능", value=f"{len(bot.cogs)}개", inline=True)
+    embed.add_field(name="🔌 연결", value=("✅ 정상" if connected else "🔄 재연결 중"),
+                    inline=True)
+    embed.add_field(name="🔁 누적 재시작", value=f"{state['boot_count']}회", inline=True)
 
-    if boot["previous_kst"]:
-        gap = boot["gap_minutes"]
-        if gap is None:
-            when = f"`{boot['previous_kst']}`"
-        elif gap < 60:
-            when = f"`{boot['previous_kst']}` ({gap:.0f}분 전)"
-        elif gap < 1440:
-            when = f"`{boot['previous_kst']}` ({gap/60:.1f}시간 전)"
-        else:
-            when = f"`{boot['previous_kst']}` ({gap/1440:.1f}일 전)"
-        embed.add_field(name="🕒 직전 기동", value=when, inline=False)
+    embed.add_field(name="💾 마지막 전체 백업",
+                    value=_ago(state["last_full_backup_kst"]), inline=False)
+
+    if history:
+        lines = [f"• {_ago(h)}" for h in reversed(history[-5:])]
+        embed.add_field(name="🕒 최근 기동", value="\n".join(lines), inline=False)
 
     if looping:
         embed.add_field(
             name="🚨 재시작이 잦습니다",
-            value=f"직전 기동으로부터 **{boot['gap_minutes']:.0f}분** 만에 다시 켜졌습니다.\n"
+            value=f"직전 기동과 **{RESTART_LOOP_MINUTES}분** 이내 간격입니다.\n"
                   "재배포 중이 아니라면 **재시작 루프**일 수 있습니다.\n"
                   "-# Render 로그에서 종료 원인을 확인해 주세요.",
             inline=False)
@@ -280,76 +319,50 @@ async def announce_boot(bot, guild) -> bool:
         embed.add_field(name="⚠️ 기동 중 발견된 문제",
                         value="\n".join(f"• {n}" for n in notes), inline=False)
 
-    if not problem:
-        embed.set_footer(text="정상 기동 · 이 알림은 봇이 켜질 때마다 남습니다")
-    await channel.send(embed=embed)
+    embed.set_footer(text=f"{STATUS_REFRESH_MINUTES}분마다 이 메시지가 갱신됩니다")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+async def upsert_status_message(bot, guild) -> bool:
+    """상태 임베드를 갱신합니다. 없으면 새로 만들고 ID를 기억합니다.
+
+    메시지 ID를 DB에 두고 계속 **수정**하므로 채널에 알림이 울리지 않습니다.
+    누가 지웠거나 봇이 못 찾으면 그때만 새로 만듭니다.
+    """
+    channel_id = await get_status_channel(guild.id)
+    if not channel_id:
+        return False
+    channel = guild.get_channel(int(channel_id))
+    if channel is None:
+        return False
+    perms = channel.permissions_for(guild.me)
+    if not perms.send_messages:
+        return False
+
+    embed = await build_status_embed(bot, guild)
+    state = await get_status_state(guild.id)
+
+    if state["message_id"]:
+        try:
+            msg = await channel.fetch_message(state["message_id"])
+            await msg.edit(embed=embed)
+            return True
+        except discord.NotFound:
+            pass          # 지워졌으니 아래에서 새로 만듭니다
+        except discord.Forbidden:
+            return False
+        except discord.HTTPException as e:
+            print(f"[Status] 임베드 수정 실패: {e}", flush=True)
+            return False
+
+    try:
+        msg = await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"[Status] 임베드 생성 실패: {e}", flush=True)
+        return False
+    await set_status_message(guild.id, msg.id)
     return True
-
-
-class BackupChannelSelect(discord.ui.ChannelSelect):
-    """전체 백업을 올릴 채널을 고릅니다."""
-
-    def __init__(self):
-        super().__init__(
-            placeholder="전체 백업을 올릴 채널을 고르세요...",
-            channel_types=[discord.ChannelType.text],
-            min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        channel = guild.get_channel(self.values[0].id)
-        if channel is None:
-            await interaction.response.send_message(
-                "⚠️ 채널을 찾을 수 없습니다.", ephemeral=True)
-            return
-
-        perms = channel.permissions_for(guild.me)
-        missing = []
-        if not perms.send_messages:
-            missing.append("메시지 보내기")
-        if not perms.attach_files:
-            missing.append("파일 첨부")
-        if missing:
-            await interaction.response.send_message(
-                f"⚠️ {channel.mention} 에 **{' · '.join(missing)}** 권한이 없습니다.\n"
-                "봇에게 권한을 주고 다시 지정해 주세요.", ephemeral=True)
-            return
-
-        await save_backup_channel(guild.id, channel.id)
-        embed = discord.Embed(
-            title="📡 전체 백업 채널 설정 완료",
-            description=f"매일 새벽 5시에 {channel.mention} 로 전체 백업을 올립니다.",
-            color=discord.Color.green())
-        embed.add_field(
-            name="🔒 이 채널은 반드시 비공개로",
-            value="백업 파일에는 **유저 ID · 포인트 · 워터마크**가 들어 있습니다.\n"
-                  "관리자만 볼 수 있는 채널로 두세요.",
-            inline=False)
-        embed.add_field(
-            name="💡 왜 채널에 올리나요",
-            value="DB 안의 백업은 **클러스터·계정 사고 때 같이 사라집니다**.\n"
-                  "PC에만 두면 PC 고장 때 사라집니다.\n"
-                  "디스코드에 있으면 **양쪽 어디에 사고가 나도** 남습니다.",
-            inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class BackupChannelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(BackupChannelSelect())
-
-    @discord.ui.button(label="설정 해제", style=discord.ButtonStyle.secondary,
-                       emoji="🚫", row=1)
-    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await save_backup_channel(interaction.guild.id, None)
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="🚫 전체 백업 채널 해제",
-                description="자동 업로드를 중단했습니다. "
-                            "DB 안의 포인트 스냅샷은 계속 동작합니다.",
-                color=discord.Color.orange()),
-            ephemeral=True)
 
 
 class StatusChannelSelect(discord.ui.ChannelSelect):
@@ -610,14 +623,34 @@ class PointBackup(commands.Cog):
         self._announced = True
         for guild in self.bot.guilds:
             try:
-                await announce_boot(self.bot, guild)
+                await record_boot(guild.id)       # 기동 이력에 한 줄 남깁니다
+                await upsert_status_message(self.bot, guild)
             except Exception as e:
-                # 알림 실패가 봇 기동을 막으면 안 됩니다
-                print(f"[Backup] {guild.name}: 기동 알림 실패 - "
+                # 상태 표시 실패가 봇 기동을 막으면 안 됩니다
+                print(f"[Status] {guild.name}: 기동 기록 실패 - "
+                      f"{type(e).__name__}: {e}", flush=True)
+        if not self.status_refresh.is_running():
+            self.status_refresh.start()
+
+    @tasks.loop(minutes=STATUS_REFRESH_MINUTES)
+    async def status_refresh(self):
+        """상태 임베드를 주기적으로 새로 고칩니다.
+
+        메시지 **수정**이라 채널이 올라가지 않고 알림도 울리지 않습니다.
+        가동 시간·응답 속도가 계속 갱신되므로, 마지막 갱신 시각만 봐도
+        봇이 살아 있는지 알 수 있습니다.
+        """
+        await self.bot.wait_until_ready()
+        for guild in self.bot.guilds:
+            try:
+                await upsert_status_message(self.bot, guild)
+            except Exception as e:
+                print(f"[Status] {guild.name}: 상태 갱신 실패 - "
                       f"{type(e).__name__}: {e}", flush=True)
 
     def cog_unload(self):
         self.daily_snapshot.cancel()
+        self.status_refresh.cancel()
 
     async def _snapshot_age_hours(self, guild_id: int) -> float | None:
         """마지막 백업이 몇 시간 전인지. 백업이 없거나 시각을 못 읽으면 None."""

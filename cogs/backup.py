@@ -212,6 +212,8 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
 # 정상 운영에서는 재배포할 때만 재시작되므로 여기 걸리지 않습니다.
 # 이 시간 창 안에서 이만큼 켜지면 '재시작 루프'로 봅니다.
 # 재배포는 보통 한두 번이라 걸리지 않고, 진짜 루프는 훨씬 잦습니다.
+NL = chr(10)
+
 RESTART_LOOP_WINDOW_MINUTES = 60
 RESTART_LOOP_COUNT = 3
 # 상태 임베드를 몇 초마다 새로 고칠지.
@@ -882,6 +884,50 @@ class PointBackup(commands.Cog):
                 inline=False)
         embed.set_footer(text="매일 새벽 5시 자동 백업 · 최근 30개 보관")
         await interaction.response.send_message(embed=embed, view=BackupView(), ephemeral=True)
+
+
+    @app_commands.command(
+        name="백업채널",
+        description="[관리자 전용] 백업 · 상태 알림 채널을 검색해서 지정합니다."
+    )
+    @app_commands.describe(종류="어떤 용도의 채널인지", 채널="이름을 입력해 검색할 수 있습니다")
+    @app_commands.choices(종류=[
+        app_commands.Choice(name="전체 백업 파일 업로드", value="backup"),
+        app_commands.Choice(name="봇 상태 알림", value="status"),
+    ])
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def backup_channel(self, interaction: discord.Interaction,
+                             종류: app_commands.Choice[str],
+                             채널: discord.TextChannel):
+        """드롭다운 대신 검색으로 채널을 지정합니다."""
+        perms = 채널.permissions_for(interaction.guild.me)
+        missing = []
+        if not perms.send_messages:
+            missing.append("메시지 보내기")
+        if 종류.value == "backup" and not perms.attach_files:
+            missing.append("파일 첨부")
+        if missing:
+            await interaction.response.send_message(
+                f"⚠️ {채널.mention} 에 **{' · '.join(missing)}** 권한이 없습니다.",
+                ephemeral=True)
+            return
+
+        if 종류.value == "backup":
+            await save_backup_channel(interaction.guild.id, 채널.id)
+            note = ("백업 파일에는 **유저 ID · 포인트 · 워터마크**가 들어 있습니다." + NL
+                    + "관리자만 볼 수 있는 채널로 두세요.")
+        else:
+            await save_status_channel(interaction.guild.id, 채널.id)
+            note = ("봇이 켜질 때마다, 그리고 1분마다 상태 임베드가 갱신됩니다." + NL
+                    + "메시지 수정이라 알림은 울리지 않습니다.")
+
+        embed = discord.Embed(
+            title=f"✅ {종류.name} 채널 설정 완료",
+            description=f"{채널.mention} 으로 지정했습니다.",
+            color=discord.Color.green())
+        embed.add_field(name="🔒 참고", value=note, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot):

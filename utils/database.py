@@ -2084,13 +2084,13 @@ _quest_lock = asyncio.Lock()
 QUEST_KINDS = {
     "chat":        {"label": "채팅 {n}회 보내기",           "unit": "회", "period": "daily"},
     "checkin":     {"label": "출석하기",                    "unit": "회", "period": "daily"},
-    "channel_chat":{"label": "지정 채널에서 {n}회 대화하기", "unit": "회", "period": "daily"},
+    "channel_chat":{"label": "{ch} 에서 {n}회 대화하기", "unit": "회", "period": "daily"},
     "gacha":       {"label": "뽑기 {n}회 돌리기",           "unit": "회", "period": "daily"},
     "early_bird":  {"label": "출석 선착순 {n}등 안에 들기",  "unit": "등", "period": "daily"},
     "week_checkin":{"label": "이번 주 {n}일 출석하기",       "unit": "일", "period": "weekly"},
     "week_chat":   {"label": "이번 주 채팅 {n}회 보내기",    "unit": "회", "period": "weekly"},
     "week_gacha":  {"label": "이번 주 뽑기 {n}회 돌리기",    "unit": "회", "period": "weekly"},
-    "week_channel":{"label": "이번 주 지정 채널에서 {n}회 대화", "unit": "회", "period": "weekly"},
+    "week_channel":{"label": "이번 주 {ch} 에서 {n}회 대화", "unit": "회", "period": "weekly"},
 }
 
 DEFAULT_QUEST_SETTINGS = {
@@ -2099,7 +2099,10 @@ DEFAULT_QUEST_SETTINGS = {
     "weekly_count": 2,         # 주마다 몇 개를 뽑을지
     "daily_reward": 150,       # 일일 퀘스트 1개당 보상
     "weekly_reward": 800,      # 주간 퀘스트 1개당 보상
-    "channel_id": None,        # channel_chat 대상 채널
+    # 랜덤 채널 퀘스트 후보. 유저마다 이 중 하나가 무작위로 배정됩니다.
+    # 하나만 넣으면 모두 같은 채널을 받습니다(예전 동작).
+    "channel_ids": [],
+    "channel_id": None,        # (구버전) 단일 채널 — channel_ids 가 비면 이걸 씁니다
     # 종류별 목표치. 슬로우모드 5초 기준으로 잡은 기본값입니다.
     "goals": {"chat": 20, "channel_chat": 10, "gacha": 2, "early_bird": 20,
               "week_checkin": 5, "week_chat": 150, "week_gacha": 10,
@@ -2325,8 +2328,21 @@ async def claim_quest(guild_id: int, user_id: int, quest_id: str,
     return True
 
 
-def _pick_quests(seed: str, pool: list[str], count: int,
-                 goals: dict, prefix: str) -> list[dict]:
+def quest_channels(settings: dict) -> list[str]:
+    """랜덤 채널 퀘스트의 후보 목록.
+
+    구버전은 `channel_id` 하나만 저장했습니다. 목록이 비어 있으면 그걸
+    한 개짜리 목록으로 취급해, 설정을 다시 하지 않아도 그대로 동작합니다.
+    """
+    ids = [str(c) for c in (settings.get("channel_ids") or []) if c]
+    if ids:
+        return ids
+    single = settings.get("channel_id")
+    return [str(single)] if single else []
+
+
+def _pick_quests(seed: str, pool: list[str], count: int, goals: dict,
+                 prefix: str, channels: list[str] | None = None) -> list[dict]:
     """씨앗으로 퀘스트를 고릅니다.
 
     **저장하지 않습니다.** 같은 씨앗이면 언제 불러도 같은 결과가 나오므로,
@@ -2338,22 +2354,30 @@ def _pick_quests(seed: str, pool: list[str], count: int,
     import random as _random
     rng = _random.Random(seed)
     picked = rng.sample(pool, min(count, len(pool)))
-    return [{"id": f"{prefix}:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
-            for k in picked]
+
+    out = []
+    for k in picked:
+        q = {"id": f"{prefix}:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
+        if k in ("channel_chat", "week_channel") and channels:
+            # 채널도 같은 씨앗으로 고릅니다. 사람마다 다른 채널을 받되,
+            # 같은 사람은 그 기간 동안 같은 채널을 봅니다.
+            q["channel"] = rng.choice(channels)
+        out.append(q)
+    return out
 
 
 def _daily_pool(settings: dict) -> list[str]:
     pool = [k for k, v in QUEST_KINDS.items()
             if v["period"] == "daily" and k not in (settings.get("disabled_kinds") or [])]
-    if "channel_chat" in pool and not settings.get("channel_id"):
-        pool.remove("channel_chat")     # 대상 채널이 없으면 낼 수 없습니다
+    if "channel_chat" in pool and not quest_channels(settings):
+        pool.remove("channel_chat")     # 후보 채널이 없으면 낼 수 없습니다
     return pool
 
 
 def _weekly_pool(settings: dict) -> list[str]:
     pool = [k for k, v in QUEST_KINDS.items()
             if v["period"] == "weekly" and k not in (settings.get("disabled_kinds") or [])]
-    if "week_channel" in pool and not settings.get("channel_id"):
+    if "week_channel" in pool and not quest_channels(settings):
         pool.remove("week_channel")
     return pool
 
@@ -2373,7 +2397,8 @@ async def get_daily_quests(guild_id: int, settings: dict | None = None,
             else f"{guild_id}:{quest_day()}")
     return _pick_quests(seed, _daily_pool(settings),
                         int(settings.get("daily_count", 3) or 3),
-                        settings.get("goals", {}), "d")
+                        settings.get("goals", {}), "d",
+                        quest_channels(settings))
 
 
 def weekly_quests(settings: dict, guild_id: int | None = None,
@@ -2386,16 +2411,30 @@ def weekly_quests(settings: dict, guild_id: int | None = None,
             else f"{guild_id}:{quest_week()}")
     return _pick_quests(seed, _weekly_pool(settings),
                         int(settings.get("weekly_count", 2) or 2),
-                        settings.get("goals", {}), "w")
+                        settings.get("goals", {}), "w",
+                        quest_channels(settings))
 
 
-def quest_progress_value(kind: str, progress: dict) -> int:
+def channel_field(channel_id, weekly: bool = False) -> str:
+    """채널별 진행도 필드 이름.
+
+    사람마다 배정된 채널이 다르므로 카운터도 채널별로 나뉘어야 합니다.
+    점(`.`)을 쓰면 Mongo 는 중첩 문서를 만들고 JSON 폴백은 납작한 키를
+    만들어 서로 어긋나므로, 밑줄로 납작하게 유지합니다.
+    """
+    return f"{'wch' if weekly else 'ch'}_{channel_id}"
+
+
+def quest_progress_value(kind: str, progress: dict, quest: dict | None = None) -> int:
     """종류별로 어느 카운터를 보는지."""
     p = progress.get("p", {}) or {}
     if kind == "chat":
         return int(p.get("chat", 0) or 0)
     if kind == "channel_chat":
-        return int(p.get("channel_chat", 0) or 0)
+        ch = (quest or {}).get("channel")
+        if ch:
+            return int(p.get(channel_field(ch), 0) or 0)
+        return int(p.get("channel_chat", 0) or 0)   # 구버전 데이터
     if kind == "gacha":
         return int(p.get("gacha", 0) or 0)
     if kind == "checkin":
@@ -2410,7 +2449,10 @@ def quest_progress_value(kind: str, progress: dict) -> int:
     if kind == "week_gacha":
         return int(p.get("wgacha", 0) or 0)
     if kind == "week_channel":
-        return int(p.get("wchannel", 0) or 0)
+        ch = (quest or {}).get("channel")
+        if ch:
+            return int(p.get(channel_field(ch, weekly=True), 0) or 0)
+        return int(p.get("wchannel", 0) or 0)       # 구버전 데이터
     return 0
 
 
@@ -2420,9 +2462,14 @@ def quest_done(kind: str, value: int, goal: int) -> bool:
     return value >= goal
 
 
-def quest_label(kind: str, goal: int) -> str:
+def quest_label(kind: str, goal: int, channel_text: str = "") -> str:
+    """퀘스트 문구. 채널형이면 어느 채널인지 함께 보여줍니다.
+
+    '지정 채널' 이라고만 하면 어디인지 알 수 없어 퀘스트를 깰 수가 없습니다.
+    """
     tpl = QUEST_KINDS.get(kind, {}).get("label", kind)
-    return tpl.replace("{n}", f"{goal:,}")
+    return (tpl.replace("{n}", f"{goal:,}")
+               .replace("{ch}", channel_text or "**지정 채널**"))
 
 
 async def take_checkin_rank(guild_id: int) -> int:

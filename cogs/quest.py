@@ -21,6 +21,7 @@ from utils.database import (
     get_daily_quests, weekly_quests, get_quest_progress,
     quest_progress_value, quest_done, quest_label, claim_quest,
     get_server_goal, mark_server_goal, add_activity_log,
+    quest_channels,
     QUEST_KINDS,
 )
 
@@ -31,6 +32,15 @@ GOAL_REFRESH_SECONDS = 120
 NL = chr(10)
 
 
+def _channel_text(guild, quest: dict) -> str:
+    """퀘스트에 배정된 채널의 표시 문구."""
+    cid = quest.get("channel")
+    if not cid or guild is None:
+        return ""
+    ch = guild.get_channel(int(cid))
+    return ch.mention if ch else f"`#{cid}`"
+
+
 def _bar(value: int, goal: int, width: int = 12) -> str:
     """진행도 막대. 숫자만 있으면 얼마나 남았는지 감이 안 옵니다."""
     if goal <= 0:
@@ -39,14 +49,19 @@ def _bar(value: int, goal: int, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _line(quest: dict, progress: dict) -> tuple[str, bool, bool]:
+def _line(quest: dict, progress: dict, guild=None) -> tuple[str, bool, bool]:
     """퀘스트 한 줄. (문구, 달성여부, 수령여부)"""
     kind, goal = quest["kind"], quest["goal"]
-    value = quest_progress_value(kind, progress)
+    value = quest_progress_value(kind, progress, quest)
     done = quest_done(kind, value, goal)
     claimed = quest["id"] in (progress.get("claimed") or [])
 
-    label = quest_label(kind, goal)
+    # 채널형 퀘스트는 어디인지 보여줘야 깰 수 있습니다.
+    ch_text = ""
+    if quest.get("channel") and guild is not None:
+        ch = guild.get_channel(int(quest["channel"]))
+        ch_text = ch.mention if ch else f"`#{quest['channel']}`"
+    label = quest_label(kind, goal, ch_text)
     if kind == "early_bird":
         shown = f"{value}등" if value else "미출석"
         detail = f"`{shown}`"
@@ -99,7 +114,8 @@ class QuestView(discord.ui.View):
                                  quest["id"], reward, weekly=weekly):
                 total += reward
                 names.append("🤝 서버 공동 목표" if quest["kind"] == "server_goal"
-                             else quest_label(quest["kind"], quest["goal"]))
+                             else quest_label(quest["kind"], quest["goal"],
+                                              _channel_text(interaction.guild, quest)))
 
         if not names:
             await interaction.followup.send(
@@ -283,15 +299,48 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
         await refresh_panel(interaction, embed)
 
 
-class QuestChannelSelect(discord.ui.ChannelSelect):
-    """지정 채널 퀘스트와 공동 목표 안내가 쓸 채널."""
+class RandomChannelSelect(discord.ui.ChannelSelect):
+    """랜덤 채널 퀘스트의 후보 목록. **여러 개를 한 번에** 고릅니다.
 
-    def __init__(self, field: str, label: str):
-        super().__init__(placeholder=f"{label} 채널을 고르세요...",
+    고른 것으로 목록을 통째로 교체합니다. 하나씩 더하고 빼는 것보다
+    지금 무엇이 들어 있는지 헷갈리지 않습니다.
+    """
+
+    def __init__(self):
+        super().__init__(placeholder="후보 채널을 모두 고르세요 (여러 개 가능)...",
+                         channel_types=[discord.ChannelType.text],
+                         min_values=1, max_values=25)
+
+    async def callback(self, interaction: discord.Interaction):
+        ids = [str(c.id) for c in self.values]
+        await save_quest_settings(interaction.guild.id, {"channel_ids": ids,
+                                                         "channel_id": None})
+        mentions = []
+        for cid in ids:
+            ch = interaction.guild.get_channel(int(cid))
+            mentions.append(ch.mention if ch else f"`#{cid}`")
+        embed = discord.Embed(
+            title="✅ 랜덤 채널 후보 설정 완료",
+            description=f"**{len(ids)}개** 채널이 후보로 등록되었습니다.",
+            color=discord.Color.green())
+        embed.add_field(name="📋 후보 채널", value="  ".join(mentions)[:1024],
+                        inline=False)
+        embed.add_field(
+            name="🎲 이렇게 동작합니다",
+            value="유저마다 이 중 **하나가 무작위로** 배정됩니다." + NL
+                  + "같은 사람은 그날 하루 같은 채널을 봅니다." + NL
+                  + "-# 후보가 많을수록 사람들이 여러 채널로 흩어집니다.",
+            inline=False)
+        await refresh_panel(interaction, embed)
+
+
+class GoalChannelSelect(discord.ui.ChannelSelect):
+    """공동 목표 진행도를 보여줄 채널 (하나)."""
+
+    def __init__(self):
+        super().__init__(placeholder="공동 목표 안내 채널을 고르세요...",
                          channel_types=[discord.ChannelType.text],
                          min_values=1, max_values=1)
-        self.field = field
-        self.label_text = label
 
     async def callback(self, interaction: discord.Interaction):
         ch = interaction.guild.get_channel(self.values[0].id)
@@ -299,30 +348,39 @@ class QuestChannelSelect(discord.ui.ChannelSelect):
             await interaction.response.send_message("⚠️ 채널을 찾을 수 없습니다.",
                                                     ephemeral=True)
             return
-        if self.field == "goal_channel_id" and not ch.permissions_for(
-                interaction.guild.me).send_messages:
+        if not ch.permissions_for(interaction.guild.me).send_messages:
             await interaction.response.send_message(
                 f"⚠️ {ch.mention} 에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
             return
-        await save_quest_settings(interaction.guild.id, {self.field: str(ch.id)})
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title=f"✅ {self.label_text} 설정 완료",
-                description=f"{ch.mention} 으로 지정했습니다.",
-                color=discord.Color.green()),
-            ephemeral=True)
+        await save_quest_settings(interaction.guild.id,
+                                  {"goal_channel_id": str(ch.id)})
+        await refresh_panel(interaction, discord.Embed(
+            title="✅ 공동 목표 안내 채널 설정 완료",
+            description=f"{ch.mention} 으로 지정했습니다.",
+            color=discord.Color.green()))
 
 
 class QuestChannelView(discord.ui.View):
     def __init__(self, field: str, label: str):
         super().__init__(timeout=180)
-        self.add_item(QuestChannelSelect(field, label))
+        self.add_item(RandomChannelSelect() if field == "channel_id"
+                      else GoalChannelSelect())
+
+    @discord.ui.button(label="후보 전체 해제", style=discord.ButtonStyle.secondary,
+                       emoji="🚫", row=1)
+    async def clear(self, interaction: discord.Interaction,
+                    button: discord.ui.Button):
+        await save_quest_settings(interaction.guild.id,
+                                  {"channel_ids": [], "channel_id": None})
+        await refresh_panel(interaction, discord.Embed(
+            title="🚫 랜덤 채널 후보 해제",
+            description="후보가 없으면 채널 퀘스트는 **출제되지 않습니다.**",
+            color=discord.Color.orange()))
 
 
 class QuestSettingsSelect(discord.ui.Select):
     def __init__(self, settings: dict, guild: discord.Guild):
-        ch = (guild.get_channel(int(settings["channel_id"]))
-              if settings.get("channel_id") else None)
+        chans = quest_channels(settings)
         gch = (guild.get_channel(int(settings["goal_channel_id"]))
                if settings.get("goal_channel_id") else None)
         super().__init__(
@@ -341,9 +399,9 @@ class QuestSettingsSelect(discord.ui.Select):
                     label="목표치", value="goals", emoji="🎯",
                     description="채팅 N회, 뽑기 N회 등 각 퀘스트의 목표를 정합니다."),
                 discord.SelectOption(
-                    label="지정 채널 퀘스트", value="channel", emoji="💬",
-                    description=(f"현재: #{ch.name}" if ch else
-                                 "미설정 — 이 퀘스트는 출제되지 않습니다")[:95]),
+                    label="랜덤 채널 후보", value="channel", emoji="🎲",
+                    description=(f"현재 {len(chans)}개 — 유저마다 무작위 배정" if chans
+                                 else "미설정 — 채널 퀘스트는 출제되지 않습니다")[:95]),
                 discord.SelectOption(
                     label="서버 공동 목표 켜기 / 끄기", value="goaltoggle", emoji="🤝",
                     description=("현재: 켜짐" if settings.get("goal_enabled")
@@ -391,13 +449,29 @@ class QuestSettingsSelect(discord.ui.Select):
             await interaction.response.send_modal(ServerGoalModal())
 
         elif choice == "channel":
+            chans = quest_channels(settings)
+            cur = []
+            for cid in chans:
+                c = guild.get_channel(int(cid))
+                cur.append(c.mention if c else f"`#{cid}`")
+            embed = discord.Embed(
+                title="🎲 랜덤 채널 후보",
+                description="채널 퀘스트가 쓸 후보입니다. "
+                            "**유저마다 이 중 하나가 무작위로** 배정됩니다.",
+                color=discord.Color.blurple())
+            embed.add_field(
+                name=f"📋 현재 후보 ({len(chans)}개)",
+                value=("  ".join(cur)[:1024] if cur
+                       else "없음 — 채널 퀘스트가 출제되지 않습니다"),
+                inline=False)
+            embed.add_field(
+                name="💡 참고",
+                value="여러 개를 고르면 목록이 통째로 교체됩니다." + NL
+                      + "후보가 많을수록 사람들이 여러 채널로 흩어집니다.",
+                inline=False)
             await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="💬 지정 채널 퀘스트",
-                    description="`지정 채널에서 N회 대화하기` 퀘스트가 쓸 채널입니다." + NL
-                                + "바꾸면 원하는 채널로 사람을 모을 수 있습니다.",
-                    color=discord.Color.blurple()),
-                view=QuestChannelView("channel_id", "지정 채널 퀘스트"), ephemeral=True)
+                embed=embed, view=QuestChannelView("channel_id", "랜덤 채널"),
+                ephemeral=True)
 
         elif choice == "goalchannel":
             await interaction.response.send_message(
@@ -422,8 +496,6 @@ class QuestSettingsSelect(discord.ui.Select):
             await refresh_panel(interaction, embed)
 
         else:
-            ch = (guild.get_channel(int(settings["channel_id"]))
-                  if settings.get("channel_id") else None)
             gch = (guild.get_channel(int(settings["goal_channel_id"]))
                    if settings.get("goal_channel_id") else None)
             goals = settings.get("goals", {})
@@ -443,9 +515,15 @@ class QuestSettingsSelect(discord.ui.Select):
                 value=NL.join(f"• {quest_label(k, int(v))}"
                               for k, v in goals.items() if k in QUEST_KINDS),
                 inline=False)
-            embed.add_field(name="💬 지정 채널",
-                            value=ch.mention if ch else "미설정 (이 퀘스트는 출제 안 됨)",
-                            inline=True)
+            chans = quest_channels(settings)
+            cur = []
+            for cid in chans:
+                c = guild.get_channel(int(cid))
+                cur.append(c.mention if c else f"`#{cid}`")
+            embed.add_field(name="🎲 랜덤 채널 후보",
+                            value=("  ".join(cur)[:1024] if cur
+                                   else "미설정 (채널 퀘스트 출제 안 됨)"),
+                            inline=False)
             embed.add_field(
                 name="🤝 공동 목표",
                 value=(f"{'켜짐' if settings.get('goal_enabled') else '꺼짐'} · "
@@ -581,7 +659,7 @@ class Quest(commands.Cog):
         if dailies:
             lines = []
             for q in dailies:
-                text, done, claimed = _line(q, progress)
+                text, done, claimed = _line(q, progress, guild)
                 lines.append(text)
                 if done and not claimed:
                     claimable.append((q, False))
@@ -594,7 +672,7 @@ class Quest(commands.Cog):
         if weeklies:
             lines = []
             for q in weeklies:
-                text, done, claimed = _line(q, progress)
+                text, done, claimed = _line(q, progress, guild)
                 lines.append(text)
                 if done and not claimed:
                     claimable.append((q, True))

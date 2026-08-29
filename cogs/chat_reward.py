@@ -8,6 +8,7 @@ from utils.database import (
     set_channel_boost, get_channel_boost, get_all_active_boosts, add_activity_log,
     check_and_clear_expired_boosts,
     bump_quest_progress, get_quest_settings, bump_server_goal,
+    quest_channels, channel_field,
 )
 
 
@@ -397,12 +398,15 @@ class ChatReward(commands.Cog):
                 await bump_quest_progress(message.guild.id, message.author.id, "chat")
                 await bump_quest_progress(message.guild.id, message.author.id,
                                           "wchat", weekly=True)
-                target = settings.get("channel_id")
-                if target and str(message.channel.id) == str(target):
-                    await bump_quest_progress(message.guild.id, message.author.id,
-                                              "channel_chat")
-                    await bump_quest_progress(message.guild.id, message.author.id,
-                                              "wchannel", weekly=True)
+                # 사람마다 배정된 채널이 다르므로 **채널별로** 셉니다.
+                # 후보 채널에서 한 말이면 그 채널 카운터를 올려 두고,
+                # 어떤 퀘스트를 받았는지는 /퀘스트 를 열 때 대조합니다.
+                if str(message.channel.id) in quest_channels(settings):
+                    field = channel_field(message.channel.id)
+                    await bump_quest_progress(message.guild.id, message.author.id, field)
+                    await bump_quest_progress(
+                        message.guild.id, message.author.id,
+                        channel_field(message.channel.id, weekly=True), weekly=True)
                 if settings.get("goal_enabled"):
                     await bump_server_goal(message.guild.id)
         except Exception as e:

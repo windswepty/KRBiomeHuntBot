@@ -1679,3 +1679,100 @@ async def save_backup_channel(guild_id: int, channel_id: int | None) -> None:
         allset.setdefault(str(guild_id), {})["channel_id"] = value
         with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
             json.dump(allset, f, ensure_ascii=False, indent=2)
+
+
+# ── 봇 상태 알림 ──────────────────────────────────────────────────────
+#
+# UptimeRobot 은 **밖에서** 응답 여부만 봅니다. 포인트가 임시 저장소에
+# 쌓이고 있는지, 기능 일부가 로드에 실패했는지, 재시작을 반복하는지는
+# 밖에서 알 수 없습니다. 그래서 봇이 직접 채널에 남깁니다.
+
+async def get_status_channel(guild_id: int) -> int | None:
+    """봇 상태 알림을 보낼 채널. 따로 없으면 전체 백업 채널을 씁니다."""
+    if backup_set_col is not None:
+        try:
+            doc = await _db(backup_set_col.find_one, {"_id": str(guild_id)})
+            if doc:
+                got = doc.get("status_channel_id") or doc.get("channel_id")
+                return int(got) if got else None
+            return None
+        except Exception as e:
+            print(f"MongoDB get_status_channel error: {e}, using local file.", flush=True)
+    async with _backup_set_lock:
+        try:
+            if os.path.exists(BACKUP_SET_FILE):
+                with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                    row = json.load(f).get(str(guild_id), {})
+                    got = row.get("status_channel_id") or row.get("channel_id")
+                    return int(got) if got else None
+        except Exception:
+            pass
+    return None
+
+
+async def save_status_channel(guild_id: int, channel_id: int | None) -> None:
+    value = str(channel_id) if channel_id else None
+    if backup_set_col is not None:
+        try:
+            await _db(backup_set_col.update_one, {"_id": str(guild_id)},
+                      {"$set": {"status_channel_id": value}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_status_channel error: {e}, using local file.", flush=True)
+    async with _backup_set_lock:
+        _ensure_data_dir()
+        try:
+            with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                allset = json.load(f)
+        except Exception:
+            allset = {}
+        allset.setdefault(str(guild_id), {})["status_channel_id"] = value
+        with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
+            json.dump(allset, f, ensure_ascii=False, indent=2)
+
+
+async def record_boot(guild_id: int) -> dict:
+    """기동 시각을 남기고, 직전 기동과의 간격을 돌려줍니다.
+
+    재시작 **루프**는 무인 운영에서 가장 알아채기 어려운 고장입니다.
+    밖에서 보면 응답이 잠깐씩 되기 때문에 감시 서비스도 정상으로 봅니다.
+    직전 기동이 얼마 전이었는지 알면 루프를 바로 알 수 있습니다.
+    """
+    now = datetime.now(KST)
+    now_s = now.strftime("%Y-%m-%d %H:%M:%S")
+    previous = None
+
+    if backup_set_col is not None:
+        try:
+            doc = await _db(backup_set_col.find_one_and_update,
+                            {"_id": str(guild_id)},
+                            {"$set": {"last_boot_kst": now_s},
+                             "$inc": {"boot_count": 1}},
+                            upsert=True)
+            previous = (doc or {}).get("last_boot_kst")
+        except Exception as e:
+            print(f"MongoDB record_boot error: {e}, using local file.", flush=True)
+    else:
+        async with _backup_set_lock:
+            _ensure_data_dir()
+            try:
+                with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                    allset = json.load(f)
+            except Exception:
+                allset = {}
+            row = allset.setdefault(str(guild_id), {})
+            previous = row.get("last_boot_kst")
+            row["last_boot_kst"] = now_s
+            row["boot_count"] = int(row.get("boot_count", 0)) + 1
+            with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
+                json.dump(allset, f, ensure_ascii=False, indent=2)
+
+    gap_minutes = None
+    if previous:
+        try:
+            prev_dt = datetime.strptime(previous, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+            gap_minutes = (now - prev_dt).total_seconds() / 60
+        except (ValueError, TypeError):
+            gap_minutes = None
+
+    return {"now_kst": now_s, "previous_kst": previous, "gap_minutes": gap_minutes}

@@ -25,7 +25,9 @@ from utils.database import (
     export_points_payload, storage_status, STORAGE_MODE,
     export_full_payload, full_backup_bytes,
     get_backup_channel, save_backup_channel,
+    get_status_channel, save_status_channel, record_boot,
 )
+from utils import health
 
 KST = datetime.timezone(datetime.timedelta(hours=9))
 # 활동이 가장 적은 시간대에 자동 백업
@@ -203,6 +205,87 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
     return True, filename
 
 
+# 재시작이 이 간격보다 짧으면 '루프'로 보고 경고합니다.
+# 정상 운영에서는 재배포할 때만 재시작되므로 여기 걸리지 않습니다.
+RESTART_LOOP_MINUTES = 15
+
+
+async def announce_boot(bot, guild) -> bool:
+    """기동 결과를 상태 채널에 남깁니다.
+
+    UptimeRobot 은 밖에서 응답 여부만 봅니다. 포인트가 임시 저장소에
+    쌓이는 중인지, 기능 일부가 로드에 실패했는지, 재시작을 반복하는지는
+    **밖에서 알 수 없습니다.** 그래서 봇이 직접 남깁니다.
+
+    나중에 채널만 훑어도 그동안 무슨 일이 있었는지 파악되는 것이 목적입니다.
+    """
+    channel_id = await get_status_channel(guild.id)
+    if not channel_id:
+        return False
+    channel = guild.get_channel(int(channel_id))
+    if channel is None:
+        return False
+    perms = channel.permissions_for(guild.me)
+    if not perms.send_messages:
+        return False
+
+    boot = await record_boot(guild.id)
+    st = health.snapshot()
+    storage_ok = st.get("storage") == "mongo"
+    notes = st.get("notes") or []
+    looping = (boot["gap_minutes"] is not None
+               and boot["gap_minutes"] < RESTART_LOOP_MINUTES)
+
+    problem = (not storage_ok) or notes or looping
+    embed = discord.Embed(
+        title="🔴 봇 시작됨 (확인 필요)" if problem else "🔄 봇 시작됨",
+        color=discord.Color.red() if problem else discord.Color.green(),
+    )
+    embed.add_field(
+        name="💽 포인트 저장",
+        value=("✅ MongoDB (영구 보존)" if storage_ok
+               else f"🚨 **{st.get('storage')}** — 재시작하면 사라집니다"),
+        inline=True)
+    embed.add_field(name="⚙️ 기능",
+                    value=f"{len(bot.cogs)}개 로드", inline=True)
+    embed.add_field(name="📡 서버",
+                    value=f"{len(bot.guilds)}개 연결", inline=True)
+
+    if boot["previous_kst"]:
+        gap = boot["gap_minutes"]
+        if gap is None:
+            when = f"`{boot['previous_kst']}`"
+        elif gap < 60:
+            when = f"`{boot['previous_kst']}` ({gap:.0f}분 전)"
+        elif gap < 1440:
+            when = f"`{boot['previous_kst']}` ({gap/60:.1f}시간 전)"
+        else:
+            when = f"`{boot['previous_kst']}` ({gap/1440:.1f}일 전)"
+        embed.add_field(name="🕒 직전 기동", value=when, inline=False)
+
+    if looping:
+        embed.add_field(
+            name="🚨 재시작이 잦습니다",
+            value=f"직전 기동으로부터 **{boot['gap_minutes']:.0f}분** 만에 다시 켜졌습니다.\n"
+                  "재배포 중이 아니라면 **재시작 루프**일 수 있습니다.\n"
+                  "-# Render 로그에서 종료 원인을 확인해 주세요.",
+            inline=False)
+    if not storage_ok:
+        embed.add_field(
+            name="🚨 포인트가 영구 저장되지 않습니다",
+            value="지금 쌓이는 포인트는 재시작 때 **전부 사라집니다**.\n"
+                  "`MONGO_URI` 환경 변수를 즉시 확인하세요.",
+            inline=False)
+    if notes:
+        embed.add_field(name="⚠️ 기동 중 발견된 문제",
+                        value="\n".join(f"• {n}" for n in notes), inline=False)
+
+    if not problem:
+        embed.set_footer(text="정상 기동 · 이 알림은 봇이 켜질 때마다 남습니다")
+    await channel.send(embed=embed)
+    return True
+
+
 class BackupChannelSelect(discord.ui.ChannelSelect):
     """전체 백업을 올릴 채널을 고릅니다."""
 
@@ -269,6 +352,53 @@ class BackupChannelView(discord.ui.View):
             ephemeral=True)
 
 
+class StatusChannelSelect(discord.ui.ChannelSelect):
+    """봇 상태 알림을 보낼 채널을 고릅니다."""
+
+    def __init__(self):
+        super().__init__(placeholder="상태 알림을 받을 채널을 고르세요...",
+                         channel_types=[discord.ChannelType.text],
+                         min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel = guild.get_channel(self.values[0].id)
+        if channel is None or not channel.permissions_for(guild.me).send_messages:
+            await interaction.response.send_message(
+                "⚠️ 그 채널에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
+            return
+        await save_status_channel(guild.id, channel.id)
+        embed = discord.Embed(
+            title="🔔 봇 상태 알림 채널 설정 완료",
+            description=f"봇이 켜질 때마다 {channel.mention} 에 기록을 남깁니다.",
+            color=discord.Color.green())
+        embed.add_field(
+            name="📌 이런 걸 알 수 있습니다",
+            value="• 재시작을 반복하고 있는가 (**루프**)\n"
+                  "• 포인트가 임시 저장소에 쌓이고 있는가\n"
+                  "• 기능 일부가 로드에 실패했는가\n"
+                  "-# 전부 밖에서 감시하는 UptimeRobot 으로는 알 수 없는 것들입니다.",
+            inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class StatusChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(StatusChannelSelect())
+
+    @discord.ui.button(label="백업 채널과 같이 쓰기", style=discord.ButtonStyle.secondary,
+                       emoji="🔗", row=1)
+    async def same(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_status_channel(interaction.guild.id, None)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🔗 백업 채널과 함께 사용",
+                description="상태 알림도 전체 백업 채널로 보냅니다.",
+                color=discord.Color.blurple()),
+            ephemeral=True)
+
+
 class BackupMenu(discord.ui.Select):
     def __init__(self):
         super().__init__(
@@ -292,6 +422,9 @@ class BackupMenu(discord.ui.Select):
                 discord.SelectOption(
                     label="지금 전체 백업 보내기", value="sendnow", emoji="📤",
                     description="설정·연동까지 포함한 전체 백업을 채널로 올립니다."),
+                discord.SelectOption(
+                    label="봇 상태 알림 채널", value="status", emoji="🔔",
+                    description="재시작·이상을 알릴 채널. 미지정 시 백업 채널을 씁니다."),
             ]
         )
 
@@ -418,6 +551,25 @@ class BackupMenu(discord.ui.Select):
                                         color=discord.Color.orange()),
                     ephemeral=True)
 
+        elif choice == "status":
+            current = await get_status_channel(guild_id)
+            backup_ch = await get_backup_channel(guild_id)
+            ch = interaction.guild.get_channel(int(current)) if current else None
+            shared = current and backup_ch and int(current) == int(backup_ch)
+            embed = discord.Embed(
+                title="🔔 봇 상태 알림 채널",
+                description=(f"현재 채널: {ch.mention}" + ("  *(백업 채널과 공유)*" if shared else "")
+                             if ch else "**아직 지정되지 않았습니다.**"),
+                color=discord.Color.blurple() if ch else discord.Color.orange())
+            embed.add_field(
+                name="🆚 UptimeRobot 과 무엇이 다른가요",
+                value="UptimeRobot 은 **밖에서** 응답 여부만 봅니다.\n"
+                      "포인트가 임시 저장소에 쌓이는 중인지, 기능이 빠졌는지,\n"
+                      "재시작을 반복하는지는 **안에서만** 알 수 있습니다.",
+                inline=False)
+            await interaction.response.send_message(
+                embed=embed, view=StatusChannelView(), ephemeral=True)
+
         elif choice == "restore":
             await interaction.response.defer(ephemeral=True, thinking=True)
             snapshots = await list_point_snapshots(guild_id, limit=25)
@@ -446,7 +598,23 @@ class BackupView(discord.ui.View):
 class PointBackup(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # on_ready 는 재접속 때마다 다시 불립니다. 기동 알림은 프로세스가
+        # 새로 뜬 경우에만 보내야 하므로 한 번만 보내도록 잠급니다.
+        self._announced = False
         self.daily_snapshot.start()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._announced:
+            return
+        self._announced = True
+        for guild in self.bot.guilds:
+            try:
+                await announce_boot(self.bot, guild)
+            except Exception as e:
+                # 알림 실패가 봇 기동을 막으면 안 됩니다
+                print(f"[Backup] {guild.name}: 기동 알림 실패 - "
+                      f"{type(e).__name__}: {e}", flush=True)
 
     def cog_unload(self):
         self.daily_snapshot.cancel()

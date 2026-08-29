@@ -399,6 +399,8 @@ class ChatReward(commands.Cog):
                 if target and str(message.channel.id) == str(target):
                     await bump_quest_progress(message.guild.id, message.author.id,
                                               "channel_chat")
+                    await bump_quest_progress(message.guild.id, message.author.id,
+                                              "wchannel", weekly=True)
                 if settings.get("goal_enabled"):
                     await bump_server_goal(message.guild.id)
         except Exception as e:

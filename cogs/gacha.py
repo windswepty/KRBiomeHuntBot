@@ -183,6 +183,7 @@ class GachaPlayView(discord.ui.View):
         # 퀘스트 진행도 (실패해도 뽑기 결과에는 영향을 주지 않습니다)
         try:
             await bump_quest_progress(guild_id, user_id, "gacha")
+            await bump_quest_progress(guild_id, user_id, "wgacha", weekly=True)
         except Exception as e:
             print(f"[Quest] 뽑기 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
 

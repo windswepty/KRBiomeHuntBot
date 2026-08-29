@@ -2085,17 +2085,21 @@ QUEST_KINDS = {
     "early_bird":  {"label": "출석 선착순 {n}등 안에 들기",  "unit": "등", "period": "daily"},
     "week_checkin":{"label": "이번 주 {n}일 출석하기",       "unit": "일", "period": "weekly"},
     "week_chat":   {"label": "이번 주 채팅 {n}회 보내기",    "unit": "회", "period": "weekly"},
+    "week_gacha":  {"label": "이번 주 뽑기 {n}회 돌리기",    "unit": "회", "period": "weekly"},
+    "week_channel":{"label": "이번 주 지정 채널에서 {n}회 대화", "unit": "회", "period": "weekly"},
 }
 
 DEFAULT_QUEST_SETTINGS = {
     "enabled": False,          # 만들어만 두고 켜는 건 운영진이 결정합니다
     "daily_count": 3,          # 매일 몇 개를 뽑을지
+    "weekly_count": 2,         # 주마다 몇 개를 뽑을지
     "daily_reward": 150,       # 일일 퀘스트 1개당 보상
     "weekly_reward": 800,      # 주간 퀘스트 1개당 보상
     "channel_id": None,        # channel_chat 대상 채널
     # 종류별 목표치. 슬로우모드 5초 기준으로 잡은 기본값입니다.
-    "goals": {"chat": 20, "channel_chat": 10, "gacha": 2,
-              "early_bird": 20, "week_checkin": 5, "week_chat": 150},
+    "goals": {"chat": 20, "channel_chat": 10, "gacha": 2, "early_bird": 20,
+              "week_checkin": 5, "week_chat": 150, "week_gacha": 10,
+              "week_channel": 60},
     # 풀에서 제외할 종류 (운영진이 끄고 싶을 때)
     "disabled_kinds": [],
     # 서버 공동 목표
@@ -2303,59 +2307,68 @@ async def claim_quest(guild_id: int, user_id: int, quest_id: str,
     return True
 
 
-async def get_daily_quests(guild_id: int, settings: dict | None = None) -> list[dict]:
-    """오늘의 일일 퀘스트. 없으면 뽑아서 저장하고 하루 동안 고정합니다.
+def _pick_quests(seed: str, pool: list[str], count: int,
+                 goals: dict, prefix: str) -> list[dict]:
+    """씨앗으로 퀘스트를 고릅니다.
 
-    **매번 새로 뽑으면 안 됩니다.** 유저가 명령어를 칠 때마다 목록이 바뀌면
-    진행하던 퀘스트가 사라집니다. 날짜를 키로 저장해 하루는 같은 목록을 씁니다.
-
-    무작위 씨앗은 `길드+날짜` 라 같은 날엔 몇 번을 불러도 같은 결과입니다.
-    (봇이 재시작해도 동일 — 저장이 실패해도 목록이 흔들리지 않습니다)
+    **저장하지 않습니다.** 같은 씨앗이면 언제 불러도 같은 결과가 나오므로,
+    봇이 재시작해도 목록이 흔들리지 않습니다. 1,245명분 문서를 매일 쓰는
+    대신 계산으로 해결합니다.
     """
-    settings = settings or await get_quest_settings(guild_id)
-    day = quest_day()
-    key = f"{guild_id}:{day}"
+    if not pool or count <= 0:
+        return []
+    import random as _random
+    rng = _random.Random(seed)
+    picked = rng.sample(pool, min(count, len(pool)))
+    return [{"id": f"{prefix}:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
+            for k in picked]
 
-    if quest_state_col is not None:
-        try:
-            doc = await _db(quest_state_col.find_one, {"_id": key})
-            if doc and doc.get("quests"):
-                return doc["quests"]
-        except Exception as e:
-            print(f"MongoDB get_daily_quests error: {e}, using local file.", flush=True)
 
+def _daily_pool(settings: dict) -> list[str]:
     pool = [k for k, v in QUEST_KINDS.items()
             if v["period"] == "daily" and k not in (settings.get("disabled_kinds") or [])]
     if "channel_chat" in pool and not settings.get("channel_id"):
         pool.remove("channel_chat")     # 대상 채널이 없으면 낼 수 없습니다
-
-    count = max(1, min(int(settings.get("daily_count", 3)), len(pool))) if pool else 0
-    import random as _random
-    rng = _random.Random(f"{guild_id}:{day}")
-    picked = rng.sample(pool, count) if count else []
-    goals = settings.get("goals", {})
-    quests = [{"id": f"d:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
-              for k in picked]
-
-    if quest_state_col is not None:
-        try:
-            await _db(quest_state_col.update_one, {"_id": key},
-                      {"$setOnInsert": {"quests": quests, "guild_id": str(guild_id),
-                                        "day": day,
-                                        "created": datetime.now(timezone.utc)}},
-                      upsert=True)
-        except Exception as e:
-            print(f"MongoDB save daily quests error: {e}", flush=True)
-    return quests
+    return pool
 
 
-def weekly_quests(settings: dict) -> list[dict]:
-    """주간 퀘스트는 고정입니다. 매주 바뀌면 진행도를 쌓을 수가 없습니다."""
-    goals = settings.get("goals", {})
-    disabled = settings.get("disabled_kinds") or []
-    return [{"id": f"w:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
-            for k, v in QUEST_KINDS.items()
-            if v["period"] == "weekly" and k not in disabled]
+def _weekly_pool(settings: dict) -> list[str]:
+    pool = [k for k, v in QUEST_KINDS.items()
+            if v["period"] == "weekly" and k not in (settings.get("disabled_kinds") or [])]
+    if "week_channel" in pool and not settings.get("channel_id"):
+        pool.remove("week_channel")
+    return pool
+
+
+async def get_daily_quests(guild_id: int, settings: dict | None = None,
+                           user_id: int | None = None) -> list[dict]:
+    """오늘의 일일 퀘스트. **유저마다 다르게** 나옵니다.
+
+    씨앗이 `길드:유저:날짜` 라 사람마다 다른 조합을 받되, 같은 사람은
+    하루 동안 같은 목록을 봅니다. 명령어를 칠 때마다 바뀌면 진행하던
+    퀘스트가 사라지기 때문입니다.
+
+    user_id 를 안 주면 길드 공통(예전 방식)으로 뽑습니다 — 미리보기용.
+    """
+    settings = settings or await get_quest_settings(guild_id)
+    seed = (f"{guild_id}:{user_id}:{quest_day()}" if user_id is not None
+            else f"{guild_id}:{quest_day()}")
+    return _pick_quests(seed, _daily_pool(settings),
+                        int(settings.get("daily_count", 3) or 3),
+                        settings.get("goals", {}), "d")
+
+
+def weekly_quests(settings: dict, guild_id: int | None = None,
+                  user_id: int | None = None) -> list[dict]:
+    """이번 주 퀘스트. 일일과 마찬가지로 **유저마다 다릅니다.**
+
+    주가 바뀌면 새로 뽑히고, 그 주 안에서는 고정입니다.
+    """
+    seed = (f"{guild_id}:{user_id}:{quest_week()}" if user_id is not None
+            else f"{guild_id}:{quest_week()}")
+    return _pick_quests(seed, _weekly_pool(settings),
+                        int(settings.get("weekly_count", 2) or 2),
+                        settings.get("goals", {}), "w")
 
 
 def quest_progress_value(kind: str, progress: dict) -> int:
@@ -2376,6 +2389,10 @@ def quest_progress_value(kind: str, progress: dict) -> int:
         return int(p.get("wcheckin", 0) or 0)
     if kind == "week_chat":
         return int(p.get("wchat", 0) or 0)
+    if kind == "week_gacha":
+        return int(p.get("wgacha", 0) or 0)
+    if kind == "week_channel":
+        return int(p.get("wchannel", 0) or 0)
     return 0
 
 

@@ -137,28 +137,32 @@ class QuestRewardModal(discord.ui.Modal, title="💰 퀘스트 보상 설정"):
                                   placeholder="예: 800", required=True, max_length=7)
     count = discord.ui.TextInput(label="하루에 제시할 퀘스트 개수",
                                  placeholder="예: 3", required=True, max_length=2)
+    wcount = discord.ui.TextInput(label="주마다 제시할 퀘스트 개수",
+                                  placeholder="예: 2", required=True, max_length=2)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             d = int(str(self.daily.value).strip())
             w = int(str(self.weekly.value).strip())
             c = int(str(self.count.value).strip())
+            wc = int(str(self.wcount.value).strip())
         except ValueError:
             await interaction.response.send_message("⚠️ 숫자만 입력해 주세요.",
                                                     ephemeral=True)
             return
-        if min(d, w) < 0 or not (1 <= c <= 5):
+        if min(d, w) < 0 or not (1 <= c <= 5) or not (1 <= wc <= 4):
             await interaction.response.send_message(
-                "⚠️ 보상은 0 이상, 개수는 1~5 사이여야 합니다.", ephemeral=True)
+                "⚠️ 보상은 0 이상, 일일 개수는 1~5, 주간 개수는 1~4 사이여야 합니다.",
+                ephemeral=True)
             return
         await save_quest_settings(interaction.guild.id,
                                   {"daily_reward": d, "weekly_reward": w,
-                                   "daily_count": c})
+                                   "daily_count": c, "weekly_count": wc})
         embed = discord.Embed(title="💰 퀘스트 보상 변경 완료",
                               color=discord.Color.green())
         embed.add_field(name="일일", value=f"개당 {d:,} P", inline=True)
         embed.add_field(name="주간", value=f"개당 {w:,} P", inline=True)
-        embed.add_field(name="하루 개수", value=f"{c}개", inline=True)
+        embed.add_field(name="개수", value=f"일일 {c}개 · 주간 {wc}개", inline=True)
         embed.add_field(name="📊 하루 최대 수급 (1인)",
                         value=f"일일 **{d * c:,} P** + 주간 분할분", inline=False)
         embed.set_footer(text="개수 변경은 내일부터 반영됩니다 (오늘 목록은 이미 정해졌습니다)")
@@ -526,8 +530,8 @@ class Quest(commands.Cog):
                 ephemeral=True)
             return
 
-        dailies = await get_daily_quests(guild.id, settings)
-        weeklies = weekly_quests(settings)
+        dailies = await get_daily_quests(guild.id, settings, interaction.user.id)
+        weeklies = weekly_quests(settings, guild.id, interaction.user.id)
         progress = await get_quest_progress(guild.id, interaction.user.id)
 
         embed = discord.Embed(
@@ -578,7 +582,7 @@ class Quest(commands.Cog):
                           ("  **← 받을 수 있습니다**" if reached else ""))),
                 inline=False)
 
-        embed.set_footer(text="일일 퀘스트는 매일 자정(KST)에 새로 바뀝니다")
+        embed.set_footer(text="퀘스트는 사람마다 다릅니다 · 일일은 매일 자정(KST), 주간은 월요일에 바뀝니다")
         await interaction.followup.send(
             embed=embed, view=QuestView(interaction.user.id, claimable), ephemeral=True)
 
@@ -593,7 +597,7 @@ class Quest(commands.Cog):
         settings = await get_quest_settings(interaction.guild.id)
         embed = discord.Embed(
             title="🧭 퀘스트 관리",
-            description="퀘스트는 **매일 무작위로 뽑혀** 제시됩니다." + NL
+            description="퀘스트는 **유저마다 다르게, 매일 무작위로** 뽑힙니다." + NL
                         + "수치는 전부 여기서 조정할 수 있습니다.",
             color=discord.Color.blurple())
         embed.add_field(name="상태",

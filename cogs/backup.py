@@ -209,7 +209,10 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
 
 # 재시작이 이 간격보다 짧으면 '루프'로 보고 경고합니다.
 # 정상 운영에서는 재배포할 때만 재시작되므로 여기 걸리지 않습니다.
-RESTART_LOOP_MINUTES = 15
+# 이 시간 창 안에서 이만큼 켜지면 '재시작 루프'로 봅니다.
+# 재배포는 보통 한두 번이라 걸리지 않고, 진짜 루프는 훨씬 잦습니다.
+RESTART_LOOP_WINDOW_MINUTES = 60
+RESTART_LOOP_COUNT = 3
 # 상태 임베드를 몇 분마다 새로 고칠지. 메시지 수정은 채널을 올리지 않으므로
 # 알림이 울리지 않습니다. 짧게 잡아도 유저에게 방해가 되지 않습니다.
 STATUS_REFRESH_MINUTES = 10
@@ -259,14 +262,22 @@ async def build_status_embed(bot, guild) -> discord.Embed:
 
     history = state["boot_history"] or ([state["last_boot_kst"]]
                                         if state["last_boot_kst"] else [])
-    looping = False
-    if len(history) >= 2:
+    # 최근 한 시간 안에 몇 번 켜졌는지로 판단합니다.
+    #
+    # 예전에는 '직전 두 기동의 간격'만 봤는데, 그러면 재배포로 두 번 연달아
+    # 켜진 뒤 며칠이 지나도 계속 빨간색으로 남았습니다. 늘 빨간 표시는
+    # 없는 것보다 나쁩니다 — 익숙해져서 진짜 경고를 놓치게 됩니다.
+    # 시간 창으로 세면 안정되는 순간 저절로 풀립니다.
+    now = datetime.datetime.now(KST)
+    recent = 0
+    for h in history:
         try:
-            a = datetime.datetime.strptime(history[-1], "%Y-%m-%d %H:%M:%S")
-            b = datetime.datetime.strptime(history[-2], "%Y-%m-%d %H:%M:%S")
-            looping = (a - b).total_seconds() / 60 < RESTART_LOOP_MINUTES
+            dt = datetime.datetime.strptime(h, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
         except (ValueError, TypeError):
-            looping = False
+            continue
+        if (now - dt).total_seconds() <= RESTART_LOOP_WINDOW_MINUTES * 60:
+            recent += 1
+    looping = recent >= RESTART_LOOP_COUNT
 
     ext_missing = st.get("ext_total", 0) > 0 and st.get("ext_loaded") != st.get("ext_total")
     problem = (not storage_ok) or notes or looping or ext_missing
@@ -312,9 +323,10 @@ async def build_status_embed(bot, guild) -> discord.Embed:
     if looping:
         embed.add_field(
             name="🚨 재시작이 잦습니다",
-            value=f"직전 기동과 **{RESTART_LOOP_MINUTES}분** 이내 간격입니다.\n"
+            value=f"최근 **{RESTART_LOOP_WINDOW_MINUTES}분 안에 {recent}번** 켜졌습니다.\n"
                   "재배포 중이 아니라면 **재시작 루프**일 수 있습니다.\n"
-                  "-# Render 로그에서 종료 원인을 확인해 주세요.",
+                  "-# Render 로그에서 종료 원인을 확인해 주세요. "
+                  "안정되면 이 경고는 저절로 사라집니다.",
             inline=False)
     if not storage_ok:
         embed.add_field(

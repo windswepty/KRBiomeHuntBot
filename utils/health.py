@@ -40,7 +40,30 @@ _state = {
     "disconnects": 0,        # 누적 끊김 횟수 (재시작 판단 아닌 참고용)
     "resumes": 0,
     "notes": [],             # 기동 시 발견한 이상 (콕 로드 실패 등)
+    # 기능이 몇 개 중 몇 개 살아있는지. 분모가 없으면 하나가 빠져도
+    # 알아챌 수 없습니다. cogs/ 폴더의 파일 수가 '있어야 할 개수'입니다.
+    "ext_loaded": 0,
+    "ext_total": 0,
+    "ext_failed": [],
+    "commands": 0,
 }
+
+
+def set_extensions(loaded: int, total: int, failed: list[str]) -> None:
+    with _lock:
+        _state["ext_loaded"] = loaded
+        _state["ext_total"] = total
+        _state["ext_failed"] = list(failed)
+
+
+def set_command_count(n: int) -> None:
+    with _lock:
+        _state["commands"] = n
+
+
+def extensions_ok() -> bool:
+    with _lock:
+        return _state["ext_total"] > 0 and _state["ext_loaded"] == _state["ext_total"]
 
 
 def mark_ready(guilds: int, storage: str) -> None:

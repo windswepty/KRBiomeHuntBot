@@ -268,7 +268,8 @@ async def build_status_embed(bot, guild) -> discord.Embed:
         except (ValueError, TypeError):
             looping = False
 
-    problem = (not storage_ok) or notes or looping
+    ext_missing = st.get("ext_total", 0) > 0 and st.get("ext_loaded") != st.get("ext_total")
+    problem = (not storage_ok) or notes or looping or ext_missing
     connected = st.get("connected")
 
     if problem:
@@ -290,9 +291,15 @@ async def build_status_embed(bot, guild) -> discord.Embed:
         name="📶 응답 속도",
         value=(f"{st['latency_ms']:.0f} ms" if st.get("latency_ms") else "측정 전"),
         inline=True)
-    embed.add_field(name="⚙️ 기능", value=f"{len(bot.cogs)}개", inline=True)
+    ext_ok = st.get("ext_total", 0) > 0 and st.get("ext_loaded") == st.get("ext_total")
+    embed.add_field(
+        name="⚙️ 기능",
+        value=(f"{st.get('ext_loaded', 0)}/{st.get('ext_total', 0)}개"
+               + ("" if ext_ok else "  🚨")),
+        inline=True)
     embed.add_field(name="🔌 연결", value=("✅ 정상" if connected else "🔄 재연결 중"),
                     inline=True)
+    embed.add_field(name="📋 명령어", value=f"{st.get('commands', 0)}개", inline=True)
     embed.add_field(name="🔁 누적 재시작", value=f"{state['boot_count']}회", inline=True)
 
     embed.add_field(name="💾 마지막 전체 백업",
@@ -314,6 +321,14 @@ async def build_status_embed(bot, guild) -> discord.Embed:
             name="🚨 포인트가 영구 저장되지 않습니다",
             value="지금 쌓이는 포인트는 재시작 때 **전부 사라집니다**.\n"
                   "`MONGO_URI` 환경 변수를 즉시 확인하세요.",
+            inline=False)
+    if ext_missing:
+        failed = st.get("ext_failed") or []
+        embed.add_field(
+            name="🚨 작동하지 않는 기능이 있습니다",
+            value=(f"**{st['ext_total']}개 중 {st['ext_loaded']}개**만 켜졌습니다.\n"
+                   + (f"빠진 기능: {', '.join(f'`{x}`' for x in failed)}\n" if failed else "")
+                   + "-# 이 이름을 그대로 알려주시면 원인을 찾을 수 있습니다."),
             inline=False)
     if notes:
         embed.add_field(name="⚠️ 기동 중 발견된 문제",

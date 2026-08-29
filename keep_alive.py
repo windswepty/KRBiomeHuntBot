@@ -37,6 +37,8 @@ def home():
         "guilds": st["guilds"],
         "latency_ms": st["latency_ms"],
         "storage": st["storage"],
+        "extensions": f"{st.get('ext_loaded', 0)}/{st.get('ext_total', 0)}",
+        "commands": st.get("commands", 0),
         "uptime_seconds": st["uptime_seconds"],
         "disconnects": st["disconnects"],
     }

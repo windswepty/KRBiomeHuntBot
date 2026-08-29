@@ -48,6 +48,7 @@ async def on_ready():
     # Sync Slash Commands
     try:
         synced = await bot.tree.sync()
+        health.set_command_count(len(synced))
         print(f"Synced {len(synced)} slash command(s).", flush=True)
     except Exception as e:
         print(f"Failed to sync slash commands: {e}", flush=True)
@@ -104,16 +105,28 @@ async def before_watchdog():
 
 
 async def load_cogs():
+    """cogs/ 의 기능 파일을 모두 불러옵니다.
+
+    **폴더의 파일 수가 '있어야 할 개수'** 입니다. 이걸 분모로 기록해 두면
+    나중에 상태 임베드에 `10/11` 처럼 보여줄 수 있고, 하나가 빠졌을 때
+    바로 눈에 띕니다. 분모가 없으면 조용히 사라져도 알 수 없습니다.
+    """
     os.makedirs("cogs", exist_ok=True)
-    failed = []
-    for filename in sorted(os.listdir("./cogs")):
-        if filename.endswith(".py") and not filename.startswith("__"):
-            try:
-                await bot.load_extension(f"cogs.{filename[:-3]}")
-                print(f"Loaded extension: cogs.{filename[:-3]}", flush=True)
-            except Exception as e:
-                failed.append(filename[:-3])
-                print(f"Failed to load extension cogs.{filename[:-3]}: {e}", flush=True)
+    targets = [f for f in sorted(os.listdir("./cogs"))
+               if f.endswith(".py") and not f.startswith("__")]
+    loaded, failed = 0, []
+    for filename in targets:
+        name = filename[:-3]
+        try:
+            await bot.load_extension(f"cogs.{name}")
+            loaded += 1
+            print(f"Loaded extension: cogs.{name}", flush=True)
+        except Exception as e:
+            failed.append(name)
+            print(f"Failed to load extension cogs.{name}: {e}", flush=True)
+
+    health.set_extensions(loaded, len(targets), failed)
+    print(f"Extensions: {loaded}/{len(targets)} loaded", flush=True)
     if failed:
         # 일부만 동작하는 봇이라도 아예 없는 것보다는 낫습니다. 다만 조용히
         # 넘어가면 무인 운영 중에 아무도 모르므로 헬스 응답에 남깁니다.

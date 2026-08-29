@@ -1731,6 +1731,20 @@ async def save_status_channel(guild_id: int, channel_id: int | None) -> None:
             json.dump(allset, f, ensure_ascii=False, indent=2)
 
 
+def current_version() -> str:
+    """지금 돌고 있는 코드의 버전(커밋 해시). 알 수 없으면 빈 문자열.
+
+    Render 는 배포마다 RENDER_GIT_COMMIT 을 넣어 줍니다. 이 값이 있으면
+    **재배포로 인한 재시작**과 **같은 코드가 계속 죽는 크래시 루프**를
+    구분할 수 있습니다. 둘은 대응이 정반대라 섞이면 안 됩니다.
+    """
+    for key in ("RENDER_GIT_COMMIT", "GIT_COMMIT", "SOURCE_VERSION"):
+        v = (os.getenv(key) or "").strip()
+        if v:
+            return v[:12]
+    return ""
+
+
 async def record_boot(guild_id: int) -> dict:
     """기동 시각을 남기고, 직전 기동과의 간격을 돌려줍니다.
 
@@ -1750,7 +1764,9 @@ async def record_boot(guild_id: int) -> dict:
                             {"_id": str(guild_id)},
                             {"$set": {"last_boot_kst": now_s},
                              "$inc": {"boot_count": 1},
-                             "$push": {"boot_history": {"$each": [now_s], "$slice": -8}}},
+                             "$push": {"boot_history": {
+                                 "$each": [{"at": now_s, "v": current_version()}],
+                                 "$slice": -8}}},
                             upsert=True)
             previous = (doc or {}).get("last_boot_kst")
         except Exception as e:
@@ -1768,7 +1784,7 @@ async def record_boot(guild_id: int) -> dict:
             row["last_boot_kst"] = now_s
             row["boot_count"] = int(row.get("boot_count", 0)) + 1
             hist = list(row.get("boot_history", []))[-7:]
-            hist.append(now_s)
+            hist.append({"at": now_s, "v": current_version()})
             row["boot_history"] = hist
             with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
                 json.dump(allset, f, ensure_ascii=False, indent=2)

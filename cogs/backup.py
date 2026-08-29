@@ -27,6 +27,7 @@ from utils.database import (
     get_backup_channel, save_backup_channel,
     get_status_channel, save_status_channel, record_boot,
     get_status_state, set_status_message, mark_full_backup,
+    current_version,
 )
 from utils import health
 
@@ -269,8 +270,15 @@ async def build_status_embed(bot, guild, state: dict | None = None) -> discord.E
     storage_ok = st.get("storage") == "mongo"
     notes = st.get("notes") or []
 
-    history = state["boot_history"] or ([state["last_boot_kst"]]
-                                        if state["last_boot_kst"] else [])
+    # 이력 항목은 예전엔 문자열, 지금은 {"at","v"} 입니다. 둘 다 받습니다.
+    def _entry(x):
+        if isinstance(x, dict):
+            return x.get("at", ""), x.get("v", "")
+        return str(x), ""
+
+    raw_history = state["boot_history"] or ([state["last_boot_kst"]]
+                                            if state["last_boot_kst"] else [])
+    history = [_entry(x) for x in raw_history]
     # 최근 한 시간 안에 몇 번 켜졌는지로 판단합니다.
     #
     # 예전에는 '직전 두 기동의 간격'만 봤는데, 그러면 재배포로 두 번 연달아
@@ -278,14 +286,24 @@ async def build_status_embed(bot, guild, state: dict | None = None) -> discord.E
     # 없는 것보다 나쁩니다 — 익숙해져서 진짜 경고를 놓치게 됩니다.
     # 시간 창으로 세면 안정되는 순간 저절로 풀립니다.
     now = datetime.datetime.now(KST)
-    recent = 0
-    for h in history:
+    version = current_version()
+    recent = 0          # 같은 코드로 다시 켜진 횟수 (진짜 루프의 신호)
+    deploys = 0         # 코드가 바뀌어 켜진 횟수 (재배포 — 정상)
+    for at, v in history:
         try:
-            dt = datetime.datetime.strptime(h, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+            dt = datetime.datetime.strptime(at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
         except (ValueError, TypeError):
             continue
-        if (now - dt).total_seconds() <= RESTART_LOOP_WINDOW_MINUTES * 60:
+        if (now - dt).total_seconds() > RESTART_LOOP_WINDOW_MINUTES * 60:
+            continue
+        if v == version:
             recent += 1
+        else:
+            deploys += 1
+
+    # 재배포는 코드가 바뀌므로 버전이 매번 다릅니다. 배포를 연달아 해도
+    # 경고가 뜨면 안 됩니다 — 대응할 것이 없는 정상 동작이기 때문입니다.
+    # **같은 버전이 반복해서 죽는 경우**만 진짜 루프입니다.
     looping = recent >= RESTART_LOOP_COUNT
 
     ext_missing = st.get("ext_total", 0) > 0 and st.get("ext_loaded") != st.get("ext_total")
@@ -320,20 +338,31 @@ async def build_status_embed(bot, guild, state: dict | None = None) -> discord.E
     embed.add_field(name="🔌 연결", value=("✅ 정상" if connected else "🔄 재연결 중"),
                     inline=True)
     embed.add_field(name="📋 명령어", value=f"{st.get('commands', 0)}개", inline=True)
-    embed.add_field(name="🔁 누적 재시작", value=f"{state['boot_count']}회", inline=True)
+    embed.add_field(
+        name="🔁 누적 재시작",
+        value=f"{state['boot_count']}회" + (f"\n-# `{version}`" if version else ""),
+        inline=True)
 
     embed.add_field(name="💾 마지막 전체 백업",
                     value=_ago(state["last_full_backup_kst"]), inline=False)
 
     if history:
-        lines = [f"• {_ago(h)}" for h in reversed(history[-5:])]
+        lines = []
+        for at, v in reversed(history[-5:]):
+            tag = ""
+            if v and v != version:
+                tag = "  `이전 버전`"
+            elif v and len(history) > 1:
+                tag = ""
+            lines.append(f"• {_ago(at)}{tag}")
         embed.add_field(name="🕒 최근 기동", value="\n".join(lines), inline=False)
 
     if looping:
         embed.add_field(
             name="🚨 재시작이 잦습니다",
-            value=f"최근 **{RESTART_LOOP_WINDOW_MINUTES}분 안에 {recent}번** 켜졌습니다.\n"
-                  "재배포 중이 아니라면 **재시작 루프**일 수 있습니다.\n"
+            value=f"**같은 버전**이 최근 {RESTART_LOOP_WINDOW_MINUTES}분 안에 "
+                  f"**{recent}번** 죽었습니다.\n"
+                  "재배포가 아니라 **크래시 루프**입니다.\n"
                   "-# Render 로그에서 종료 원인을 확인해 주세요. "
                   "안정되면 이 경고는 저절로 사라집니다.",
             inline=False)

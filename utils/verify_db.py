@@ -230,6 +230,11 @@ DEFAULT_VERIFY_SETTINGS = {
     # 멤버가 로블록스 계정을 다른 계정으로 바꾸면 로그 채널에 알릴지.
     # 갑작스러운 계정 교체는 그 자체로 확인해 볼 만한 신호입니다.
     "roblox_relink_alert": True,
+    # 인증을 받으려면 로블록스 계정 연동까지 마쳐야 하는지.
+    # 켜면 "역할 조건 + 연동" 을 모두 만족해야 인증 역할이 나갑니다.
+    # 게임 내 플레이어 목록과 대조할 수 있는 사람만 링크를 받게 되므로,
+    # 외부 유출을 잡아낼 확률이 크게 올라갑니다.
+    "require_roblox": False,
     # 필요 역할을 잃으면 인증 역할도 자동으로 회수할지.
     # 잘못 설정하면 멀쩡한 인증자까지 줄줄이 풀리므로 기본은 꺼둡니다.
     "auto_revoke": False,
@@ -1065,3 +1070,74 @@ async def get_roblox_names(guild_id: int, user_ids: list) -> dict:
     return {str(e["user_id"]): e.get("roblox_name", "")
             for e in all_links.values()
             if e.get("guild_id") == str_gid and str(e.get("user_id")) in wanted}
+
+
+async def search_roblox_links(guild_id: int, query: str, limit: int = 10) -> list[dict]:
+    """연동 명단을 검색합니다.
+
+    명단이 커지면 목록을 훑는 것이 비현실적이라, 어느 방향으로든 찾을 수
+    있게 합니다. 특히 게임에서 낯선 이름을 봤을 때 '우리 멤버인가'를
+    역으로 확인하는 용도가 중요합니다.
+
+    query 는 다음 중 무엇이든 됩니다.
+      · 디스코드 ID 또는 멘션      → 그 사람의 로블록스 계정
+      · 로블록스 숫자 ID           → 그 계정의 주인
+      · 로블록스 유저명(부분 일치) → 해당하는 사람들
+    """
+    str_gid = str(guild_id)
+    raw = (query or "").strip()
+    if not raw:
+        return []
+
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(entry: dict, how: str) -> None:
+        if not entry:
+            return
+        key = str(entry.get("user_id"))
+        if key in seen:
+            return
+        seen.add(key)
+        results.append({**entry, "matched_by": how})
+
+    # 1) 숫자면 디스코드 ID 와 로블록스 ID 양쪽으로 시도합니다.
+    #    디스코드 ID 는 17~20자리, 로블록스 ID 는 보통 그보다 짧습니다.
+    if digits:
+        if len(digits) >= 17:
+            _add(await get_roblox_link(guild_id, int(digits)), "discord_id")
+        try:
+            _add(await find_roblox_owner(guild_id, int(digits)), "roblox_id")
+        except (ValueError, OverflowError):
+            pass
+
+    # 2) 로블록스 유저명 (대소문자 무시, 부분 일치)
+    if len(results) < limit and raw:
+        needle = raw.lower()
+        if roblox_col is not None:
+            try:
+                import re as _re
+                pattern = _re.escape(raw)
+
+                def _fetch():
+                    return list(roblox_col.find({
+                        "guild_id": str_gid,
+                        "roblox_name": {"$regex": pattern, "$options": "i"},
+                    }).limit(limit))
+                for doc in await _db(_fetch):
+                    _add({k: v for k, v in doc.items() if k != "_id"}, "roblox_name")
+            except Exception as e:
+                print(f"MongoDB search_roblox_links error: {e}, using local file.", flush=True)
+
+        if len(results) < limit:
+            async with _roblox_lock:
+                rows = [e for e in _read_json(ROBLOX_FILE).values()
+                        if e.get("guild_id") == str_gid]
+            for e in rows:
+                if needle in str(e.get("roblox_name", "")).lower():
+                    _add(e, "roblox_name")
+                    if len(results) >= limit:
+                        break
+
+    return results[:limit]

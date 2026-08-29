@@ -19,7 +19,7 @@ from discord import app_commands
 from utils import roblox_oauth
 from utils.verify_db import (
     get_roblox_link, find_roblox_owner, save_roblox_link,
-    remove_roblox_link, list_roblox_links,
+    remove_roblox_link, list_roblox_links, search_roblox_links,
     get_verify_settings, get_linkguard_settings,
 )
 
@@ -149,6 +149,76 @@ class RobloxLink(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
+        name="연동조회",
+        description="[관리자 전용] 연동 명단을 검색합니다 (디스코드 / 로블록스 양방향)."
+    )
+    @app_commands.describe(
+        검색어="디스코드 ID·멘션, 로블록스 유저명, 또는 로블록스 숫자 ID"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def search(self, interaction: discord.Interaction, 검색어: str):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        query = (검색어 or "").strip()
+
+        rows = await search_roblox_links(guild.id, query, limit=10)
+
+        if not rows:
+            embed = discord.Embed(
+                title="🔍 검색 결과 없음",
+                description=f"`{query[:80]}` 로 연동된 기록을 찾지 못했습니다.",
+                color=discord.Color.orange()
+            )
+            # 게임에서 본 이름이 안 나온다는 것 자체가 중요한 신호입니다.
+            embed.add_field(
+                name="⚠️ 게임 안에서 본 이름인가요?",
+                value="연동 명단에 없는 사람이 개인서버에 들어와 있다면,\n"
+                      "**링크가 외부로 새어나갔다는 뜻**일 수 있습니다.\n"
+                      "-# 다만 연동을 아직 안 한 멤버일 수도 있으니 함께 확인하세요.",
+                inline=False
+            )
+            embed.add_field(
+                name="💡 검색 가능한 값",
+                value="• 디스코드 ID 또는 멘션\n"
+                      "• 로블록스 유저명 (일부만 입력해도 됩니다)\n"
+                      "• 로블록스 숫자 ID",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        badge = {
+            "discord_id": "🙋 디스코드 ID 일치",
+            "roblox_id": "🔢 로블록스 ID 일치",
+            "roblox_name": "🎮 로블록스 유저명 일치",
+        }
+
+        embed = discord.Embed(
+            title="🔍 연동 검색 결과",
+            description=f"`{query[:80]}` → **{len(rows)}건**",
+            color=discord.Color.green()
+        )
+
+        for idx, r in enumerate(rows, 1):
+            uid = r.get("user_id", "?")
+            member = guild.get_member(int(uid)) if str(uid).isdigit() else None
+            # 서버를 이미 나간 사람일 수 있습니다. 그것 자체가 확인할 신호입니다.
+            who = member.mention if member else f"`{uid}` (⚠️ 서버에 없음)"
+            embed.add_field(
+                name=f"{idx}. {r.get('roblox_name', '?')}",
+                value=f"{who}\n"
+                      f"🎮 `{r.get('roblox_id', '?')}`\n"
+                      f"🕒 `{r.get('linked_at', '?')}`\n"
+                      f"-# {badge.get(r.get('matched_by'), '일치')}",
+                inline=False
+            )
+
+        if len(rows) >= 10:
+            embed.set_footer(text="결과가 10건을 넘어 잘렸습니다 · 더 정확한 검색어를 입력해 보세요")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
         name="연동해제",
         description="[관리자 전용] 특정 멤버의 로블록스 연동을 해제합니다."
     )
@@ -164,7 +234,37 @@ class RobloxLink(commands.Cog):
                          if removed else
                          f"{member.mention} 님은 연동된 계정이 없습니다."),
             color=discord.Color.orange() if removed else discord.Color.greyple())
+
+        # 연동을 필수로 걸어둔 서버에서 연동만 지우고 인증 역할을 남겨두면,
+        # '링크를 받아간 사람은 전원 연동돼 있다'는 전제가 깨집니다.
+        # 그래서 인증 역할도 함께 회수합니다.
+        if removed:
+            note = await self._revoke_verify_if_required(interaction.guild, member)
+            if note:
+                embed.add_field(name="♻️ 인증 역할", value=note, inline=False)
+
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _revoke_verify_if_required(self, guild: discord.Guild,
+                                         member: discord.Member) -> str:
+        """연동 필수 설정이 켜져 있으면 인증 역할을 회수하고 결과 문구를 돌려줍니다."""
+        try:
+            settings = await get_verify_settings(guild.id)
+            if not settings.get("require_roblox", False):
+                return ""
+            role_id = settings.get("role_id")
+            if not role_id:
+                return ""
+            role = guild.get_role(int(role_id))
+            if role is None or not any(r.id == role.id for r in member.roles):
+                return ""
+            await member.remove_roles(role, reason="로블록스 연동 해제 (연동 필수 설정)")
+            return f"{role.mention} 역할도 함께 회수했습니다.\n"                    "-# 다시 연동한 뒤 인증 버튼을 누르면 재발급됩니다."
+        except discord.Forbidden:
+            return "⚠️ 인증 역할을 회수하지 못했습니다 (봇 권한 부족)."
+        except Exception as e:
+            print(f"[RobloxLink] 인증 역할 회수 실패: {type(e).__name__}: {e}", flush=True)
+            return "⚠️ 인증 역할 회수 중 오류가 발생했습니다."
 
 
 async def _alert_relink(bot, guild_id: int, user_id: int,

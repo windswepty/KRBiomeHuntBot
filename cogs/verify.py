@@ -12,7 +12,9 @@ from discord import app_commands
 from utils.verify_db import (
     get_verify_settings, save_verify_settings,
     get_linkguard_settings, save_linkguard_settings,
+    get_roblox_link,
 )
+from utils import roblox_oauth
 
 # 봇 재시작 후에도 버튼이 살아있도록 고정 custom_id 사용
 VERIFY_BUTTON_ID = "hbh_verify_panel:click"
@@ -73,6 +75,14 @@ def build_panel_embed(settings: dict, guild: discord.Guild) -> discord.Embed:
                 inline=False
             )
 
+    if settings.get("require_roblox", False):
+        embed.add_field(
+            name="🎮 로블록스 연동 필수",
+            value="`/로블록스연동` 으로 로블록스 계정을 먼저 연동해야 합니다.\n"
+                  "-# 개인서버 링크가 밖으로 새어나갔을 때 확인하기 위해서입니다.",
+            inline=False
+        )
+
     embed.set_footer(text="한바헌 서버 인증 시스템")
     return embed
 
@@ -130,6 +140,63 @@ class VerifyPanelView(discord.ui.View):
             embed.set_footer(text="역할을 받는 방법은 관리자에게 문의해 주세요")
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
+
+        # 로블록스 연동 검사 — 역할 조건을 통과해도 연동을 마치지 않았으면 막습니다.
+        # 링크를 받아간 사람을 게임 내 플레이어 목록과 대조할 수 있어야 외부 유출을
+        # 잡을 수 있는데, 연동하지 않은 사람이 섞여 있으면 그 대조가 무의미해집니다.
+        if settings.get("require_roblox", False):
+            link = await get_roblox_link(guild.id, member.id)
+            if not link:
+                # 이미 인증된 분에게 "인증을 마치려면" 이라고 하면 혼란스럽습니다.
+                # (설정을 나중에 켜면 기존 인증자는 그대로 남아 있습니다)
+                already = any(r.id == role.id for r in member.roles)
+                embed = discord.Embed(
+                    title="🎮 로블록스 연동이 필요합니다",
+                    description=("인증은 이미 완료되어 있지만, 아직 로블록스 계정이 "
+                                 "연동되지 않았습니다.\n"
+                                 "-# 개인서버에 들어온 사람을 확인하는 데 쓰이니 "
+                                 "연동해 주시면 좋습니다."
+                                 if already else
+                                 "인증을 마치려면 로블록스 계정을 먼저 연동해 주세요."),
+                    color=discord.Color.orange()
+                )
+                embed.add_field(
+                    name="🔒 확인하는 정보",
+                    value="로블록스 **아이디와 유저명만** 확인합니다.\n"
+                          "비밀번호 · 로벅스 · 인벤토리에는 접근하지 않습니다.",
+                    inline=False
+                )
+                view = discord.ui.View(timeout=None)
+                url = None
+                if roblox_oauth.enabled():
+                    try:
+                        url, _ = roblox_oauth.start(guild.id, member.id)
+                    except Exception as e:
+                        # 링크 생성 실패가 안내 자체를 막으면 안 됩니다
+                        print(f"[Verify] 로블록스 로그인 링크 생성 실패: "
+                              f"{type(e).__name__}: {e}", flush=True)
+                if url:
+                    embed.add_field(
+                        name="👉 연동 방법",
+                        value="아래 버튼을 누르거나 `/로블록스연동` 을 사용해 주세요.",
+                        inline=False
+                    )
+                    embed.set_footer(text="이 링크는 10분 뒤 만료됩니다 · 연동 후 다시 [인증하기]를 눌러 주세요")
+                    view.add_item(discord.ui.Button(
+                        label="로블록스로 로그인", url=url,
+                        style=discord.ButtonStyle.link, emoji="🎮"))
+                else:
+                    embed.add_field(
+                        name="⚠️ 안내",
+                        value="로블록스 연동 기능이 아직 준비되지 않았습니다. "
+                              "관리자에게 문의해 주세요.",
+                        inline=False
+                    )
+                kwargs = {"embed": embed, "ephemeral": True}
+                if view.children:
+                    kwargs["view"] = view
+                await interaction.response.send_message(**kwargs)
+                return
 
         if any(r.id == role.id for r in member.roles):
             await interaction.response.send_message(
@@ -414,6 +481,14 @@ class VerifySettingsSelect(discord.ui.Select):
                 emoji="🎫"
             ),
             discord.SelectOption(
+                label="로블록스 연동 필수 여부",
+                value="reqroblox",
+                description=("현재: ✅ 켜짐 — 연동해야 인증 가능"
+                             if current.get("require_roblox")
+                             else "현재: ❌ 꺼짐 — 연동 없이도 인증 가능"),
+                emoji="🎮"
+            ),
+            discord.SelectOption(
                 label="로블록스 계정 교체 알림",
                 value="relinkalert",
                 description=("현재: 켜짐 — 계정을 바꾸면 로그 채널에 기록"
@@ -479,6 +554,58 @@ class VerifySettingsSelect(discord.ui.Select):
             embed.set_footer(text="역할 우클릭 → ID 복사 로 ID를 얻을 수 있습니다")
             await interaction.response.send_message(
                 embed=embed, view=RequiredRoleView(required, guild), ephemeral=True)
+
+        elif choice == "reqroblox":
+            new_state = not settings.get("require_roblox", False)
+
+            if new_state and not roblox_oauth.enabled():
+                embed = discord.Embed(
+                    title="⚠️ 로블록스 연동이 준비되지 않았습니다",
+                    description="`ROBLOX_CLIENT_ID` · `ROBLOX_CLIENT_SECRET` 환경 변수가 "
+                                "설정되어야 합니다.\n"
+                                "지금 켜면 **아무도 인증을 받을 수 없게 됩니다.**",
+                    color=discord.Color.orange()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            await save_verify_settings(guild.id, {"require_roblox": new_state})
+            embed = discord.Embed(
+                title="🎮 로블록스 연동 필수 설정 변경",
+                description=f"연동 필수가 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.",
+                color=discord.Color.green() if new_state else discord.Color.red()
+            )
+            if new_state:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value="인증 역할을 받으려면 **필요 역할 + 로블록스 연동**을 "
+                          "모두 만족해야 합니다.\n"
+                          "연동하지 않은 채 [인증하기]를 누르면 로블록스 로그인 "
+                          "버튼이 안내됩니다.",
+                    inline=False
+                )
+                embed.add_field(
+                    name="✅ 얻는 것",
+                    value="링크를 받아간 사람 **전원**의 로블록스 아이디를 알게 되므로,\n"
+                          "게임 안 플레이어 목록과 대조해 **명단에 없는 침입자**를 "
+                          "바로 찾아낼 수 있습니다.",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚠️ 주의",
+                    value="• **이미 인증받은 멤버는 그대로 유지**됩니다 (소급 적용 없음)\n"
+                          "• 로블록스 계정이 만 13세 미만이면 연동할 수 없습니다\n"
+                          "• 로블록스 앱 심사 전에는 **10명까지만** 연동 가능합니다",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value="연동 여부와 무관하게 인증할 수 있습니다. "
+                          "(`/로블록스연동` 은 계속 사용 가능합니다)",
+                    inline=False
+                )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
         elif choice == "relinkalert":
             new_state = not settings.get("roblox_relink_alert", True)

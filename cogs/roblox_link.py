@@ -24,6 +24,105 @@ from utils.verify_db import (
 )
 
 
+def _login_embed_and_view(guild_id: int, user_id: int,
+                          title: str, description: str,
+                          color: discord.Color) -> tuple[discord.Embed, discord.ui.View]:
+    """로블록스 로그인 안내 임베드와 링크 버튼을 만듭니다.
+
+    최초 연동과 계정 교체가 같은 화면을 쓰도록 한곳에 모았습니다.
+    """
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.add_field(
+        name="🔒 요청하는 권한",
+        value="로블록스 **아이디와 유저명만** 확인합니다.\n"
+              "비밀번호 · 로벅스 · 인벤토리에는 접근하지 않습니다.",
+        inline=False)
+    embed.set_footer(text="이 링크는 10분 뒤 만료됩니다")
+
+    view = discord.ui.View(timeout=None)
+    url, _ = roblox_oauth.start(guild_id, user_id)
+    view.add_item(discord.ui.Button(
+        label="로블록스로 로그인", url=url,
+        style=discord.ButtonStyle.link, emoji="🎮"))
+    return embed, view
+
+
+class RelinkConfirmView(discord.ui.View):
+    """이미 연동된 상태에서 다시 연동할 때 한 번 더 확인받습니다.
+
+    로블록스 동의 화면은 로블록스가 만든 페이지라 우리가 손댈 수 없습니다.
+    (거기서는 이미 연동돼 있다는 사실조차 알려줄 수 없습니다)
+    그래서 **그 앞 단계인 디스코드에서** 확인을 받습니다.
+
+    임시 View 입니다 — 재시작 후에는 동작하지 않지만, 명령어를 다시 부르면
+    되므로 영구 View 로 만들 필요가 없습니다. 그래서 custom_id 도 없습니다.
+    """
+
+    def __init__(self, guild_id: int, user_id: int, existing: dict):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.existing = existing
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # ephemeral 이라 본인만 보이지만, 소유자 검사를 한 번 더 둡니다.
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "⚠️ 본인만 사용할 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="다른 계정으로 연동하기",
+                       style=discord.ButtonStyle.danger, emoji="🔄")
+    async def relink(self, interaction: discord.Interaction,
+                     button: discord.ui.Button):
+        if not roblox_oauth.enabled():
+            await interaction.response.send_message(
+                "⚠️ 로블록스 연동이 아직 준비되지 않았습니다.", ephemeral=True)
+            return
+        try:
+            embed, view = _login_embed_and_view(
+                self.guild_id, self.user_id,
+                title="🔄 다른 계정으로 연동",
+                description=f"현재 **{self.existing.get('roblox_name', '?')}** 계정이 "
+                            f"연동돼 있습니다.\n"
+                            "아래 버튼을 눌러 **바꿀 계정으로** 로그인해 주세요.",
+                color=discord.Color.orange())
+        except Exception as e:
+            print(f"[RobloxLink] 로그인 링크 생성 실패: {type(e).__name__}: {e}",
+                  flush=True)
+            await interaction.response.send_message(
+                "⚠️ 로그인 링크를 만들지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                ephemeral=True)
+            return
+
+        embed.add_field(
+            name="⚠️ 로블록스 화면에서 주의하세요",
+            value="로블록스 동의 화면에는 **지금 브라우저에 로그인된 계정**이 뜹니다.\n"
+                  "바꾸려는 계정이 맞는지 이름을 꼭 확인하고 눌러 주세요.\n"
+                  "-# 다른 계정이면 로블록스에서 먼저 로그아웃한 뒤 진행하세요.",
+            inline=False)
+        embed.add_field(
+            name="📝 참고",
+            value="계정을 바꾸면 **관리자 로그에 기록**됩니다.\n"
+                  "이전 계정으로 남아 있던 기록은 그대로 보존됩니다.",
+            inline=False)
+        await interaction.response.send_message(
+            embed=embed, view=view, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction,
+                     button: discord.ui.Button):
+        embed = discord.Embed(
+            title="✖️ 취소되었습니다",
+            description=f"연동은 **{self.existing.get('roblox_name', '?')}** 계정 "
+                        "그대로 유지됩니다.",
+            color=discord.Color.greyple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        self.stop()
+
+
 class RobloxLink(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -49,36 +148,56 @@ class RobloxLink(commands.Cog):
             return
 
         existing = await get_roblox_link(guild.id, interaction.user.id)
-        url, _ = roblox_oauth.start(guild.id, interaction.user.id)
 
-        embed = discord.Embed(
-            title="🎮 로블록스 계정 연동",
-            description="아래 버튼을 눌러 로블록스에 로그인하면 연동이 완료됩니다.",
-            color=discord.Color.blurple()
-        )
+        # 이미 연동돼 있으면 곧바로 로블록스로 보내지 않고 한 번 확인합니다.
+        # 로블록스 동의 화면은 우리가 손댈 수 없어서, 거기서는 "이미 연동된
+        # 계정입니다" 같은 안내를 띄울 방법이 없습니다.
         if existing:
+            embed = discord.Embed(
+                title="🔗 이미 연동된 계정이 있습니다",
+                description="다른 계정으로 바꾸시겠습니까?",
+                color=discord.Color.orange()
+            )
             embed.add_field(
-                name="🔗 현재 연동된 계정",
-                value=f"**{existing.get('roblox_name', '?')}** "
-                      f"(`{existing.get('roblox_id', '?')}`)\n"
-                      "-# 다시 연동하면 이 계정으로 교체됩니다.",
+                name="🎮 현재 연동된 계정",
+                value=f"**{existing.get('roblox_name', '?')}**\n"
+                      f"`{existing.get('roblox_id', '?')}`",
+                inline=True)
+            embed.add_field(
+                name="🕒 연동 시각",
+                value=f"`{existing.get('linked_at', '?')}`",
+                inline=True)
+            embed.add_field(
+                name="ℹ️ 그대로 두셔도 됩니다",
+                value="지금 계정이 맞다면 **[취소]** 를 누르시면 됩니다.\n"
+                      "다시 연동해도 이 계정이면 달라지는 것은 없습니다.",
                 inline=False)
-        embed.add_field(
+            await interaction.response.send_message(
+                embed=embed,
+                view=RelinkConfirmView(guild.id, interaction.user.id, existing),
+                ephemeral=True)
+            return
+
+        try:
+            embed, view = _login_embed_and_view(
+                guild.id, interaction.user.id,
+                title="🎮 로블록스 계정 연동",
+                description="아래 버튼을 눌러 로블록스에 로그인하면 연동이 완료됩니다.",
+                color=discord.Color.blurple())
+        except Exception as e:
+            print(f"[RobloxLink] 로그인 링크 생성 실패: {type(e).__name__}: {e}",
+                  flush=True)
+            await interaction.response.send_message(
+                "⚠️ 로그인 링크를 만들지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                ephemeral=True)
+            return
+
+        embed.insert_field_at(
+            0,
             name="ℹ️ 왜 필요한가요",
             value="개인서버 링크를 누가 받아갔는지 **로블록스 아이디로도** 남기기 "
                   "위해서입니다. 링크가 외부로 새어나갔을 때 확인하는 데 쓰입니다.",
             inline=False)
-        embed.add_field(
-            name="🔒 요청하는 권한",
-            value="로블록스 **아이디와 유저명만** 확인합니다.\n"
-                  "비밀번호 · 로벅스 · 인벤토리에는 접근하지 않습니다.",
-            inline=False)
-        embed.set_footer(text="이 링크는 10분 뒤 만료됩니다")
-
-        view = discord.ui.View(timeout=None)
-        view.add_item(discord.ui.Button(
-            label="로블록스로 로그인", url=url,
-            style=discord.ButtonStyle.link, emoji="🎮"))
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(

@@ -126,8 +126,46 @@ class QuestView(discord.ui.View):
         button.label = "수령 완료"
         try:
             await interaction.edit_original_response(view=None)
-        except discord.HTTPException:
+        except (discord.HTTPException, discord.InteractionResponded):
             pass
+
+
+def build_quest_panel(settings: dict) -> discord.Embed:
+    """설정 패널 임베드. 설정이 바뀔 때마다 이걸로 다시 그립니다."""
+    embed = discord.Embed(
+        title="\U0001f9ed 퀘스트 관리",
+        description="퀘스트는 **유저마다 다르게, 매일 무작위로** 뽑힙니다." + NL
+                    + "수치는 전부 여기서 조정할 수 있습니다.",
+        color=discord.Color.blurple())
+    embed.add_field(name="상태",
+                    value="✅ 켜짐" if settings.get("enabled") else "❌ 꺼짐",
+                    inline=True)
+    embed.add_field(name="일일 퀘스트",
+                    value=f"{settings.get('daily_count', 0)}개 / 일", inline=True)
+    embed.add_field(name="공동 목표",
+                    value="✅ 켜짐" if settings.get("goal_enabled") else "❌ 꺼짐",
+                    inline=True)
+    return embed
+
+
+async def refresh_panel(interaction: discord.Interaction, result: discord.Embed) -> None:
+    """패널을 최신 설정으로 다시 그리고, 변경 결과를 따로 알립니다.
+
+    이 한 단계가 없으면 드롭다운 설명이 옛 값 그대로 남아
+    '켰는데 꺼짐으로 보이는' 상태가 됩니다.
+    """
+    settings = await get_quest_settings(interaction.guild.id)
+    try:
+        await interaction.response.edit_message(
+            embed=build_quest_panel(settings),
+            view=QuestSettingsView(settings, interaction.guild))
+        await interaction.followup.send(embed=result, ephemeral=True)
+    except (discord.HTTPException, discord.InteractionResponded):
+        # 패널을 못 고치는 상황(메시지 만료 등)에서도 결과는 알려야 합니다
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=result, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=result, ephemeral=True)
 
 
 class QuestRewardModal(discord.ui.Modal, title="💰 퀘스트 보상 설정"):
@@ -166,7 +204,7 @@ class QuestRewardModal(discord.ui.Modal, title="💰 퀘스트 보상 설정"):
         embed.add_field(name="📊 하루 최대 수급 (1인)",
                         value=f"일일 **{d * c:,} P** + 주간 분할분", inline=False)
         embed.set_footer(text="개수 변경은 내일부터 반영됩니다 (오늘 목록은 이미 정해졌습니다)")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await refresh_panel(interaction, embed)
 
 
 class QuestGoalModal(discord.ui.Modal, title="🎯 퀘스트 목표치 설정"):
@@ -214,7 +252,7 @@ class QuestGoalModal(discord.ui.Modal, title="🎯 퀘스트 목표치 설정"):
             value=NL.join(f"• {quest_label(k, v)}" for k, v in goals.items()),
             inline=False)
         embed.set_footer(text="오늘 이미 진행 중인 퀘스트에도 즉시 반영됩니다")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await refresh_panel(interaction, embed)
 
 
 class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"):
@@ -242,7 +280,7 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
         embed.add_field(name="목표", value=f"서버 전체 채팅 {t:,}회", inline=True)
         embed.add_field(name="1인당 보상", value=f"{r:,} P", inline=True)
         embed.set_footer(text="목표는 매일 자정(KST)에 초기화됩니다")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await refresh_panel(interaction, embed)
 
 
 class QuestChannelSelect(discord.ui.ChannelSelect):
@@ -343,7 +381,7 @@ class QuestSettingsSelect(discord.ui.Select):
                     value=f"약 **{per_day:,} P**" + NL
                           + "-# 주간 · 공동 목표는 별도입니다.",
                     inline=False)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await refresh_panel(interaction, embed)
 
         elif choice == "reward":
             await interaction.response.send_modal(QuestRewardModal())
@@ -381,7 +419,7 @@ class QuestSettingsSelect(discord.ui.Select):
                     name="⚠️ 안내 채널이 없습니다",
                     value="`공동 목표 안내 채널` 을 지정해야 진행도가 보입니다.",
                     inline=False)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await refresh_panel(interaction, embed)
 
         else:
             ch = (guild.get_channel(int(settings["channel_id"]))
@@ -595,20 +633,9 @@ class Quest(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def quest_settings(self, interaction: discord.Interaction):
         settings = await get_quest_settings(interaction.guild.id)
-        embed = discord.Embed(
-            title="🧭 퀘스트 관리",
-            description="퀘스트는 **유저마다 다르게, 매일 무작위로** 뽑힙니다." + NL
-                        + "수치는 전부 여기서 조정할 수 있습니다.",
-            color=discord.Color.blurple())
-        embed.add_field(name="상태",
-                        value="켜짐" if settings.get("enabled") else "꺼짐", inline=True)
-        embed.add_field(name="일일 퀘스트",
-                        value=f"{settings.get('daily_count', 0)}개 / 일", inline=True)
-        embed.add_field(name="공동 목표",
-                        value="켜짐" if settings.get("goal_enabled") else "꺼짐",
-                        inline=True)
         await interaction.response.send_message(
-            embed=embed, view=QuestSettingsView(settings, interaction.guild),
+            embed=build_quest_panel(settings),
+            view=QuestSettingsView(settings, interaction.guild),
             ephemeral=True)
 
 

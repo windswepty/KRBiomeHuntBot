@@ -480,6 +480,46 @@ class RequiredRoleView(discord.ui.View):
         await interaction.response.send_modal(RequiredRoleIdModal())
 
 
+def build_settings_panel(settings: dict, guild: discord.Guild) -> discord.Embed:
+    """인증 설정 패널. 값이 바뀔 때마다 이걸로 다시 그립니다."""
+    role_id = settings.get("role_id")
+    role = guild.get_role(int(role_id)) if role_id else None
+    state_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
+    role_text = role.mention if role else "⚠️ 미설정"
+
+    embed = discord.Embed(
+        title="🔐 서버 인증 시스템 관리",
+        description=f"**시스템 상태**: {state_text}\n"
+                    f"**인증 역할**: {role_text}\n\n"
+                    "아래 드롭다운 메뉴에서 원하시는 관리 기능을 선택해 주세요.",
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="한바헌 서버 인증 시스템")
+    return embed
+
+
+async def refresh_settings_panel(interaction: discord.Interaction,
+                                 result: discord.Embed) -> None:
+    """설정을 바꾼 뒤 패널을 최신 값으로 다시 그립니다.
+
+    이 단계가 없으면 드롭다운 설명이 옛 값 그대로 남아, 켰는데도
+    '꺼짐'으로 보입니다. 실제로 그런 신고가 있었습니다.
+
+    패널 갱신에 실패해도 변경 결과는 반드시 알려야 하므로 갈라 둡니다.
+    """
+    settings = await get_verify_settings(interaction.guild.id)
+    try:
+        await interaction.response.edit_message(
+            embed=build_settings_panel(settings, interaction.guild),
+            view=VerifySettingsView(settings, interaction.guild))
+        await interaction.followup.send(embed=result, ephemeral=True)
+    except (discord.HTTPException, discord.InteractionResponded):
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=result, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=result, ephemeral=True)
+
+
 class VerifySettingsSelect(discord.ui.Select):
     def __init__(self, current: dict, guild: discord.Guild):
         role_id = current.get("role_id")
@@ -632,7 +672,7 @@ class VerifySettingsSelect(discord.ui.Select):
                           "(`/로블록스연동` 은 계속 사용 가능합니다)",
                     inline=False
                 )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await refresh_settings_panel(interaction, embed)
 
         elif choice == "relinkalert":
             new_state = not settings.get("roblox_relink_alert", True)
@@ -659,7 +699,7 @@ class VerifySettingsSelect(discord.ui.Select):
                     name="🔎 이렇게 동작합니다",
                     value="계정을 바꿔도 로그 채널에 알리지 않습니다. (콘솔 로그에는 남습니다)",
                     inline=False)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await refresh_settings_panel(interaction, embed)
 
         elif choice == "autorevoke":
             required = [int(r) for r in settings.get("required_role_ids", [])]
@@ -702,7 +742,7 @@ class VerifySettingsSelect(discord.ui.Select):
                     value="필요 역할을 잃어도 인증 역할은 **그대로 유지**됩니다.",
                     inline=False
                 )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await refresh_settings_panel(interaction, embed)
 
         elif choice == "toggle":
             new_state = not settings.get("enabled", True)
@@ -713,7 +753,7 @@ class VerifySettingsSelect(discord.ui.Select):
                 description=f"인증 시스템이 **{state_text}** 상태로 변경되었습니다.",
                 color=discord.Color.green() if new_state else discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await refresh_settings_panel(interaction, embed)
 
         elif choice == "role":
             await interaction.response.send_modal(VerifyRoleModal())
@@ -910,21 +950,10 @@ class Verify(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def verify_settings(self, interaction: discord.Interaction):
         settings = await get_verify_settings(interaction.guild.id)
-        role_id = settings.get("role_id")
-        role = interaction.guild.get_role(int(role_id)) if role_id else None
-        state_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
-        role_text = role.mention if role else "⚠️ 미설정"
-
-        embed = discord.Embed(
-            title="🔐 서버 인증 시스템 관리",
-            description=f"**시스템 상태**: {state_text}\n"
-                        f"**인증 역할**: {role_text}\n\n"
-                        "아래 드롭다운 메뉴에서 원하시는 관리 기능을 선택해 주세요.",
-            color=discord.Color.blurple()
-        )
-        embed.set_footer(text="한바헌 서버 인증 시스템")
-        view = VerifySettingsView(settings, interaction.guild)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            embed=build_settings_panel(settings, interaction.guild),
+            view=VerifySettingsView(settings, interaction.guild),
+            ephemeral=True)
 
 
 class VerifyRevoke(commands.Cog):

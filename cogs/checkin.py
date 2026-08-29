@@ -85,6 +85,41 @@ class PointGuideView(discord.ui.View):
         self.add_item(PointGuideSelect())
 
 
+
+
+def _build_checkin_panel(settings: dict) -> discord.Embed:
+    """출석 보상 설정 패널. 값이 바뀔 때마다 이걸로 다시 그립니다."""
+    embed = discord.Embed(
+        title="🔥 연속 출석 보상 설정",
+        description="연속으로 출석할수록 더 많이 받도록 조정할 수 있습니다.",
+        color=discord.Color.blurple())
+    embed.add_field(name="📈 지금 설정으로는", value=_reward_preview(settings),
+                    inline=False)
+    embed.set_footer(text="하루라도 거르면 연속은 1일로 초기화됩니다")
+    return embed
+
+
+async def _refresh_settings_panel(interaction, view_factory, embed_factory,
+                                  result_embed):
+    """설정을 바꾼 뒤 패널을 최신 값으로 다시 그립니다.
+
+    이 단계가 없으면 드롭다운 설명이 옛 값 그대로 남습니다
+    ('공동 목표를 켰는데 꺼짐으로 나온다' 같은 혼란).
+
+    패널 갱신에 실패해도 변경 결과는 반드시 알려야 하므로 갈라 둡니다.
+    """
+    try:
+        await interaction.response.edit_message(embed=embed_factory(),
+                                                view=view_factory())
+        await interaction.followup.send(embed=result_embed, ephemeral=True)
+    except (discord.HTTPException, discord.InteractionResponded):
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=result_embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=result_embed,
+                                                    ephemeral=True)
+
+
 class CheckinRewardModal(discord.ui.Modal, title="🔥 연속 출석 보상 설정"):
     """수치를 코드에 박지 않고 운영진이 직접 조정합니다."""
 
@@ -133,7 +168,11 @@ class CheckinRewardModal(discord.ui.Modal, title="🔥 연속 출석 보상 설�
         embed.add_field(name="📈 이렇게 지급됩니다",
                         value=_reward_preview(settings), inline=False)
         embed.set_footer(text="추가 보상은 주기를 채운 날에만 붙습니다")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await _refresh_settings_panel(
+            interaction,
+            lambda: CheckinSettingsView(settings),
+            lambda: _build_checkin_panel(settings),
+            embed)
 
 
 class MilestoneModal(discord.ui.Modal, title="🎯 특별 보상 설정"):
@@ -167,7 +206,12 @@ class MilestoneModal(discord.ui.Modal, title="🎯 특별 보상 설정"):
                                      for d, v in sorted(milestones.items(), key=lambda x: int(x[0])))),
             color=discord.Color.green())
         embed.set_footer(text="달성 보상은 그 날 한 번만 지급됩니다")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        fresh = await get_checkin_settings(interaction.guild.id)
+        await _refresh_settings_panel(
+            interaction,
+            lambda: CheckinSettingsView(fresh),
+            lambda: _build_checkin_panel(fresh),
+            embed)
 
 
 def _reward_preview(settings: dict) -> str:
@@ -489,15 +533,9 @@ class CheckIn(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def checkin_settings(self, interaction: discord.Interaction):
         settings = await get_checkin_settings(interaction.guild.id)
-        embed = discord.Embed(
-            title="🔥 연속 출석 보상 설정",
-            description="연속으로 출석할수록 더 많이 받도록 조정할 수 있습니다.",
-            color=discord.Color.blurple())
-        embed.add_field(name="📈 지금 설정으로는", value=_reward_preview(settings),
-                        inline=False)
-        embed.set_footer(text="하루라도 거르면 연속은 1일로 초기화됩니다")
         await interaction.response.send_message(
-            embed=embed, view=CheckinSettingsView(settings), ephemeral=True)
+            embed=_build_checkin_panel(settings),
+            view=CheckinSettingsView(settings), ephemeral=True)
 
 
 async def setup(bot):

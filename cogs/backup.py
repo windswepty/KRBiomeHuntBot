@@ -213,9 +213,16 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
 # 재배포는 보통 한두 번이라 걸리지 않고, 진짜 루프는 훨씬 잦습니다.
 RESTART_LOOP_WINDOW_MINUTES = 60
 RESTART_LOOP_COUNT = 3
-# 상태 임베드를 몇 분마다 새로 고칠지. 메시지 수정은 채널을 올리지 않으므로
-# 알림이 울리지 않습니다. 짧게 잡아도 유저에게 방해가 되지 않습니다.
-STATUS_REFRESH_MINUTES = 10
+# 상태 임베드를 몇 초마다 새로 고칠지.
+#
+# 메시지 **수정**은 채널을 올리지 않고 알림도 울리지 않으므로, 짧게 잡아도
+# 유저에게 전혀 방해가 되지 않습니다. 디스코드 편집 한도(초당 여러 번)에
+# 비해서도 1분에 한 번은 매우 여유롭습니다.
+#
+# 짧게 두는 진짜 이유는 따로 있습니다. **임베드가 갱신되는 시각 자체가
+# 생존 신호**입니다. 봇이 멈추면 갱신도 멈추므로, 시각이 굳어 있는 것만
+# 보고도 이상을 알 수 있습니다. 주기가 짧을수록 그 판단이 빨라집니다.
+STATUS_REFRESH_SECONDS = 60
 
 
 def _ago(stamp: str | None) -> str:
@@ -247,7 +254,7 @@ def _uptime(seconds: int) -> str:
     return f"{m}분"
 
 
-async def build_status_embed(bot, guild) -> discord.Embed:
+async def build_status_embed(bot, guild, state: dict | None = None) -> discord.Embed:
     """지금 상태를 하나의 임베드로 만듭니다.
 
     매번 새 메시지를 보내면 채널이 도배되고, 정작 중요한 신호가 묻힙니다.
@@ -255,7 +262,9 @@ async def build_status_embed(bot, guild) -> discord.Embed:
     남겨, 도배 없이도 '재시작이 몰렸는지'를 볼 수 있게 합니다.
     """
     st = health.snapshot()
-    state = await get_status_state(guild.id)
+    # 1분마다 도는 경로라 같은 조회를 두 번 하지 않도록 받아서 씁니다.
+    if state is None:
+        state = await get_status_state(guild.id)
 
     storage_ok = st.get("storage") == "mongo"
     notes = st.get("notes") or []
@@ -346,7 +355,8 @@ async def build_status_embed(bot, guild) -> discord.Embed:
         embed.add_field(name="⚠️ 기동 중 발견된 문제",
                         value="\n".join(f"• {n}" for n in notes), inline=False)
 
-    embed.set_footer(text=f"{STATUS_REFRESH_MINUTES}분마다 이 메시지가 갱신됩니다")
+    # 아래 시각이 멈춰 있으면 그 자체가 이상 신호입니다. 명시적으로 알려둡니다.
+    embed.set_footer(text="1분마다 갱신 · 아래 시각이 멈춰 있으면 봇이 멈춘 것입니다")
     embed.timestamp = discord.utils.utcnow()
     return embed
 
@@ -367,8 +377,8 @@ async def upsert_status_message(bot, guild) -> bool:
     if not perms.send_messages:
         return False
 
-    embed = await build_status_embed(bot, guild)
     state = await get_status_state(guild.id)
+    embed = await build_status_embed(bot, guild, state)
 
     if state["message_id"]:
         try:
@@ -659,13 +669,16 @@ class PointBackup(commands.Cog):
         if not self.status_refresh.is_running():
             self.status_refresh.start()
 
-    @tasks.loop(minutes=STATUS_REFRESH_MINUTES)
+    @tasks.loop(seconds=STATUS_REFRESH_SECONDS)
     async def status_refresh(self):
         """상태 임베드를 주기적으로 새로 고칩니다.
 
         메시지 **수정**이라 채널이 올라가지 않고 알림도 울리지 않습니다.
         가동 시간·응답 속도가 계속 갱신되므로, 마지막 갱신 시각만 봐도
         봇이 살아 있는지 알 수 있습니다.
+
+        갱신 실패가 쌓여도 봇 자체는 계속 돌아야 하므로 예외를 삼킵니다.
+        (연결이 끊긴 동안에는 편집이 실패하는 것이 정상입니다)
         """
         await self.bot.wait_until_ready()
         for guild in self.bot.guilds:

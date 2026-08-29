@@ -23,6 +23,8 @@ from utils.database import (
     create_point_snapshot, list_point_snapshots,
     get_point_snapshot, restore_point_snapshot,
     export_points_payload, storage_status, STORAGE_MODE,
+    export_full_payload, full_backup_bytes,
+    get_backup_channel, save_backup_channel,
 )
 
 KST = datetime.timezone(datetime.timedelta(hours=9))
@@ -147,6 +149,126 @@ class RestoreView(discord.ui.View):
 
 # ── 메인 메뉴 ─────────────────────────────────────────────────────────
 
+async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool, str]:
+    """전체 백업을 만들어 지정된 채널에 올립니다.
+
+    DB 안의 스냅샷은 클러스터·계정 사고를 못 막습니다. 디스코드 채널에
+    올려두면 PC 고장이든 Atlas 사고든 어느 쪽에도 살아남습니다.
+
+    반환값은 (성공여부, 사유) 입니다.
+    """
+    channel_id = await get_backup_channel(guild.id)
+    if not channel_id:
+        return False, "no-channel"
+    channel = guild.get_channel(int(channel_id))
+    if channel is None:
+        return False, "channel-gone"
+
+    perms = channel.permissions_for(guild.me)
+    if not (perms.send_messages and perms.attach_files):
+        return False, "no-permission"
+
+    payload = await export_full_payload()
+    data, filename = full_backup_bytes(payload)
+    meta = payload["_meta"]
+    counts = meta.get("collections", {})
+    total = sum(counts.values())
+
+    embed = discord.Embed(
+        title="💾 전체 백업",
+        description=f"`{meta.get('created_kst', '?')}` 시점의 **DB 전체**입니다.",
+        color=discord.Color.green() if reason == "auto" else discord.Color.blurple()
+    )
+    users = counts.get("users", 0)
+    embed.add_field(
+        name="📊 담긴 내용",
+        value=f"컬렉션 **{len(counts)}개** · 문서 **{total:,}건**\n"
+              f"유저 **{users:,}명** · 파일 **{len(data)/1024/1024:.2f} MB**",
+        inline=False)
+    embed.add_field(
+        name="🗂️ 포인트 백업과 다른 점",
+        value="상점 구성 · 뽑기 확률 · 인증 조건 · 링크 보호 설정 · "
+              "로블록스 연동까지 **전부** 들어 있습니다.",
+        inline=False)
+    embed.add_field(
+        name="♻️ 되돌리는 법",
+        value="이 파일을 받아 프로젝트 폴더에서:\n"
+              "```python tools/full_backup.py restore <파일> --all --yes```",
+        inline=False)
+    embed.set_footer(text=("매일 새벽 5시 자동 업로드" if reason == "auto"
+                           else "수동 업로드") + " · 이 채널은 비공개로 두세요")
+    embed.timestamp = discord.utils.utcnow()
+
+    await channel.send(embed=embed, file=discord.File(io.BytesIO(data), filename=filename))
+    return True, filename
+
+
+class BackupChannelSelect(discord.ui.ChannelSelect):
+    """전체 백업을 올릴 채널을 고릅니다."""
+
+    def __init__(self):
+        super().__init__(
+            placeholder="전체 백업을 올릴 채널을 고르세요...",
+            channel_types=[discord.ChannelType.text],
+            min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel = guild.get_channel(self.values[0].id)
+        if channel is None:
+            await interaction.response.send_message(
+                "⚠️ 채널을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        perms = channel.permissions_for(guild.me)
+        missing = []
+        if not perms.send_messages:
+            missing.append("메시지 보내기")
+        if not perms.attach_files:
+            missing.append("파일 첨부")
+        if missing:
+            await interaction.response.send_message(
+                f"⚠️ {channel.mention} 에 **{' · '.join(missing)}** 권한이 없습니다.\n"
+                "봇에게 권한을 주고 다시 지정해 주세요.", ephemeral=True)
+            return
+
+        await save_backup_channel(guild.id, channel.id)
+        embed = discord.Embed(
+            title="📡 전체 백업 채널 설정 완료",
+            description=f"매일 새벽 5시에 {channel.mention} 로 전체 백업을 올립니다.",
+            color=discord.Color.green())
+        embed.add_field(
+            name="🔒 이 채널은 반드시 비공개로",
+            value="백업 파일에는 **유저 ID · 포인트 · 워터마크**가 들어 있습니다.\n"
+                  "관리자만 볼 수 있는 채널로 두세요.",
+            inline=False)
+        embed.add_field(
+            name="💡 왜 채널에 올리나요",
+            value="DB 안의 백업은 **클러스터·계정 사고 때 같이 사라집니다**.\n"
+                  "PC에만 두면 PC 고장 때 사라집니다.\n"
+                  "디스코드에 있으면 **양쪽 어디에 사고가 나도** 남습니다.",
+            inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class BackupChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(BackupChannelSelect())
+
+    @discord.ui.button(label="설정 해제", style=discord.ButtonStyle.secondary,
+                       emoji="🚫", row=1)
+    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_backup_channel(interaction.guild.id, None)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🚫 전체 백업 채널 해제",
+                description="자동 업로드를 중단했습니다. "
+                            "DB 안의 포인트 스냅샷은 계속 동작합니다.",
+                color=discord.Color.orange()),
+            ephemeral=True)
+
+
 class BackupMenu(discord.ui.Select):
     def __init__(self):
         super().__init__(
@@ -164,6 +286,12 @@ class BackupMenu(discord.ui.Select):
                 discord.SelectOption(
                     label="백업으로 복원하기", value="restore", emoji="♻️",
                     description="포인트가 초기화됐을 때 되돌립니다."),
+                discord.SelectOption(
+                    label="전체 백업 채널 설정", value="chan", emoji="📡",
+                    description="매일 새벽 전체 백업을 올릴 채널을 지정합니다. (권장)"),
+                discord.SelectOption(
+                    label="지금 전체 백업 보내기", value="sendnow", emoji="📤",
+                    description="설정·연동까지 포함한 전체 백업을 채널로 올립니다."),
             ]
         )
 
@@ -230,6 +358,66 @@ class BackupMenu(discord.ui.Select):
                 inline=False)
             await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
+        elif choice == "chan":
+            current = await get_backup_channel(guild_id)
+            ch = interaction.guild.get_channel(int(current)) if current else None
+            embed = discord.Embed(
+                title="📡 전체 백업 채널",
+                description=("현재 채널: " + ch.mention if ch else
+                             "**아직 지정되지 않았습니다.**"),
+                color=discord.Color.blurple() if ch else discord.Color.orange())
+            if current and ch is None:
+                embed.description = (f"지정된 채널(`{current}`)을 찾을 수 없습니다.\n"
+                                     "삭제됐거나 봇이 볼 수 없는 채널입니다.")
+                embed.color = discord.Color.red()
+            embed.add_field(
+                name="📦 무엇이 올라가나요",
+                value="포인트뿐 아니라 **상점 구성 · 뽑기 확률 · 인증 조건 · "
+                      "링크 보호 설정 · 로블록스 연동**까지 전부입니다.",
+                inline=False)
+            embed.add_field(
+                name="🕔 언제",
+                value="매일 새벽 5시(KST), 포인트 스냅샷 직후에 올립니다.",
+                inline=False)
+            await interaction.response.send_message(
+                embed=embed, view=BackupChannelView(), ephemeral=True)
+
+        elif choice == "sendnow":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                ok, info = await send_full_backup(
+                    interaction.client, interaction.guild, reason="manual")
+            except discord.HTTPException as e:
+                # 파일이 첨부 한도를 넘거나 디스코드가 거절한 경우
+                await interaction.followup.send(
+                    f"⚠️ 업로드에 실패했습니다: `{e.status}` {e.text[:200]}",
+                    ephemeral=True)
+                return
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ 백업 중 오류가 발생했습니다: {type(e).__name__}: {e}",
+                    ephemeral=True)
+                return
+
+            if ok:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="📤 전체 백업 업로드 완료",
+                        description=f"`{info}` 파일을 백업 채널에 올렸습니다.",
+                        color=discord.Color.green()),
+                    ephemeral=True)
+            else:
+                why = {
+                    "no-channel": "먼저 `📡 전체 백업 채널 설정`에서 채널을 지정해 주세요.",
+                    "channel-gone": "지정된 채널을 찾을 수 없습니다. 다시 지정해 주세요.",
+                    "no-permission": "그 채널에 **메시지 보내기 · 파일 첨부** 권한이 없습니다.",
+                }.get(info, f"알 수 없는 오류: {info}")
+                await interaction.followup.send(
+                    embed=discord.Embed(title="⚠️ 업로드하지 못했습니다",
+                                        description=why,
+                                        color=discord.Color.orange()),
+                    ephemeral=True)
+
         elif choice == "restore":
             await interaction.response.defer(ephemeral=True, thinking=True)
             snapshots = await list_point_snapshots(guild_id, limit=25)
@@ -291,6 +479,21 @@ class PointBackup(commands.Cog):
                           f"{result.get('error', '알 수 없음')}", flush=True)
             except Exception as e:
                 print(f"[Backup] {guild.name}: 자동 백업 중 오류 - {e}", flush=True)
+
+            # 스냅샷은 같은 클러스터 안에 남습니다. 클러스터·계정 사고까지
+            # 대비하려면 서버 밖에도 있어야 하므로, 지정된 채널에 전체 백업을
+            # 올립니다. 실패해도 스냅샷은 이미 끝났으므로 넘어갑니다.
+            try:
+                ok, info = await send_full_backup(self.bot, guild, reason="auto")
+                if ok:
+                    print(f"[Backup] {guild.name}: 전체 백업 채널 업로드 완료 ({info})",
+                          flush=True)
+                elif info != "no-channel":
+                    print(f"[Backup] {guild.name}: 전체 백업 업로드 실패 - {info}",
+                          flush=True)
+            except Exception as e:
+                print(f"[Backup] {guild.name}: 전체 백업 업로드 중 오류 - "
+                      f"{type(e).__name__}: {e}", flush=True)
 
     @daily_snapshot.before_loop
     async def before_daily_snapshot(self):

@@ -43,6 +43,7 @@ logs_col = None
 blacklist_col = None
 boost_col = None
 snapshot_col = None
+backup_set_col = None
 
 if MONGO_URI:
     try:
@@ -59,6 +60,7 @@ if MONGO_URI:
         blacklist_col = mongo_db["blacklist"]
         boost_col = mongo_db["channel_boosts"]
         snapshot_col = mongo_db["point_snapshots"]
+        backup_set_col = mongo_db["backup_settings"]
         from pymongo import ReturnDocument as _ReturnDocument, UpdateOne as _UpdateOne
         _AFTER = _ReturnDocument.AFTER
 
@@ -100,6 +102,7 @@ if MONGO_URI:
         blacklist_col = None
         boost_col = None
         snapshot_col = None
+        backup_set_col = None
 
 async def _db(fn, *args, **kwargs):
     """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
@@ -1542,3 +1545,137 @@ async def export_points_payload(guild_id: int) -> dict:
     rows.sort(key=lambda r: r["points"], reverse=True)
     return {"taken_at_kst": now_kst, "guild_id": str_gid, "user_count": len(rows),
             "total_points": sum(r["points"] for r in rows), "users": rows}
+
+
+# ── 전체 백업 (서버 밖 보관용) ─────────────────────────────────────────
+#
+# `create_point_snapshot()` 은 포인트만, 그것도 **같은 클러스터 안에** 담습니다.
+# 클러스터나 계정 사고가 나면 스냅샷도 같이 사라지고, 설정(상점 구성 · 인증
+# 조건 · 링크 보호)은 애초에 담기지도 않습니다.
+#
+# 그래서 DB 전체를 파일 하나로 만들어 디스코드 채널에 올려 둡니다.
+# 채널에 올려두면 PC 고장 · Atlas 사고 어느 쪽에도 살아남습니다.
+#
+# 형식은 `tools/full_backup.py` 와 **동일**합니다. 채널에서 받은 파일을
+# 그대로 `restore` 에 넣을 수 있어야 백업으로서 의미가 있습니다.
+
+BACKUP_SET_FILE = os.path.join(DATA_DIR, "backup_settings.json")
+_backup_set_lock = asyncio.Lock()
+
+# 디스코드 첨부 한도(비부스트 25MB)에 여유를 두고, 넘으면 압축합니다.
+FULL_BACKUP_GZIP_OVER = 8 * 1024 * 1024
+
+
+def _encode_bson(o):
+    """ObjectId·datetime 을 타입 보존 형태로 직렬화합니다.
+
+    문자열로 뭉개면 복원했을 때 타입이 달라져 TTL 인덱스(BSON Date 필요)가
+    조용히 죽습니다. tools/full_backup.py 와 같은 규칙을 씁니다.
+    """
+    name = type(o).__name__
+    if name == "ObjectId":
+        return {"$oid": str(o)}
+    if isinstance(o, datetime):
+        return {"$date": o.isoformat()}
+    raise TypeError(f"직렬화할 수 없는 타입: {type(o)}")
+
+
+async def export_full_payload() -> dict:
+    """DB 전체를 파일 본문으로 만듭니다 (모든 컬렉션).
+
+    포인트 시스템과 인증 시스템은 코드가 분리돼 있지만 **같은 DB**에 삽니다.
+    백업은 둘 다 담아야 의미가 있으므로, 여기서는 컬렉션 이름을 DB 에서
+    직접 읽어옵니다. (verify_db 를 import 하지 않습니다 — 경계 유지)
+    """
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    if mongo_db is not None:
+        def _collect():
+            out = {}
+            for name in sorted(mongo_db.list_collection_names()):
+                out[name] = list(mongo_db[name].find())
+            return out
+        try:
+            data = await _db(_collect)
+        except Exception as e:
+            print(f"MongoDB export_full_payload error: {e}", flush=True)
+            data = {}
+    else:
+        # 폴백 모드에서는 data/ 안의 JSON 을 그대로 담습니다.
+        def _collect_files():
+            out = {}
+            if os.path.isdir(DATA_DIR):
+                for fn in sorted(os.listdir(DATA_DIR)):
+                    if not fn.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(DATA_DIR, fn), "r", encoding="utf-8") as f:
+                            out[fn[:-5]] = json.load(f)
+                    except Exception:
+                        continue
+            return out
+        data = await asyncio.to_thread(_collect_files)
+
+    counts = {k: (len(v) if isinstance(v, (list, dict)) else 0) for k, v in data.items()}
+    return {
+        "_meta": {
+            "database": "krbiomehuntbot",
+            "created_kst": now_kst,
+            "collections": counts,
+            "storage_mode": STORAGE_MODE,
+            "note": "전체 덤프 — 유저 ID·포인트 포함. 공개 채널에 올리지 마세요.",
+        },
+        "data": data,
+    }
+
+
+def full_backup_bytes(payload: dict) -> tuple[bytes, str]:
+    """본문을 파일 바이트와 파일명으로 만듭니다. 크면 gzip 으로 압축합니다."""
+    raw = json.dumps(payload, ensure_ascii=False, indent=1,
+                     default=_encode_bson).encode("utf-8")
+    stamp = payload["_meta"]["created_kst"].replace("-", "").replace(" ", "_").replace(":", "")
+    if len(raw) > FULL_BACKUP_GZIP_OVER:
+        import gzip
+        return gzip.compress(raw, 6), f"full_{stamp}.json.gz"
+    return raw, f"full_{stamp}.json"
+
+
+async def get_backup_channel(guild_id: int) -> int | None:
+    """전체 백업을 올릴 채널 ID. 설정 안 됐으면 None."""
+    if backup_set_col is not None:
+        try:
+            doc = await _db(backup_set_col.find_one, {"_id": str(guild_id)})
+            return int(doc["channel_id"]) if doc and doc.get("channel_id") else None
+        except Exception as e:
+            print(f"MongoDB get_backup_channel error: {e}, using local file.", flush=True)
+    async with _backup_set_lock:
+        try:
+            if os.path.exists(BACKUP_SET_FILE):
+                with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                    got = json.load(f).get(str(guild_id), {}).get("channel_id")
+                    return int(got) if got else None
+        except Exception:
+            pass
+    return None
+
+
+async def save_backup_channel(guild_id: int, channel_id: int | None) -> None:
+    """전체 백업을 올릴 채널을 지정합니다. None 이면 해제."""
+    value = str(channel_id) if channel_id else None
+    if backup_set_col is not None:
+        try:
+            await _db(backup_set_col.update_one, {"_id": str(guild_id)},
+                      {"$set": {"channel_id": value}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_backup_channel error: {e}, using local file.", flush=True)
+    async with _backup_set_lock:
+        _ensure_data_dir()
+        try:
+            with open(BACKUP_SET_FILE, "r", encoding="utf-8") as f:
+                allset = json.load(f)
+        except Exception:
+            allset = {}
+        allset.setdefault(str(guild_id), {})["channel_id"] = value
+        with open(BACKUP_SET_FILE, "w", encoding="utf-8") as f:
+            json.dump(allset, f, ensure_ascii=False, indent=2)

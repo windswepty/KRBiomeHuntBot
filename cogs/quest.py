@@ -21,7 +21,7 @@ from utils.database import (
     get_daily_quests, weekly_quests, get_quest_progress,
     quest_progress_value, quest_done, quest_label, claim_quest,
     get_server_goal, mark_server_goal, add_activity_log,
-    quest_channels,
+    quest_channels, goal_min_chat,
     QUEST_KINDS,
 )
 
@@ -276,11 +276,16 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
                                   placeholder="예: 2000", required=True, max_length=8)
     reward = discord.ui.TextInput(label="달성 시 1인당 보상 (P)",
                                   placeholder="예: 300", required=True, max_length=7)
+    min_percent = discord.ui.TextInput(
+        label="본인 최소 참여 (%) · 0이면 조건 없음",
+        placeholder="예: 1  ->  목표 3,000회면 본인이 30회 이상",
+        required=False, max_length=4)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             t = int(str(self.target.value).strip())
             r = int(str(self.reward.value).strip())
+            pct = float(str(self.min_percent.value or "0").strip() or 0)
         except ValueError:
             await interaction.response.send_message("⚠️ 숫자만 입력해 주세요.",
                                                     ephemeral=True)
@@ -289,12 +294,23 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
             await interaction.response.send_message(
                 "⚠️ 목표는 1 이상, 보상은 0 이상이어야 합니다.", ephemeral=True)
             return
+        if not (0 <= pct <= 100):
+            await interaction.response.send_message(
+                "⚠️ 참여 비율은 0~100 사이여야 합니다.", ephemeral=True)
+            return
         await save_quest_settings(interaction.guild.id,
-                                  {"goal_target": t, "goal_reward": r})
+                                  {"goal_target": t, "goal_reward": r,
+                                   "goal_min_percent": pct})
         embed = discord.Embed(title="🤝 공동 목표 변경 완료",
                               color=discord.Color.green())
         embed.add_field(name="목표", value=f"서버 전체 채팅 {t:,}회", inline=True)
         embed.add_field(name="1인당 보상", value=f"{r:,} P", inline=True)
+        fresh = await get_quest_settings(interaction.guild.id)
+        need = goal_min_chat(fresh)
+        embed.add_field(
+            name="🔒 본인 최소 참여",
+            value=(f"{pct:g}% = **{need:,}회 이상**" if need else "조건 없음"),
+            inline=True)
         embed.set_footer(text="목표는 매일 밤 12시(KST)에 초기화됩니다")
         await refresh_panel(interaction, embed)
 
@@ -409,7 +425,8 @@ class QuestSettingsSelect(discord.ui.Select):
                 discord.SelectOption(
                     label="공동 목표 수치", value="goalset", emoji="📊",
                     description=(f"채팅 {settings.get('goal_target', 0):,}회 -> "
-                                 f"1인당 {settings.get('goal_reward', 0):,} P")[:95]),
+                                 f"{settings.get('goal_reward', 0):,} P · "
+                                 f"본인 {goal_min_chat(settings):,}회 이상")[:95]),
                 discord.SelectOption(
                     label="공동 목표 안내 채널", value="goalchannel", emoji="📢",
                     description=(f"현재: #{gch.name}" if gch else "미설정")[:95]),
@@ -529,6 +546,10 @@ class QuestSettingsSelect(discord.ui.Select):
                 value=(f"{'켜짐' if settings.get('goal_enabled') else '꺼짐'} · "
                        f"채팅 {settings.get('goal_target', 0):,}회 -> "
                        f"{settings.get('goal_reward', 0):,} P" + NL
+                       + f"-# 본인 최소 참여: "
+                       + (f"{goal_min_chat(settings):,}회 "
+                          f"({settings.get('goal_min_percent', 0)}%)"
+                          if goal_min_chat(settings) else "조건 없음") + NL
                        + f"-# 안내: {gch.mention if gch else '미설정'}"),
                 inline=False)
             daily_max = (int(settings.get("daily_reward", 0))
@@ -590,11 +611,16 @@ class Quest(commands.Cog):
         progress = state["progress"]
         reached = target > 0 and progress >= target
 
+        need = goal_min_chat(settings)
+        desc = (f"서버 전체가 함께 **채팅 {target:,}회** 를 채우면\n"
+                f"**+{int(settings.get('goal_reward', 0)):,} P** 가 지급됩니다.")
+        if need > 0:
+            desc += (f"\n\n단, 본인도 **{need:,}회 이상** 대화해야 받을 수 있습니다."
+                     f"\n-# 목표치의 {settings.get('goal_min_percent', 0)}% 입니다. "
+                     "다 같이 채운 목표라 최소한의 참여를 요구합니다.")
         embed = discord.Embed(
             title="🤝 오늘의 서버 공동 목표",
-            description=(f"서버 전체가 함께 **채팅 {target:,}회** 를 채우면\n"
-                         f"오늘 퀘스트에 참여한 **모두에게** "
-                         f"**+{int(settings.get('goal_reward', 0)):,} P** 가 지급됩니다."),
+            description=desc,
             color=discord.Color.gold() if reached else discord.Color.blurple())
         pct = (progress / target * 100) if target else 0
         embed.add_field(
@@ -604,7 +630,9 @@ class Quest(commands.Cog):
         if reached:
             embed.add_field(
                 name="🎁 보상 받는 법",
-                value="`/퀘스트` 를 열어 **[보상 받기]** 를 눌러 주세요.",
+                value="`/퀘스트` 를 열어 **[보상 받기]** 를 눌러 주세요."
+                      + (f"\n-# 오늘 **{need:,}회 이상** 대화한 분만 받을 수 있습니다."
+                         if need > 0 else ""),
                 inline=False)
         embed.set_footer(text="매일 밤 12시(KST)에 새로 시작됩니다")
         embed.timestamp = discord.utils.utcnow()
@@ -687,16 +715,33 @@ class Quest(commands.Cog):
             reached = target > 0 and prog >= target
             goal_q = {"id": "g:server", "kind": "server_goal", "goal": target}
             claimed = "g:server" in (progress.get("claimed") or [])
-            if reached and not claimed:
+
+            # 다 같이 채운 목표인데 아무것도 안 한 사람이 똑같이 받으면
+            # 김이 빠집니다. 목표치의 일정 비율은 본인이 채워야 합니다.
+            need = goal_min_chat(settings)
+            mine = int((progress.get("p", {}) or {}).get("chat", 0) or 0)
+            eligible = mine >= need
+
+            if reached and eligible and not claimed:
                 claimable.append((goal_q, False))
-            embed.add_field(
-                name="🤝 서버 공동 목표",
-                value=(f"{'✅' if claimed else ('🎁' if reached else '▫️')} "
-                       f"**서버 전체 채팅 {target:,}회**\n"
-                       f"　　`{min(prog, target):,}/{target:,}`  {_bar(prog, target)}"
-                       + ("  **수령 완료**" if claimed else
-                          ("  **← 받을 수 있습니다**" if reached else ""))),
-                inline=False)
+
+            if claimed:
+                mark, tail = "✅", "  **수령 완료**"
+            elif reached and eligible:
+                mark, tail = "🎁", "  **← 받을 수 있습니다**"
+            elif reached:
+                mark, tail = "🔒", "  **← 참여 조건 미달**"
+            else:
+                mark, tail = "▫️", ""
+
+            lines = [f"{mark} **서버 전체 채팅 {target:,}회**",
+                     f"　　`{min(prog, target):,}/{target:,}`  {_bar(prog, target)}{tail}"]
+            if need > 0:
+                ok = "✅" if eligible else "❌"
+                lines.append(f"　　{ok} 내 채팅 `{min(mine, need):,}/{need:,}`"
+                             f"  -# 목표의 {settings.get('goal_min_percent', 0)}% 이상 참여해야 받습니다")
+            embed.add_field(name="🤝 서버 공동 목표", value=NL.join(lines),
+                            inline=False)
 
         embed.set_footer(text="퀘스트는 사람마다 다릅니다 · 일일은 매일 밤 12시(KST), 주간은 일요일 밤 12시에 새로 시작됩니다")
         await interaction.followup.send(

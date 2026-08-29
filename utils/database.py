@@ -2113,6 +2113,10 @@ DEFAULT_QUEST_SETTINGS = {
     "goal_enabled": False,
     "goal_target": 2000,       # 서버 전체 채팅 수
     "goal_reward": 300,        # 참여자 전원에게
+    # 보상을 받으려면 목표치의 몇 %를 본인이 채워야 하는지.
+    # 목표 3,000회 · 1% 면 본인이 30회는 쳐야 합니다. 아무것도 안 하고
+    # 받아가는 무임승차를 막습니다. 0 이면 조건 없음.
+    "goal_min_percent": 1,
     "goal_channel_id": None,   # 진행도를 보여줄 채널
 }
 
@@ -2500,6 +2504,19 @@ async def take_checkin_rank(guild_id: int) -> int:
         with open(QUEST_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(allst, f, ensure_ascii=False)
         return row["checkin_seq"]
+
+
+def goal_min_chat(settings: dict) -> int:
+    """공동 목표 보상을 받기 위해 **본인이** 쳐야 하는 최소 채팅 수.
+
+    목표치에 비례하므로, 목표를 바꿔도 따로 조정할 필요가 없습니다.
+    """
+    target = int(settings.get("goal_target", 0) or 0)
+    pct = float(settings.get("goal_min_percent", 0) or 0)
+    if target <= 0 or pct <= 0:
+        return 0
+    import math
+    return max(1, math.ceil(target * pct / 100))
 
 
 async def bump_server_goal(guild_id: int, amount: int = 1) -> int:

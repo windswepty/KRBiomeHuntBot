@@ -402,6 +402,71 @@ async def upsert_status_message(bot, guild) -> bool:
     return True
 
 
+class BackupChannelSelect(discord.ui.ChannelSelect):
+    """전체 백업 파일을 올릴 채널을 고릅니다."""
+
+    def __init__(self):
+        super().__init__(placeholder="전체 백업을 올릴 채널을 고르세요...",
+                         channel_types=[discord.ChannelType.text],
+                         min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel = guild.get_channel(self.values[0].id)
+        if channel is None:
+            await interaction.response.send_message(
+                "⚠️ 채널을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        perms = channel.permissions_for(guild.me)
+        missing = []
+        if not perms.send_messages:
+            missing.append("메시지 보내기")
+        if not perms.attach_files:
+            missing.append("파일 첨부")
+        if missing:
+            await interaction.response.send_message(
+                f"⚠️ {channel.mention} 에 **{' · '.join(missing)}** 권한이 없습니다.\n"
+                "봇에게 권한을 주고 다시 지정해 주세요.", ephemeral=True)
+            return
+
+        await save_backup_channel(guild.id, channel.id)
+        embed = discord.Embed(
+            title="📡 전체 백업 채널 설정 완료",
+            description=f"매일 새벽 5시에 {channel.mention} 로 전체 백업을 올립니다.",
+            color=discord.Color.green())
+        embed.add_field(
+            name="🔒 이 채널은 반드시 비공개로",
+            value="백업 파일에는 **유저 ID · 포인트 · 워터마크**가 들어 있습니다.\n"
+                  "관리자만 볼 수 있는 채널로 두세요.",
+            inline=False)
+        embed.add_field(
+            name="💡 왜 채널에 올리나요",
+            value="DB 안의 백업은 **클러스터·계정 사고 때 같이 사라집니다**.\n"
+                  "PC에만 두면 PC 고장 때 사라집니다.\n"
+                  "디스코드에 있으면 **양쪽 어디에 사고가 나도** 남습니다.",
+            inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class BackupChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(BackupChannelSelect())
+
+    @discord.ui.button(label="설정 해제", style=discord.ButtonStyle.secondary,
+                       emoji="🚫", row=1)
+    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_backup_channel(interaction.guild.id, None)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🚫 전체 백업 채널 해제",
+                description="자동 업로드를 중단했습니다. "
+                            "DB 안의 포인트 스냅샷은 계속 동작합니다.",
+                color=discord.Color.orange()),
+            ephemeral=True)
+
+
 class StatusChannelSelect(discord.ui.ChannelSelect):
     """봇 상태 알림을 보낼 채널을 고릅니다."""
 

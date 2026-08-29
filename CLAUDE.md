@@ -63,11 +63,12 @@ import asyncio, utils.verify_db as vdb
 
 | | 포인트 이코노미 | 인증 / 링크 보호 |
 | :--- | :--- | :--- |
-| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` | `verify` `link_guard` |
+| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
-| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` |
+| 보조 모듈 | — | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
+| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
 
-`verify.py` / `link_guard.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
+`verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
 
 ### 데이터 계층 패턴
 
@@ -174,7 +175,13 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 - 캐시는 전부 `_TTLCache`(시간 만료 + 크기 상한)입니다. 무한히 늘어나면 메모리를
   잠식하고, DB TTL이 지운 값을 계속 돌려주게 됩니다.
 
-**중계 리다이렉트를 도입하지 마세요.** Render 무료 플랜은 유휴 시 잠들어 첫 요청에 30~50초가 걸립니다.
+**중계 리다이렉트는 결국 도입했습니다** (`relay_links`, 켜짐). 원래 이 문서는 도입하지
+말라고 했었습니다 — Render 무료 플랜이 유휴 시 잠들어 첫 요청에 30~50초가 걸리기 때문입니다.
+**그 위험은 지금도 그대로입니다.** 버튼에 로블록스 주소를 직접 넣으면 우클릭 한 번으로
+링크가 새는데, 그걸 막으려면 중계가 필수라 감수하기로 한 것입니다.
+
+속도 문제가 재발하면 `/링크보호설정`에서 `relay_links`를 끄면 즉시 예전 방식으로 돌아갑니다.
+**끄는 경로를 제거하지 마세요.** 이게 유일한 탈출구입니다.
 
 ## 이미 밟은 지뢰
 
@@ -193,6 +200,27 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
   새 로그성 컬렉션을 만들 때 **양쪽 경로 모두** 상한을 거세요.
 - **동시 완료 순서는 값의 크기 순이 아닙니다.** 디바운스에 "마지막에 도착한 값"을
   쓰면 20명이 눌렀는데 13명으로 남습니다. 단조 증가하는 값은 **최댓값**을 쓰세요.
+- **디스코드 API는 기본 User-Agent를 막습니다.** `urllib` 의 `Python-urllib/3.x` 로
+  토큰 교환을 시도하면 Cloudflare 가 **403 / error code 1010** 으로 끊습니다.
+  OAuth 가 통째로 실패하는데 원인은 로그에 안 보입니다. UA 를 명시하세요.
+- **`urllib` 예외 계층에 구멍이 있습니다.** 응답을 **읽는 중**에 나는
+  `TimeoutError` `RemoteDisconnected` `IncompleteRead` `SSLError` 는 `URLError` 로
+  감싸지지 않습니다. `except URLError` 만 두면 Flask 500 이 뜨고 진단 로그도 안 남습니다.
+  `OSError` + `http.client.HTTPException` 까지 잡으세요.
+- **Flask 는 GET 라우트에 HEAD 를 자동으로 붙입니다.** 디스코드·카카오톡의 링크
+  미리보기가 HEAD 를 날려 **1회용 토큰을 먼저 소비해 버렸습니다.**
+  유저가 누르면 이미 죽어 있습니다. HEAD 는 204 로 막으세요.
+- **OAuth 왕복 예산(600초) > 토큰 수명(90초).** 신원 확인에 **성공하고도**
+  "만료되었습니다"가 떴습니다. 게이트로 내보내기 직전에 `extend()` 로 늘립니다.
+- **만료 판정은 정리(purge)보다 먼저 조회해야 합니다.** 순서를 바꾸면 방금 만료된
+  토큰이 이미 지워져 "만료됨" 대신 "유효하지 않음"으로 안내됩니다.
+- **`roblox_created_at` 은 유닉스 타임스탬프(int)** 입니다. ISO 문자열이 아닙니다.
+  계정 나이 조건을 붙일 때 문자열로 파싱하면 안 됩니다.
+- **로블록스 앱은 심사 전 10명 제한**입니다. 승인 전에 `require_roblox` 를 켜면
+  11번째 유저부터 인증을 못 받습니다. OAuth 미설정 시 켜지지 않도록 막아 두었지만,
+  **심사 여부까지는 코드가 알 수 없습니다.**
+- **연동 명단 검색어는 반드시 `re.escape` 하세요.** 안 하면 `.*` 한 글자로
+  명단이 통째로 덤프되고, ReDoS 도 열립니다.
 - **레거시 유저 문서 191건** (`_id`가 user_id인 옛 형식)이 아직 있습니다.
   마이그레이션 경로를 지우지 마세요. 그리고 `replace_one`으로 옮기면 그 사이
   적립된 포인트를 덮어씁니다 — 반드시 `$setOnInsert`를 쓰세요.

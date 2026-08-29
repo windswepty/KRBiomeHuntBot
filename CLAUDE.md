@@ -91,7 +91,7 @@ asyncio.run(m())"
 | Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
 | 보조 모듈 | `utils/health.py`(공용) | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
-| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
+| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
 
 `verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
 
@@ -280,6 +280,12 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 **채팅 한 줄마다 DB 를 읽습니다.** 블랙리스트를 캐시하는 것과 같은 이유입니다.
 그리고 기능이 **꺼져 있으면 아예 쓰지 않도록** 순서를 잡으세요 —
 꺼진 기능이 모든 메시지마다 DB 에 쓰고 있던 적이 있습니다.
+
+- **이벤트 진행도는 기간이 깁니다.** `created` 를 `$setOnInsert` 로 고정하면
+  TTL 이 이벤트 도중에 문서를 지웁니다. 이벤트 기간 키(`E…`)일 때는 활동할
+  때마다 `created` 를 갱신해 **마지막 활동 기준**으로 만료되게 합니다.
+- **역할 보상은 포인트 지급 뒤에 줍니다.** 역할 부여가 실패해도 되돌리지 않고
+  무엇이 안 됐는지 알립니다. 되돌리려다 포인트까지 꼬이는 것이 더 나쁩니다.
 
 ## 이미 밟은 지뢰
 

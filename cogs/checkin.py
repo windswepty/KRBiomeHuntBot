@@ -6,7 +6,7 @@ from utils.database import (
     checkin_user, get_user_points, get_top_users, get_user_rank,
     is_user_blacklisted, add_user_points, deduct_user_points, add_activity_log,
     get_checkin_settings, save_checkin_settings, streak_reward, next_cycle_day,
-    bump_quest_progress, take_checkin_rank,
+    bump_quest_progress, take_checkin_rank, bump_event_progress,
 )
 
 def _next_goal(streak: int, settings: dict) -> tuple[int, int] | None:
@@ -319,6 +319,8 @@ class CheckIn(commands.Cog):
                                           "checkin")
                 await bump_quest_progress(interaction.guild.id, interaction.user.id,
                                           "wcheckin", weekly=True)
+                await bump_event_progress(interaction.guild.id,
+                                          interaction.user.id, "checkin")
                 rank = await take_checkin_rank(interaction.guild.id)
                 if rank:
                     # 등수는 누적이 아니라 '그 날의 값'이라 $inc 로 올리면 안 됩니다.

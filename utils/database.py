@@ -59,6 +59,7 @@ checkin_set_col = None
 quest_set_col = None
 quest_prog_col = None
 quest_state_col = None
+event_col = None
 
 if MONGO_URI:
     try:
@@ -80,6 +81,7 @@ if MONGO_URI:
         quest_set_col = mongo_db["quest_settings"]
         quest_prog_col = mongo_db["quest_progress"]
         quest_state_col = mongo_db["quest_state"]
+        event_col = mongo_db["quest_events"]
         from pymongo import ReturnDocument as _ReturnDocument, UpdateOne as _UpdateOne
         _AFTER = _ReturnDocument.AFTER
 
@@ -132,6 +134,7 @@ if MONGO_URI:
         quest_set_col = None
         quest_prog_col = None
         quest_state_col = None
+        event_col = None
 
 async def _db(fn, *args, **kwargs):
     """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
@@ -1415,6 +1418,23 @@ def _read_snapshots() -> dict:
     return {}
 
 
+def _read_json(path: str) -> dict:
+    """JSON 파일을 읽습니다. 없거나 깨졌으면 빈 dict."""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _write_json(path: str, payload: dict) -> None:
+    _ensure_data_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _write_snapshots(payload: dict) -> None:
     _ensure_data_dir()
     with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
@@ -2095,6 +2115,9 @@ QUEST_KINDS = {
 
 DEFAULT_QUEST_SETTINGS = {
     "enabled": False,          # 만들어만 두고 켜는 건 운영진이 결정합니다
+    # 켜면 **관리자만** /퀘스트 를 쓸 수 있습니다. 공개 전에 관리자끼리
+    # 돌려보기 위한 것으로, 유저에게는 '아직 열리지 않았습니다'로 보입니다.
+    "admin_only": False,
     "daily_count": 3,          # 매일 몇 개를 뽑을지
     "weekly_count": 2,         # 주마다 몇 개를 뽑을지
     "daily_reward": 150,       # 일일 퀘스트 1개당 보상
@@ -2207,23 +2230,29 @@ async def save_quest_settings(guild_id: int, patch: dict) -> None:
 
 
 async def bump_quest_progress(guild_id: int, user_id: int, field: str,
-                              amount: int = 1, weekly: bool = False) -> None:
+                              amount: int = 1, weekly: bool = False,
+                              period: str | None = None) -> None:
     """진행도를 원자적으로 올립니다.
 
     ⚠️ 반드시 `$inc` 여야 합니다. 읽고 계산해서 쓰면 채팅이 몰릴 때
     서로를 지워 집계가 뭉개집니다(사용 인원이 80명에서 1명으로 뭉개진 전례).
     """
     key = _quest_key(guild_id, user_id,
-                     quest_week() if weekly else quest_day())
+                     period or (quest_week() if weekly else quest_day()))
     if quest_prog_col is not None:
         try:
-            await _db(quest_prog_col.update_one, {"_id": key},
-                      {"$inc": {f"p.{field}": amount},
-                       "$setOnInsert": {"guild_id": str(guild_id),
-                                        "user_id": str(user_id),
-                                        "period": key.rsplit(":", 1)[-1],
-                                        "created": datetime.now(timezone.utc)}},
-                      upsert=True)
+            upd = {"$inc": {f"p.{field}": amount},
+                   "$setOnInsert": {"guild_id": str(guild_id),
+                                    "user_id": str(user_id),
+                                    "period": key.rsplit(":", 1)[-1]}}
+            if period and period.startswith("E"):
+                # 이벤트는 여러 날에 걸칩니다. created 를 고정하면 이벤트가
+                # 끝나기 전에 TTL 이 문서를 지웁니다. 활동할 때마다 갱신해
+                # **마지막 활동으로부터** 21일 뒤에 지워지게 합니다.
+                upd["$set"] = {"created": datetime.now(timezone.utc)}
+            else:
+                upd["$setOnInsert"]["created"] = datetime.now(timezone.utc)
+            await _db(quest_prog_col.update_one, {"_id": key}, upd, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB bump_quest_progress error: {e}, using local file.", flush=True)
@@ -2259,11 +2288,14 @@ def _trim_quest_progress_local(allp: dict) -> None:
             allp.pop(k, None)
 
 
-async def get_quest_progress(guild_id: int, user_id: int) -> dict:
-    """오늘/이번 주 진행도와 수령 내역을 한 번에 돌려줍니다."""
+async def get_quest_progress(guild_id: int, user_id: int,
+                            periods: list[str] | None = None) -> dict:
+    """오늘/이번 주(+지정한 기간) 진행도와 수령 내역을 한 번에 돌려줍니다."""
     out = {"p": {}, "claimed": []}
     keys = [_quest_key(guild_id, user_id, quest_day()),
             _quest_key(guild_id, user_id, quest_week())]
+    for extra in (periods or []):
+        keys.append(_quest_key(guild_id, user_id, extra))
     if quest_prog_col is not None:
         try:
             def _fetch():
@@ -2288,13 +2320,15 @@ async def get_quest_progress(guild_id: int, user_id: int) -> dict:
 
 
 async def claim_quest(guild_id: int, user_id: int, quest_id: str,
-                      reward: int, weekly: bool = False) -> bool:
+                      reward: int, weekly: bool = False,
+                      period: str | None = None) -> bool:
     """보상을 지급합니다. 이미 받았으면 False (포인트는 나가지 않습니다).
 
     '아직 안 받음'을 **필터 조건**에 넣어 서버 측에서 판정합니다.
     버튼을 연타해도 두 번 지급되지 않습니다.
     """
-    key = _quest_key(guild_id, user_id, quest_week() if weekly else quest_day())
+    key = _quest_key(guild_id, user_id,
+                     period or (quest_week() if weekly else quest_day()))
     if quest_prog_col is not None:
         try:
             doc = await _db(quest_prog_col.find_one_and_update,
@@ -2587,3 +2621,229 @@ async def mark_server_goal(guild_id: int, **patch) -> None:
         allst.setdefault(key, {}).update(patch)
         with open(QUEST_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(allst, f, ensure_ascii=False)
+
+
+# ── 이벤트 퀘스트 ─────────────────────────────────────────────────────
+#
+# 일일·주간과 달리 **기간이 있고 관리자가 직접 만듭니다.**
+# 보상으로 포인트뿐 아니라 역할도 줄 수 있어, 기념 역할 배포에 쓸 수 있습니다.
+#
+# 두 가지 방식을 지원합니다.
+#   tier  단계별  — 하나의 조건을 여러 단계로 (채팅 100/300/1000회)
+#   all   모두달성 — 여러 조건을 전부 (채팅 200 + 뽑기 10 + 출석 5)
+
+EVENT_FILE = os.path.join(DATA_DIR, "quest_events.json")
+_event_lock = asyncio.Lock()
+MAX_EVENTS = 20            # 길드당 보관 개수
+MAX_TIERS = 5              # 이벤트당 단계 수
+MAX_OBJECTIVES = 4         # 이벤트당 조건 수
+
+# 이벤트에서 쓸 수 있는 조건. 일일 퀘스트가 쓰는 카운터를 그대로 재사용하되,
+# 이벤트는 기간 누적이라 별도 문서에 쌓입니다.
+EVENT_KINDS = {
+    "chat":    "채팅 {n}회",
+    "gacha":   "뽑기 {n}회",
+    "checkin": "출석 {n}일",
+}
+
+
+def event_period_key(event_id: str) -> str:
+    """이벤트 진행도의 기간 키. 날짜가 아니라 이벤트 단위로 쌓입니다."""
+    return f"E{event_id}"
+
+
+def event_is_active(ev: dict, when: datetime | None = None) -> bool:
+    """지금이 이벤트 기간 안인지. 날짜는 KST 기준이며 양끝을 포함합니다."""
+    if not ev.get("enabled", True):
+        return False
+    today = (when or datetime.now(KST)).strftime("%Y-%m-%d")
+    starts, ends = ev.get("starts") or "", ev.get("ends") or ""
+    if starts and today < starts:
+        return False
+    if ends and today > ends:
+        return False
+    return True
+
+
+def event_label(ev: dict) -> str:
+    """이벤트 조건을 사람이 읽을 문구로."""
+    if ev.get("mode") == "tier":
+        tpl = EVENT_KINDS.get(ev.get("kind"), "{n}")
+        return tpl.replace("{n}", "누적")
+    return "여러 조건 모두 달성"
+
+
+async def list_events(guild_id: int) -> list[dict]:
+    """이 길드의 이벤트 전부 (최신순)."""
+    str_gid = str(guild_id)
+    if event_col is not None:
+        try:
+            def _fetch():
+                return list(event_col.find({"guild_id": str_gid})
+                            .sort("_id", -1).limit(MAX_EVENTS))
+            return [{k: v for k, v in d.items() if k != "_id"} | {"id": d["_id"].split(":")[-1]}
+                    for d in await _db(_fetch)]
+        except Exception as e:
+            print(f"MongoDB list_events error: {e}, using local file.", flush=True)
+    async with _event_lock:
+        rows = _read_json(EVENT_FILE)
+    out = [dict(v) | {"id": k.split(":")[-1]}
+           for k, v in rows.items() if v.get("guild_id") == str_gid]
+    out.sort(key=lambda x: x.get("created", ""), reverse=True)
+    return out[:MAX_EVENTS]
+
+
+async def get_event(guild_id: int, event_id: str) -> dict | None:
+    key = f"{guild_id}:{event_id}"
+    if event_col is not None:
+        try:
+            doc = await _db(event_col.find_one, {"_id": key})
+            if doc:
+                return {k: v for k, v in doc.items() if k != "_id"} | {"id": event_id}
+            return None
+        except Exception as e:
+            print(f"MongoDB get_event error: {e}, using local file.", flush=True)
+    async with _event_lock:
+        row = _read_json(EVENT_FILE).get(key)
+    return (dict(row) | {"id": event_id}) if row else None
+
+
+async def save_event(guild_id: int, event_id: str, data: dict) -> None:
+    """이벤트를 저장합니다. 같은 id 면 덮어씁니다."""
+    _active_events_cache.pop(str(guild_id))   # 변경 즉시 반영
+    key = f"{guild_id}:{event_id}"
+    payload = dict(data)
+    payload["guild_id"] = str(guild_id)
+    payload.setdefault("created", datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"))
+    payload.pop("id", None)
+    if event_col is not None:
+        try:
+            await _db(event_col.update_one, {"_id": key}, {"$set": payload}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_event error: {e}, using local file.", flush=True)
+    async with _event_lock:
+        _ensure_data_dir()
+        rows = _read_json(EVENT_FILE)
+        rows[key] = payload
+        # 길드당 상한 — Mongo 경로는 조회에서 limit 을 걸지만, 파일은 계속
+        # 늘어나므로 여기서 잘라야 합니다. (양쪽 모두에 상한을 거는 규칙)
+        mine = sorted([k for k, v in rows.items() if v.get("guild_id") == str(guild_id)],
+                      key=lambda k: rows[k].get("created", ""), reverse=True)
+        for old in mine[MAX_EVENTS:]:
+            rows.pop(old, None)
+        _write_json(EVENT_FILE, rows)
+
+
+async def delete_event(guild_id: int, event_id: str) -> bool:
+    _active_events_cache.pop(str(guild_id))
+    key = f"{guild_id}:{event_id}"
+    if event_col is not None:
+        try:
+            res = await _db(event_col.delete_one, {"_id": key})
+            return bool(getattr(res, "deleted_count", 0))
+        except Exception as e:
+            print(f"MongoDB delete_event error: {e}, using local file.", flush=True)
+    async with _event_lock:
+        rows = _read_json(EVENT_FILE)
+        existed = key in rows
+        rows.pop(key, None)
+        _write_json(EVENT_FILE, rows)
+    return existed
+
+
+async def active_events(guild_id: int) -> list[dict]:
+    """지금 기간 안인 이벤트만."""
+    return [e for e in await list_events(guild_id) if event_is_active(e)]
+
+
+# 활성 이벤트 목록도 모든 메시지 경로에서 조회됩니다. 캐시가 없으면
+# 채팅 한 줄마다 DB 를 읽습니다(퀘스트 설정과 같은 이유).
+_active_events_cache = _TTLCache(ttl_seconds=60, max_items=8)
+
+
+async def bump_event_progress(guild_id: int, user_id: int, kind: str,
+                              amount: int = 1) -> None:
+    """진행 중인 이벤트들의 해당 조건 진행도를 올립니다.
+
+    이벤트는 보통 0~1개라 추가 비용이 거의 없습니다. 목록은 60초 캐시라
+    메시지마다 DB 를 읽지 않습니다.
+    """
+    cached = _active_events_cache.get(str(guild_id))
+    if cached is None:
+        cached = await active_events(guild_id)
+        _active_events_cache.set(str(guild_id), cached)
+    for ev in cached:
+        # 이 이벤트가 그 조건을 쓰는지 확인 — 안 쓰면 셀 필요가 없습니다.
+        if ev.get("mode") == "tier":
+            if ev.get("kind") != kind:
+                continue
+        elif not any(o.get("kind") == kind for o in (ev.get("objectives") or [])):
+            continue
+        await bump_quest_progress(guild_id, user_id, f"ev_{kind}", amount,
+                                  period=event_period_key(ev["id"]))
+
+
+def invalidate_events(guild_id: int) -> None:
+    """이벤트를 만들거나 고치면 즉시 반영되도록 캐시를 비웁니다."""
+    _active_events_cache.pop(str(guild_id))
+
+
+def event_progress_value(ev: dict, progress: dict, kind: str | None = None) -> int:
+    """이벤트 진행도. 단계별이면 그 조건, 모두달성이면 지정한 조건."""
+    p = progress.get("p", {}) or {}
+    field = kind or ev.get("kind") or "chat"
+    return int(p.get(f"ev_{field}", 0) or 0)
+
+
+def event_status(ev: dict, progress: dict) -> dict:
+    """이벤트 달성 상황을 한 번에 계산합니다.
+
+    반환값:
+        mode      "tier" | "all"
+        rows      [{label, value, goal, done, claimed, points, role_id, id}]
+        all_done  (모두달성 방식에서) 전부 깼는지
+    """
+    claimed = set(progress.get("claimed") or [])
+    eid = ev.get("id", "")
+    rows = []
+
+    if ev.get("mode") == "tier":
+        value = event_progress_value(ev, progress)
+        tpl = EVENT_KINDS.get(ev.get("kind"), "{n}")
+        for i, t in enumerate(ev.get("tiers") or []):
+            goal = int(t.get("goal", 0) or 0)
+            qid = f"e:{eid}:{i}"
+            rows.append({
+                "id": qid,
+                "label": tpl.replace("{n}", f"{goal:,}"),
+                "value": value, "goal": goal,
+                "done": goal > 0 and value >= goal,
+                "claimed": qid in claimed,
+                "points": int(t.get("points", 0) or 0),
+                "role_id": t.get("role_id"),
+            })
+        return {"mode": "tier", "rows": rows, "all_done": False}
+
+    # 모두달성
+    all_done = True
+    for i, o in enumerate(ev.get("objectives") or []):
+        kind = o.get("kind", "chat")
+        goal = int(o.get("goal", 0) or 0)
+        value = event_progress_value(ev, progress, kind)
+        done = goal > 0 and value >= goal
+        all_done = all_done and done
+        rows.append({
+            "id": f"e:{eid}:o{i}",
+            "label": EVENT_KINDS.get(kind, "{n}").replace("{n}", f"{goal:,}"),
+            "value": value, "goal": goal, "done": done,
+            "claimed": False, "points": 0, "role_id": None,
+        })
+    if not rows:
+        all_done = False
+    reward = ev.get("reward") or {}
+    return {"mode": "all", "rows": rows, "all_done": all_done,
+            "reward_id": f"e:{eid}:all",
+            "reward_claimed": f"e:{eid}:all" in claimed,
+            "points": int(reward.get("points", 0) or 0),
+            "role_id": reward.get("role_id")}

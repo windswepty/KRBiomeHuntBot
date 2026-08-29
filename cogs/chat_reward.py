@@ -8,7 +8,7 @@ from utils.database import (
     set_channel_boost, get_channel_boost, get_all_active_boosts, add_activity_log,
     check_and_clear_expired_boosts,
     bump_quest_progress, get_quest_settings, bump_server_goal,
-    quest_channels, channel_field,
+    quest_channels, channel_field, bump_event_progress,
 )
 
 
@@ -409,6 +409,7 @@ class ChatReward(commands.Cog):
                         channel_field(message.channel.id, weekly=True), weekly=True)
                 if settings.get("goal_enabled"):
                     await bump_server_goal(message.guild.id)
+                await bump_event_progress(message.guild.id, message.author.id, "chat")
         except Exception as e:
             print(f"[Quest] 채팅 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
 

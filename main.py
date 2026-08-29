@@ -1,9 +1,11 @@
 import os
+import sys
 import asyncio
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from keep_alive import keep_alive
+from utils import health
 
 # Load environment variables
 load_dotenv()
@@ -16,6 +18,12 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# 무인 운영 전제입니다. 관리자가 오래 자리를 비워도 스스로 살아나야 하므로,
+# 이상을 발견하면 사람을 기다리지 않고 프로세스를 끝냅니다.
+# 호스팅(Render)이 죽은 프로세스를 자동으로 새로 띄웁니다.
+WATCHDOG_INTERVAL = 60          # 초
+
+
 @bot.event
 async def on_ready():
     print(f"==========================================", flush=True)
@@ -24,40 +32,143 @@ async def on_ready():
 
     # 포인트가 어디에 저장되는지 매 기동마다 눈에 보이게 남깁니다.
     # 임시 저장소로 떨어진 채 운영되면 유저 포인트가 사라지기 때문입니다.
+    storage = "unknown"
     try:
         from utils.database import storage_status, STORAGE_MODE
+        storage = STORAGE_MODE
         print(f"Point storage: {storage_status()}", flush=True)
         if STORAGE_MODE != "mongo":
             print("*** 포인트가 영구 저장되지 않는 상태입니다. 즉시 확인하세요. ***", flush=True)
     except Exception as e:
         print(f"Storage status check failed: {e}", flush=True)
     print(f"==========================================", flush=True)
-    
+
+    health.mark_ready(len(bot.guilds), storage)
+
     # Sync Slash Commands
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s).", flush=True)
     except Exception as e:
         print(f"Failed to sync slash commands: {e}", flush=True)
+        health.add_note(f"슬래시 명령어 동기화 실패: {e}")
+
+    if not watchdog.is_running():
+        watchdog.start()
+
+
+# ── 연결 상태 추적 ────────────────────────────────────────────────────
+# discord.py 는 끊기면 스스로 재접속합니다. 아래 이벤트는 그 과정을
+# 기록해 두기 위한 것이고, 재접속이 끝내 안 되는 경우만 watchdog 이 잡습니다.
+
+@bot.event
+async def on_disconnect():
+    health.mark_disconnected()
+
+
+@bot.event
+async def on_resumed():
+    health.mark_resumed()
+    print("[Watchdog] 게이트웨이 재연결됨", flush=True)
+
+
+@tasks.loop(seconds=WATCHDOG_INTERVAL)
+async def watchdog():
+    """스스로 생존을 확인하고, 회복이 안 되면 재시작합니다.
+
+    좀비 상태(프로세스는 살아 있는데 디스코드 연결만 죽은 경우)는 호스팅이
+    감지하지 못합니다. 프로세스가 멀쩡하기 때문입니다. 그래서 봇이 직접
+    판단해 끝내야 합니다.
+    """
+    try:
+        if bot.is_closed():
+            health.mark_disconnected()
+        else:
+            latency = bot.latency          # 끊겨 있으면 nan/inf
+            if latency == latency and latency != float("inf"):
+                health.mark_connected(latency * 1000)
+            else:
+                health.mark_disconnected()
+
+        if health.should_restart():
+            secs = round(health.unhealthy_seconds())
+            health.hard_exit(f"디스코드 연결이 {secs}초째 끊겨 있습니다")
+    except Exception as e:
+        # 감시 자체가 죽으면 감시가 없는 것과 같습니다. 절대 조용히 넘기지 않습니다.
+        print(f"[Watchdog] 점검 중 오류: {type(e).__name__}: {e}", flush=True)
+
+
+@watchdog.before_loop
+async def before_watchdog():
+    await bot.wait_until_ready()
+
 
 async def load_cogs():
     os.makedirs("cogs", exist_ok=True)
-    for filename in os.listdir("./cogs"):
+    failed = []
+    for filename in sorted(os.listdir("./cogs")):
         if filename.endswith(".py") and not filename.startswith("__"):
             try:
                 await bot.load_extension(f"cogs.{filename[:-3]}")
                 print(f"Loaded extension: cogs.{filename[:-3]}", flush=True)
             except Exception as e:
+                failed.append(filename[:-3])
                 print(f"Failed to load extension cogs.{filename[:-3]}: {e}", flush=True)
+    if failed:
+        # 일부만 동작하는 봇이라도 아예 없는 것보다는 낫습니다. 다만 조용히
+        # 넘어가면 무인 운영 중에 아무도 모르므로 헬스 응답에 남깁니다.
+        health.add_note(f"로드 실패한 기능: {', '.join(failed)}")
+
+
+def check_storage_or_die() -> None:
+    """MONGO_URI 를 줬는데 접속이 안 되면 **차라리 죽습니다**.
+
+    폴백(로컬 JSON)으로 조용히 넘어가면 봇은 정상처럼 보이는데 Render
+    파일시스템은 휘발성이라 재시작 때 포인트가 전부 사라집니다. 무인
+    운영에서는 아무도 눈치채지 못하고 며칠치가 날아갈 수 있습니다.
+
+    멈춰 있으면 호스팅이 재시작을 반복하고, Atlas 가 돌아오면 저절로
+    복구됩니다. **틀린 데이터로 도는 것보다 잠깐 멈추는 편이 낫습니다.**
+    """
+    if not (os.getenv("MONGO_URI") or "").strip():
+        print("MONGO_URI 가 설정되지 않았습니다. 로컬 파일 모드로 실행합니다.", flush=True)
+        return
+    try:
+        from utils.database import STORAGE_MODE
+    except Exception as e:
+        print(f"저장소 상태를 확인할 수 없습니다: {e}", flush=True)
+        return
+    if STORAGE_MODE != "mongo":
+        print("=" * 60, flush=True)
+        print("MONGO_URI 가 설정돼 있는데 MongoDB 에 접속하지 못했습니다.", flush=True)
+        print("이 상태로 계속 돌면 포인트가 임시 파일에 쌓였다가 사라집니다.", flush=True)
+        print("데이터를 지키기 위해 기동을 중단합니다. 잠시 후 자동으로 다시 시도합니다.", flush=True)
+        print("=" * 60, flush=True)
+        sys.stdout.flush()
+        os._exit(1)
+
 
 async def main():
+    check_storage_or_die()
+    if not TOKEN:
+        print("ERROR: DISCORD_TOKEN is not set in .env file!", flush=True)
+        sys.exit(1)
     async with bot:
         await load_cogs()
         keep_alive()
-        if not TOKEN:
-            print("ERROR: DISCORD_TOKEN is not set in .env file!")
-            return
         await bot.start(TOKEN)
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        # 어떤 이유로든 떨어지면 **실패로 끝내야** 호스팅이 다시 띄웁니다.
+        # 조용히 0 으로 끝나면 '정상 종료'로 보고 그대로 멈춰 있을 수 있습니다.
+        print(f"FATAL: {type(e).__name__}: {e}", flush=True)
+        sys.exit(1)
+    # 정상 흐름으로 여기까지 왔다는 것은 봇이 스스로 종료된 것입니다.
+    # 무인 운영에서는 이것도 비정상이므로 재시작을 유도합니다.
+    sys.exit(1)

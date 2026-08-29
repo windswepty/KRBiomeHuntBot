@@ -7,6 +7,7 @@ from flask import Flask, redirect, request, Response, make_response
 from utils import link_tokens
 from utils.link_tokens import redeem, peek_owner
 from utils import oauth_gate, roblox_oauth
+from utils import health
 
 app = Flask(__name__)
 
@@ -16,8 +17,37 @@ log.setLevel(logging.ERROR)
 
 
 @app.route('/')
+@app.route('/health')
 def home():
-    return "KRBiomeHuntBot is alive!"
+    """생존 확인 — **디스코드 연결 상태까지** 반영합니다.
+
+    예전에는 무조건 "alive" 를 돌려줬습니다. 그래서 Flask 만 살고 디스코드
+    연결이 끊긴 **좀비 상태**를 외부 감시 서비스가 정상으로 판정했고,
+    아무도 모르는 채 봇만 멈춰 있었습니다.
+
+    이상하면 503 을 돌려주므로 UptimeRobot 같은 감시 서비스가 알림을 보냅니다.
+    (그와 별개로 봇 스스로도 일정 시간 뒤 재시작합니다)
+    """
+    st = health.snapshot()
+    ok = health.is_healthy()
+    body = {
+        "status": "ok" if ok else "unhealthy",
+        "ready": st["ready"],
+        "connected": st["connected"],
+        "guilds": st["guilds"],
+        "latency_ms": st["latency_ms"],
+        "storage": st["storage"],
+        "uptime_seconds": st["uptime_seconds"],
+        "disconnects": st["disconnects"],
+    }
+    if st["notes"]:
+        body["notes"] = st["notes"]
+    if not ok:
+        body["unhealthy_seconds"] = round(health.unhealthy_seconds())
+
+    resp = make_response(body, 200 if ok else 503)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ── 개인서버 링크 중계 ────────────────────────────────────────────────

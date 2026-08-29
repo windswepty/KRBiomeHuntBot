@@ -390,11 +390,13 @@ class ChatReward(commands.Cog):
         # 기준이 다르면 "채팅했는데 퀘스트가 안 오른다"는 혼란이 생깁니다.
         # 실패해도 채팅 적립을 막지 않도록 통째로 감쌉니다.
         try:
-            await bump_quest_progress(message.guild.id, message.author.id, "chat")
-            await bump_quest_progress(message.guild.id, message.author.id,
-                                      "wchat", weekly=True)
+            # 켜져 있을 때만 씁니다. 꺼져 있는데도 진행도를 쌓으면 모든 메시지가
+            # 쓸모없는 DB 쓰기가 됩니다. (설정 조회는 캐시라 매번 DB 를 보지 않습니다)
             settings = await get_quest_settings(message.guild.id)
             if settings.get("enabled"):
+                await bump_quest_progress(message.guild.id, message.author.id, "chat")
+                await bump_quest_progress(message.guild.id, message.author.id,
+                                          "wchat", weekly=True)
                 target = settings.get("channel_id")
                 if target and str(message.channel.id) == str(target):
                     await bump_quest_progress(message.guild.id, message.author.id,

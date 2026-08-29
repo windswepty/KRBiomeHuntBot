@@ -196,6 +196,10 @@ class _TTLCache:
 _blacklist_cache = _TTLCache(ttl_seconds=300, max_items=64)
 # 채널 부스트도 메시지마다 조회됩니다. 설정 변경 시 무효화합니다.
 _boost_cache = _TTLCache(ttl_seconds=30, max_items=500)
+# 퀘스트 설정은 **모든 메시지마다** 조회됩니다. 캐시가 없으면 채팅 한 줄마다
+# DB 를 한 번씩 읽습니다(블랙리스트를 캐시하는 것과 같은 이유).
+# save_quest_settings() 가 즉시 무효화하므로 설정 변경은 바로 반영됩니다.
+_quest_settings_cache = _TTLCache(ttl_seconds=60, max_items=8)
 
 
 async def _ensure_user_doc(guild_id: int, user_id: int) -> dict:
@@ -2134,6 +2138,9 @@ def _quest_key(guild_id: int, user_id: int, period_key: str) -> str:
 
 
 async def get_quest_settings(guild_id: int) -> dict:
+    cached = _quest_settings_cache.get(str(guild_id))
+    if cached is not None:
+        return copy.deepcopy(cached)
     merged = copy.deepcopy(DEFAULT_QUEST_SETTINGS)
     if quest_set_col is not None:
         try:
@@ -2146,7 +2153,8 @@ async def get_quest_settings(guild_id: int) -> dict:
                         merged["goals"].update(v)
                     else:
                         merged[k] = v
-            return merged
+            _quest_settings_cache.set(str(guild_id), merged)
+            return copy.deepcopy(merged)
         except Exception as e:
             print(f"MongoDB get_quest_settings error: {e}, using local file.", flush=True)
     async with _quest_lock:
@@ -2161,10 +2169,12 @@ async def get_quest_settings(guild_id: int) -> dict:
                         merged[k] = v
         except Exception:
             pass
-    return merged
+    _quest_settings_cache.set(str(guild_id), merged)
+    return copy.deepcopy(merged)
 
 
 async def save_quest_settings(guild_id: int, patch: dict) -> None:
+    _quest_settings_cache.pop(str(guild_id))   # 설정 변경을 즉시 반영
     if quest_set_col is not None:
         try:
             await _db(quest_set_col.update_one, {"_id": str(guild_id)},

@@ -6,6 +6,7 @@ from utils.database import (
     checkin_user, get_user_points, get_top_users, get_user_rank,
     is_user_blacklisted, add_user_points, deduct_user_points, add_activity_log,
     get_checkin_settings, save_checkin_settings, streak_reward, next_cycle_day,
+    bump_quest_progress, take_checkin_rank,
 )
 
 def _next_goal(streak: int, settings: dict) -> tuple[int, int] | None:
@@ -265,6 +266,24 @@ class CheckIn(commands.Cog):
         total_points = result["points"]
         streak = result["streak"]
 
+        # 퀘스트 진행도. **출석에 실제로 성공했을 때만** 셉니다. 이미 출석한
+        # 사람이 명령어를 또 쳐도 선착순 번호가 올라가면 안 됩니다.
+        rank = None
+        if result["ok"]:
+            try:
+                await bump_quest_progress(interaction.guild.id, interaction.user.id,
+                                          "checkin")
+                await bump_quest_progress(interaction.guild.id, interaction.user.id,
+                                          "wcheckin", weekly=True)
+                rank = await take_checkin_rank(interaction.guild.id)
+                if rank:
+                    # 등수는 누적이 아니라 '그 날의 값'이라 $inc 로 올리면 안 됩니다.
+                    # 0 에서 시작하므로 등수를 그대로 더해 한 번만 기록합니다.
+                    await bump_quest_progress(interaction.guild.id, interaction.user.id,
+                                              "rank", amount=rank)
+            except Exception as e:
+                print(f"[Quest] 출석 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
+
         if result["ok"]:
             # 어떻게 이 숫자가 나왔는지 그대로 보여줍니다. 연속이 이득이라는
             # 걸 눈으로 봐야 다음 날 또 오게 됩니다.
@@ -293,6 +312,9 @@ class CheckIn(commands.Cog):
                     value=f"**{days}일** 연속까지 **{days - streak}일** 남았습니다 "
                           f"(보상 **+{reward:,} P**)",
                     inline=False)
+            if rank:
+                embed.add_field(name="🏃 오늘 출석 순번",
+                                value=f"**{rank}번째**", inline=True)
             embed.set_footer(text="하루라도 거르면 연속이 처음부터 다시 시작됩니다")
 
             if result["milestone"]:

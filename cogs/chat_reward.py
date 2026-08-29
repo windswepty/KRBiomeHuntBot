@@ -6,7 +6,8 @@ from discord import app_commands
 from utils.database import (
     process_chat_message, is_user_blacklisted,
     set_channel_boost, get_channel_boost, get_all_active_boosts, add_activity_log,
-    check_and_clear_expired_boosts
+    check_and_clear_expired_boosts,
+    bump_quest_progress, get_quest_settings, bump_server_goal,
 )
 
 
@@ -384,6 +385,24 @@ class ChatReward(commands.Cog):
         await process_chat_message(
             message.guild.id, message.author.id, message.channel.id
         )
+
+        # 퀘스트 진행도. 포인트 지급과 **같은 필터를 통과한 메시지만** 셉니다.
+        # 기준이 다르면 "채팅했는데 퀘스트가 안 오른다"는 혼란이 생깁니다.
+        # 실패해도 채팅 적립을 막지 않도록 통째로 감쌉니다.
+        try:
+            await bump_quest_progress(message.guild.id, message.author.id, "chat")
+            await bump_quest_progress(message.guild.id, message.author.id,
+                                      "wchat", weekly=True)
+            settings = await get_quest_settings(message.guild.id)
+            if settings.get("enabled"):
+                target = settings.get("channel_id")
+                if target and str(message.channel.id) == str(target):
+                    await bump_quest_progress(message.guild.id, message.author.id,
+                                              "channel_chat")
+                if settings.get("goal_enabled"):
+                    await bump_server_goal(message.guild.id)
+        except Exception as e:
+            print(f"[Quest] 채팅 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
 
     @app_commands.command(name="채널부스트", description="[관리자 전용] 게릴라 채널 부스트 설정, 배율, 기간 및 해제를 관리합니다.")
     @app_commands.default_permissions(administrator=True)

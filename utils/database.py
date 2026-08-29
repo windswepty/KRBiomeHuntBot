@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import time
 import asyncio
@@ -26,6 +27,16 @@ _blacklist_lock = asyncio.Lock()
 _boost_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
+# 퀘스트 진행도는 유저×날짜라 계속 늘어납니다. **양쪽 경로 모두에** 상한을
+# 겁니다 (Mongo 는 TTL 인덱스, JSON 은 _trim_quest_progress_local).
+# ⚠️ 이 상수는 아래 인덱스 생성보다 **먼저** 정의돼야 합니다. 뒤에 두면
+#    NameError 가 try/except 에 삼켜져 TTL 이 조용히 안 걸립니다.
+QUEST_PROGRESS_TTL_DAYS = 21
+
+# pymongo 의 ReturnDocument.AFTER. `if MONGO_URI:` 블록 안에서만 정의하면
+# 폴백 모드에서 NameError 가 납니다. 항상 존재하도록 미리 둡니다.
+_AFTER = None
+
 # MongoDB setup
 # 저장 모드 — 포인트가 어디에 쌓이는지 나타냅니다.
 #   "mongo"      : 영구 보존 (정상)
@@ -45,6 +56,9 @@ boost_col = None
 snapshot_col = None
 backup_set_col = None
 checkin_set_col = None
+quest_set_col = None
+quest_prog_col = None
+quest_state_col = None
 
 if MONGO_URI:
     try:
@@ -63,6 +77,9 @@ if MONGO_URI:
         snapshot_col = mongo_db["point_snapshots"]
         backup_set_col = mongo_db["backup_settings"]
         checkin_set_col = mongo_db["checkin_settings"]
+        quest_set_col = mongo_db["quest_settings"]
+        quest_prog_col = mongo_db["quest_progress"]
+        quest_state_col = mongo_db["quest_state"]
         from pymongo import ReturnDocument as _ReturnDocument, UpdateOne as _UpdateOne
         _AFTER = _ReturnDocument.AFTER
 
@@ -77,6 +94,12 @@ if MONGO_URI:
             logs_col.create_index([("guild_id", 1), ("_id", -1)], name="logs_recent")
             # 포인트 스냅샷 최신순 조회
             snapshot_col.create_index([("guild_id", 1), ("_id", -1)], name="snap_recent")
+            # 퀘스트 진행도는 유저×날짜라 계속 늘어납니다. 봇이 꺼져 있어도
+            # 서버가 지우도록 TTL 을 겁니다 (JSON 폴백에는 별도 trim 이 있습니다).
+            quest_prog_col.create_index("created", name="quest_prog_ttl",
+                                        expireAfterSeconds=QUEST_PROGRESS_TTL_DAYS * 86400)
+            quest_state_col.create_index("created", name="quest_state_ttl",
+                                         expireAfterSeconds=QUEST_PROGRESS_TTL_DAYS * 86400)
         except Exception as e:
             print(f"MongoDB index setup warning: {e}", flush=True)
 
@@ -106,6 +129,9 @@ if MONGO_URI:
         snapshot_col = None
         backup_set_col = None
         checkin_set_col = None
+        quest_set_col = None
+        quest_prog_col = None
+        quest_state_col = None
 
 async def _db(fn, *args, **kwargs):
     """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
@@ -2033,3 +2059,432 @@ async def save_checkin_settings(guild_id: int, patch: dict) -> None:
         allset.setdefault(str(guild_id), {}).update(patch)
         with open(CHECKIN_SET_FILE, "w", encoding="utf-8") as f:
             json.dump(allset, f, ensure_ascii=False, indent=2)
+
+
+# ── 퀘스트 ────────────────────────────────────────────────────────────
+#
+# 채팅·출석만으로는 포인트가 잘 모이지 않아 만든 수급처입니다.
+# 미리 만들어 둔 풀에서 **매일 무작위로 몇 개를 뽑아** 제시합니다.
+# 고정 목록이면 며칠 만에 지루해지기 때문입니다.
+#
+# 진행도는 전부 `$inc` 로만 올립니다. 읽고 계산해서 쓰면 동시 요청끼리
+# 서로를 지웁니다(포인트와 같은 이유). 보상 수령도 '아직 안 받음'을
+# **필터 조건**에 넣어 서버 측에서 판정합니다.
+
+QUEST_SET_FILE = os.path.join(DATA_DIR, "quest_settings.json")
+QUEST_PROG_FILE = os.path.join(DATA_DIR, "quest_progress.json")
+QUEST_STATE_FILE = os.path.join(DATA_DIR, "quest_state.json")
+_quest_lock = asyncio.Lock()
+
+# 퀘스트 종류. key 는 저장값이라 바꾸면 기존 데이터와 어긋납니다.
+QUEST_KINDS = {
+    "chat":        {"label": "채팅 {n}회 보내기",           "unit": "회", "period": "daily"},
+    "checkin":     {"label": "출석하기",                    "unit": "회", "period": "daily"},
+    "channel_chat":{"label": "지정 채널에서 {n}회 대화하기", "unit": "회", "period": "daily"},
+    "gacha":       {"label": "뽑기 {n}회 돌리기",           "unit": "회", "period": "daily"},
+    "early_bird":  {"label": "출석 선착순 {n}등 안에 들기",  "unit": "등", "period": "daily"},
+    "week_checkin":{"label": "이번 주 {n}일 출석하기",       "unit": "일", "period": "weekly"},
+    "week_chat":   {"label": "이번 주 채팅 {n}회 보내기",    "unit": "회", "period": "weekly"},
+}
+
+DEFAULT_QUEST_SETTINGS = {
+    "enabled": False,          # 만들어만 두고 켜는 건 운영진이 결정합니다
+    "daily_count": 3,          # 매일 몇 개를 뽑을지
+    "daily_reward": 150,       # 일일 퀘스트 1개당 보상
+    "weekly_reward": 800,      # 주간 퀘스트 1개당 보상
+    "channel_id": None,        # channel_chat 대상 채널
+    # 종류별 목표치. 슬로우모드 5초 기준으로 잡은 기본값입니다.
+    "goals": {"chat": 20, "channel_chat": 10, "gacha": 2,
+              "early_bird": 20, "week_checkin": 5, "week_chat": 150},
+    # 풀에서 제외할 종류 (운영진이 끄고 싶을 때)
+    "disabled_kinds": [],
+    # 서버 공동 목표
+    "goal_enabled": False,
+    "goal_target": 2000,       # 서버 전체 채팅 수
+    "goal_reward": 300,        # 참여자 전원에게
+    "goal_channel_id": None,   # 진행도를 보여줄 채널
+}
+
+
+def quest_day(when: datetime | None = None) -> str:
+    return (when or datetime.now(KST)).strftime("%Y-%m-%d")
+
+
+def quest_week(when: datetime | None = None) -> str:
+    """ISO 주차 키. 월요일 시작이라 '이번 주'의 경계가 분명합니다."""
+    d = when or datetime.now(KST)
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _quest_key(guild_id: int, user_id: int, period_key: str) -> str:
+    return f"{guild_id}:{user_id}:{period_key}"
+
+
+async def get_quest_settings(guild_id: int) -> dict:
+    merged = copy.deepcopy(DEFAULT_QUEST_SETTINGS)
+    if quest_set_col is not None:
+        try:
+            doc = await _db(quest_set_col.find_one, {"_id": str(guild_id)})
+            if doc:
+                for k, v in doc.items():
+                    if k == "_id":
+                        continue
+                    if k == "goals" and isinstance(v, dict):
+                        merged["goals"].update(v)
+                    else:
+                        merged[k] = v
+            return merged
+        except Exception as e:
+            print(f"MongoDB get_quest_settings error: {e}, using local file.", flush=True)
+    async with _quest_lock:
+        try:
+            if os.path.exists(QUEST_SET_FILE):
+                with open(QUEST_SET_FILE, "r", encoding="utf-8") as f:
+                    row = json.load(f).get(str(guild_id), {})
+                for k, v in row.items():
+                    if k == "goals" and isinstance(v, dict):
+                        merged["goals"].update(v)
+                    else:
+                        merged[k] = v
+        except Exception:
+            pass
+    return merged
+
+
+async def save_quest_settings(guild_id: int, patch: dict) -> None:
+    if quest_set_col is not None:
+        try:
+            await _db(quest_set_col.update_one, {"_id": str(guild_id)},
+                      {"$set": patch}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_quest_settings error: {e}, using local file.", flush=True)
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_SET_FILE, "r", encoding="utf-8") as f:
+                allset = json.load(f)
+        except Exception:
+            allset = {}
+        row = allset.setdefault(str(guild_id), {})
+        for k, v in patch.items():
+            if k == "goals" and isinstance(v, dict):
+                row.setdefault("goals", {}).update(v)
+            else:
+                row[k] = v
+        with open(QUEST_SET_FILE, "w", encoding="utf-8") as f:
+            json.dump(allset, f, ensure_ascii=False, indent=2)
+
+
+async def bump_quest_progress(guild_id: int, user_id: int, field: str,
+                              amount: int = 1, weekly: bool = False) -> None:
+    """진행도를 원자적으로 올립니다.
+
+    ⚠️ 반드시 `$inc` 여야 합니다. 읽고 계산해서 쓰면 채팅이 몰릴 때
+    서로를 지워 집계가 뭉개집니다(사용 인원이 80명에서 1명으로 뭉개진 전례).
+    """
+    key = _quest_key(guild_id, user_id,
+                     quest_week() if weekly else quest_day())
+    if quest_prog_col is not None:
+        try:
+            await _db(quest_prog_col.update_one, {"_id": key},
+                      {"$inc": {f"p.{field}": amount},
+                       "$setOnInsert": {"guild_id": str(guild_id),
+                                        "user_id": str(user_id),
+                                        "period": key.rsplit(":", 1)[-1],
+                                        "created": datetime.now(timezone.utc)}},
+                      upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB bump_quest_progress error: {e}, using local file.", flush=True)
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_PROG_FILE, "r", encoding="utf-8") as f:
+                allp = json.load(f)
+        except Exception:
+            allp = {}
+        row = allp.setdefault(key, {"p": {}, "claimed": []})
+        row.setdefault("p", {})[field] = int(row.get("p", {}).get(field, 0)) + amount
+        _trim_quest_progress_local(allp)
+        with open(QUEST_PROG_FILE, "w", encoding="utf-8") as f:
+            json.dump(allp, f, ensure_ascii=False)
+
+
+def _trim_quest_progress_local(allp: dict) -> None:
+    """오래된 진행도를 지웁니다 (JSON 폴백 경로).
+
+    Mongo 경로는 TTL 인덱스가 지웁니다. **양쪽 모두에 상한을 걸어야**
+    합니다 — 한쪽만 걸어 영구 누적된 전례가 있습니다.
+    """
+    cutoff = (datetime.now(KST) - timedelta(days=QUEST_PROGRESS_TTL_DAYS))
+    cut_day = cutoff.strftime("%Y-%m-%d")
+    cut_week = quest_week(cutoff)
+    for k in [k for k in allp]:
+        period = k.rsplit(":", 1)[-1]
+        if "W" in period:
+            if period < cut_week:
+                allp.pop(k, None)
+        elif period < cut_day:
+            allp.pop(k, None)
+
+
+async def get_quest_progress(guild_id: int, user_id: int) -> dict:
+    """오늘/이번 주 진행도와 수령 내역을 한 번에 돌려줍니다."""
+    out = {"p": {}, "claimed": []}
+    keys = [_quest_key(guild_id, user_id, quest_day()),
+            _quest_key(guild_id, user_id, quest_week())]
+    if quest_prog_col is not None:
+        try:
+            def _fetch():
+                return list(quest_prog_col.find({"_id": {"$in": keys}}))
+            for doc in await _db(_fetch):
+                out["p"].update(doc.get("p", {}) or {})
+                out["claimed"] += list(doc.get("claimed", []) or [])
+            return out
+        except Exception as e:
+            print(f"MongoDB get_quest_progress error: {e}, using local file.", flush=True)
+    async with _quest_lock:
+        try:
+            with open(QUEST_PROG_FILE, "r", encoding="utf-8") as f:
+                allp = json.load(f)
+        except Exception:
+            allp = {}
+    for k in keys:
+        row = allp.get(k) or {}
+        out["p"].update(row.get("p", {}) or {})
+        out["claimed"] += list(row.get("claimed", []) or [])
+    return out
+
+
+async def claim_quest(guild_id: int, user_id: int, quest_id: str,
+                      reward: int, weekly: bool = False) -> bool:
+    """보상을 지급합니다. 이미 받았으면 False (포인트는 나가지 않습니다).
+
+    '아직 안 받음'을 **필터 조건**에 넣어 서버 측에서 판정합니다.
+    버튼을 연타해도 두 번 지급되지 않습니다.
+    """
+    key = _quest_key(guild_id, user_id, quest_week() if weekly else quest_day())
+    if quest_prog_col is not None:
+        try:
+            doc = await _db(quest_prog_col.find_one_and_update,
+                            {"_id": key, "claimed": {"$ne": quest_id}},
+                            {"$push": {"claimed": quest_id},
+                             "$setOnInsert": {"guild_id": str(guild_id),
+                                              "user_id": str(user_id),
+                                              "created": datetime.now(timezone.utc)}},
+                            upsert=True, return_document=_AFTER)
+            if doc is None:
+                return False
+        except Exception as e:
+            # 중복 키 등으로 실패하면 이미 받은 것으로 봅니다(포인트 보호 우선)
+            print(f"MongoDB claim_quest error: {e}", flush=True)
+            return False
+        if reward > 0:
+            await add_user_points(guild_id, user_id, reward)
+        return True
+
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_PROG_FILE, "r", encoding="utf-8") as f:
+                allp = json.load(f)
+        except Exception:
+            allp = {}
+        row = allp.setdefault(key, {"p": {}, "claimed": []})
+        if quest_id in row.get("claimed", []):
+            return False
+        row.setdefault("claimed", []).append(quest_id)
+        with open(QUEST_PROG_FILE, "w", encoding="utf-8") as f:
+            json.dump(allp, f, ensure_ascii=False)
+    if reward > 0:
+        await add_user_points(guild_id, user_id, reward)
+    return True
+
+
+async def get_daily_quests(guild_id: int, settings: dict | None = None) -> list[dict]:
+    """오늘의 일일 퀘스트. 없으면 뽑아서 저장하고 하루 동안 고정합니다.
+
+    **매번 새로 뽑으면 안 됩니다.** 유저가 명령어를 칠 때마다 목록이 바뀌면
+    진행하던 퀘스트가 사라집니다. 날짜를 키로 저장해 하루는 같은 목록을 씁니다.
+
+    무작위 씨앗은 `길드+날짜` 라 같은 날엔 몇 번을 불러도 같은 결과입니다.
+    (봇이 재시작해도 동일 — 저장이 실패해도 목록이 흔들리지 않습니다)
+    """
+    settings = settings or await get_quest_settings(guild_id)
+    day = quest_day()
+    key = f"{guild_id}:{day}"
+
+    if quest_state_col is not None:
+        try:
+            doc = await _db(quest_state_col.find_one, {"_id": key})
+            if doc and doc.get("quests"):
+                return doc["quests"]
+        except Exception as e:
+            print(f"MongoDB get_daily_quests error: {e}, using local file.", flush=True)
+
+    pool = [k for k, v in QUEST_KINDS.items()
+            if v["period"] == "daily" and k not in (settings.get("disabled_kinds") or [])]
+    if "channel_chat" in pool and not settings.get("channel_id"):
+        pool.remove("channel_chat")     # 대상 채널이 없으면 낼 수 없습니다
+
+    count = max(1, min(int(settings.get("daily_count", 3)), len(pool))) if pool else 0
+    import random as _random
+    rng = _random.Random(f"{guild_id}:{day}")
+    picked = rng.sample(pool, count) if count else []
+    goals = settings.get("goals", {})
+    quests = [{"id": f"d:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
+              for k in picked]
+
+    if quest_state_col is not None:
+        try:
+            await _db(quest_state_col.update_one, {"_id": key},
+                      {"$setOnInsert": {"quests": quests, "guild_id": str(guild_id),
+                                        "day": day,
+                                        "created": datetime.now(timezone.utc)}},
+                      upsert=True)
+        except Exception as e:
+            print(f"MongoDB save daily quests error: {e}", flush=True)
+    return quests
+
+
+def weekly_quests(settings: dict) -> list[dict]:
+    """주간 퀘스트는 고정입니다. 매주 바뀌면 진행도를 쌓을 수가 없습니다."""
+    goals = settings.get("goals", {})
+    disabled = settings.get("disabled_kinds") or []
+    return [{"id": f"w:{k}", "kind": k, "goal": int(goals.get(k, 1) or 1)}
+            for k, v in QUEST_KINDS.items()
+            if v["period"] == "weekly" and k not in disabled]
+
+
+def quest_progress_value(kind: str, progress: dict) -> int:
+    """종류별로 어느 카운터를 보는지."""
+    p = progress.get("p", {}) or {}
+    if kind == "chat":
+        return int(p.get("chat", 0) or 0)
+    if kind == "channel_chat":
+        return int(p.get("channel_chat", 0) or 0)
+    if kind == "gacha":
+        return int(p.get("gacha", 0) or 0)
+    if kind == "checkin":
+        return int(p.get("checkin", 0) or 0)
+    if kind == "early_bird":
+        # 선착순은 '몇 등이었나'라서 작을수록 좋습니다. 0 은 아직 출석 전.
+        return int(p.get("rank", 0) or 0)
+    if kind == "week_checkin":
+        return int(p.get("wcheckin", 0) or 0)
+    if kind == "week_chat":
+        return int(p.get("wchat", 0) or 0)
+    return 0
+
+
+def quest_done(kind: str, value: int, goal: int) -> bool:
+    if kind == "early_bird":
+        return 0 < value <= goal      # 등수는 작을수록 달성
+    return value >= goal
+
+
+def quest_label(kind: str, goal: int) -> str:
+    tpl = QUEST_KINDS.get(kind, {}).get("label", kind)
+    return tpl.replace("{n}", f"{goal:,}")
+
+
+async def take_checkin_rank(guild_id: int) -> int:
+    """오늘 출석 순번을 원자적으로 받아옵니다 (1부터).
+
+    선착순 퀘스트용입니다. 읽고 더해서 쓰면 동시에 출석한 사람들이
+    같은 등수를 받습니다. `$inc` 의 반환값을 그대로 등수로 씁니다.
+    """
+    key = f"{guild_id}:{quest_day()}"
+    if quest_state_col is not None:
+        try:
+            doc = await _db(quest_state_col.find_one_and_update,
+                            {"_id": key}, {"$inc": {"checkin_seq": 1}},
+                            upsert=True, return_document=_AFTER)
+            return int((doc or {}).get("checkin_seq", 1) or 1)
+        except Exception as e:
+            print(f"MongoDB take_checkin_rank error: {e}", flush=True)
+            return 0
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_STATE_FILE, "r", encoding="utf-8") as f:
+                allst = json.load(f)
+        except Exception:
+            allst = {}
+        row = allst.setdefault(key, {})
+        row["checkin_seq"] = int(row.get("checkin_seq", 0)) + 1
+        with open(QUEST_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(allst, f, ensure_ascii=False)
+        return row["checkin_seq"]
+
+
+async def bump_server_goal(guild_id: int, amount: int = 1) -> int:
+    """서버 공동 목표 진행도를 올리고 현재값을 돌려줍니다."""
+    key = f"{guild_id}:{quest_day()}"
+    if quest_state_col is not None:
+        try:
+            doc = await _db(quest_state_col.find_one_and_update,
+                            {"_id": key}, {"$inc": {"goal_progress": amount}},
+                            upsert=True, return_document=_AFTER)
+            return int((doc or {}).get("goal_progress", 0) or 0)
+        except Exception as e:
+            print(f"MongoDB bump_server_goal error: {e}", flush=True)
+            return 0
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_STATE_FILE, "r", encoding="utf-8") as f:
+                allst = json.load(f)
+        except Exception:
+            allst = {}
+        row = allst.setdefault(key, {})
+        row["goal_progress"] = int(row.get("goal_progress", 0)) + amount
+        with open(QUEST_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(allst, f, ensure_ascii=False)
+        return row["goal_progress"]
+
+
+async def get_server_goal(guild_id: int) -> dict:
+    """오늘 공동 목표 진행 상황."""
+    key = f"{guild_id}:{quest_day()}"
+    doc = {}
+    if quest_state_col is not None:
+        try:
+            doc = await _db(quest_state_col.find_one, {"_id": key}) or {}
+        except Exception as e:
+            print(f"MongoDB get_server_goal error: {e}, using local file.", flush=True)
+            doc = {}
+    else:
+        async with _quest_lock:
+            try:
+                with open(QUEST_STATE_FILE, "r", encoding="utf-8") as f:
+                    doc = json.load(f).get(key, {})
+            except Exception:
+                doc = {}
+    return {"progress": int(doc.get("goal_progress", 0) or 0),
+            "message_id": doc.get("goal_message_id"),
+            "announced": bool(doc.get("goal_announced"))}
+
+
+async def mark_server_goal(guild_id: int, **patch) -> None:
+    key = f"{guild_id}:{quest_day()}"
+    if quest_state_col is not None:
+        try:
+            await _db(quest_state_col.update_one, {"_id": key},
+                      {"$set": patch}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB mark_server_goal error: {e}", flush=True)
+            return
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_STATE_FILE, "r", encoding="utf-8") as f:
+                allst = json.load(f)
+        except Exception:
+            allst = {}
+        allst.setdefault(key, {}).update(patch)
+        with open(QUEST_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(allst, f, ensure_ascii=False)

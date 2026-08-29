@@ -6,6 +6,7 @@ from discord import app_commands
 from utils.database import (
     get_gacha_settings, save_gacha_settings,
     get_user_points, deduct_user_points, add_user_points, add_activity_log,
+    bump_quest_progress,
     consume_gacha_stock
 )
 
@@ -179,6 +180,11 @@ class GachaPlayView(discord.ui.View):
 
         # 로그 기록
         await add_activity_log(guild_id, "gacha", user_id, interaction.user.display_name, f"[{item_name}] 뽑기 당첨 (-{price:,}P)")
+        # 퀘스트 진행도 (실패해도 뽑기 결과에는 영향을 주지 않습니다)
+        try:
+            await bump_quest_progress(guild_id, user_id, "gacha")
+        except Exception as e:
+            print(f"[Quest] 뽑기 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
 
         gacha_title = settings.get("title", "한바헌 럭키 뽑기")
 

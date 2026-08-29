@@ -20,6 +20,7 @@ from utils import roblox_oauth
 from utils.verify_db import (
     get_roblox_link, find_roblox_owner, save_roblox_link,
     remove_roblox_link, list_roblox_links,
+    get_verify_settings, get_linkguard_settings,
 )
 
 
@@ -166,7 +167,54 @@ class RobloxLink(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-def _make_saver(loop):
+async def _alert_relink(bot, guild_id: int, user_id: int,
+                        before: dict, after: dict) -> None:
+    """계정 교체를 로그 채널에 알립니다.
+
+    갑작스러운 계정 교체는 그 자체로 확인해 볼 만한 신호입니다.
+    (인증과 링크 보호는 같은 하위 시스템이라 로그 채널을 공유합니다)
+    """
+    try:
+        settings = await get_verify_settings(guild_id)
+        if not settings.get("roblox_relink_alert", True):
+            return
+
+        guard = await get_linkguard_settings(guild_id)
+        channel_id = guard.get("log_channel_id")
+        if not channel_id:
+            return
+        guild = bot.get_guild(int(guild_id))
+        if guild is None:
+            return
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            return
+
+        embed = discord.Embed(
+            title="🔄 로블록스 계정 교체",
+            description=f"<@{user_id}> 님이 연동 계정을 바꿨습니다.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(
+            name="이전",
+            value=f"**{before.get('roblox_name', '?')}**\n`{before.get('roblox_id', '?')}`",
+            inline=True)
+        embed.add_field(
+            name="이후",
+            value=f"**{after.get('roblox_name', '?')}**\n`{after.get('roblox_id', '?')}`",
+            inline=True)
+        embed.add_field(
+            name="🙋 디스코드",
+            value=f"`{user_id}`", inline=True)
+        embed.set_footer(text="정상적인 계정 변경일 수도 있습니다 · /인증설정 에서 이 알림을 끌 수 있습니다")
+        embed.timestamp = discord.utils.utcnow()
+        await channel.send(embed=embed)
+    except Exception as e:
+        # 알림 실패가 연동 자체를 막으면 안 됩니다
+        print(f"[RobloxLink] 교체 알림 실패: {type(e).__name__}: {e}", flush=True)
+
+
+def _make_saver(bot, loop):
     """Flask 스레드가 호출할 저장 함수를 만듭니다.
 
     콜백은 Flask 스레드에서 처리되는데 저장은 async 라,
@@ -179,9 +227,17 @@ def _make_saver(loop):
         if owner and str(owner.get("user_id")) != str(user_id):
             return False, "taken"
 
+        # 교체인지 판단하기 위해 이전 연동을 먼저 확인합니다
+        previous = await get_roblox_link(guild_id, user_id)
+
         await save_roblox_link(
             guild_id, user_id, info["roblox_id"], info["roblox_name"],
             method="oauth", created_at=info.get("created_at", ""))
+
+        if previous and int(previous.get("roblox_id", 0)) != int(info["roblox_id"]):
+            print(f"[RobloxLink] 계정 교체: discord={user_id} "
+                  f"{previous.get('roblox_id')} -> {info['roblox_id']}", flush=True)
+            await _alert_relink(bot, guild_id, user_id, previous, info)
         return True, "ok"
 
     def bridge(guild_id: int, user_id: int, info: dict):
@@ -195,7 +251,7 @@ def _make_saver(loop):
 async def setup(bot):
     await bot.add_cog(RobloxLink(bot))
     # Flask 스레드에서 저장할 수 있도록 봇의 이벤트 루프를 연결합니다.
-    roblox_oauth.set_saver(_make_saver(asyncio.get_running_loop()))
+    roblox_oauth.set_saver(_make_saver(bot, asyncio.get_running_loop()))
     if roblox_oauth.enabled():
         print("[RobloxLink] 로블록스 연동: 활성화 (OAuth)", flush=True)
     else:

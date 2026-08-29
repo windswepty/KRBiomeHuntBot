@@ -414,6 +414,14 @@ class VerifySettingsSelect(discord.ui.Select):
                 emoji="🎫"
             ),
             discord.SelectOption(
+                label="로블록스 계정 교체 알림",
+                value="relinkalert",
+                description=("현재: 켜짐 — 계정을 바꾸면 로그 채널에 기록"
+                             if current.get("roblox_relink_alert", True)
+                             else "현재: 꺼짐"),
+                emoji="🔄"
+            ),
+            discord.SelectOption(
                 label="자격 상실 시 인증 자동 회수",
                 value="autorevoke",
                 description=("현재: ✅ 켜짐" if current.get("auto_revoke")
@@ -471,6 +479,33 @@ class VerifySettingsSelect(discord.ui.Select):
             embed.set_footer(text="역할 우클릭 → ID 복사 로 ID를 얻을 수 있습니다")
             await interaction.response.send_message(
                 embed=embed, view=RequiredRoleView(required, guild), ephemeral=True)
+
+        elif choice == "relinkalert":
+            new_state = not settings.get("roblox_relink_alert", True)
+            await save_verify_settings(guild.id, {"roblox_relink_alert": new_state})
+            embed = discord.Embed(
+                title="🔄 로블록스 계정 교체 알림",
+                description=f"알림이 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.",
+                color=discord.Color.green() if new_state else discord.Color.red()
+            )
+            if new_state:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value="멤버가 연동된 로블록스 계정을 **다른 계정으로 바꾸면**\n"
+                          "링크 보호 로그 채널에 이전/이후 계정을 함께 기록합니다.\n"
+                          "갑작스러운 계정 교체는 확인해 볼 만한 신호입니다.",
+                    inline=False)
+                embed.add_field(
+                    name="ℹ️ 참고",
+                    value="로그 채널이 설정돼 있어야 기록됩니다.\n"
+                          "정상적인 계정 변경일 수도 있으니 정황과 함께 판단하세요.",
+                    inline=False)
+            else:
+                embed.add_field(
+                    name="🔎 이렇게 동작합니다",
+                    value="계정을 바꿔도 로그 채널에 알리지 않습니다. (콘솔 로그에는 남습니다)",
+                    inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
         elif choice == "autorevoke":
             required = [int(r) for r in settings.get("required_role_ids", [])]

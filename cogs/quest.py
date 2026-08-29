@@ -279,7 +279,7 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
                               color=discord.Color.green())
         embed.add_field(name="목표", value=f"서버 전체 채팅 {t:,}회", inline=True)
         embed.add_field(name="1인당 보상", value=f"{r:,} P", inline=True)
-        embed.set_footer(text="목표는 매일 자정(KST)에 초기화됩니다")
+        embed.set_footer(text="목표는 매일 밤 12시(KST)에 초기화됩니다")
         await refresh_panel(interaction, embed)
 
 
@@ -528,7 +528,7 @@ class Quest(commands.Cog):
                 name="🎁 보상 받는 법",
                 value="`/퀘스트` 를 열어 **[보상 받기]** 를 눌러 주세요.",
                 inline=False)
-        embed.set_footer(text="매일 자정(KST)에 새로 시작됩니다")
+        embed.set_footer(text="매일 밤 12시(KST)에 새로 시작됩니다")
         embed.timestamp = discord.utils.utcnow()
 
         if state["message_id"]:
@@ -599,7 +599,7 @@ class Quest(commands.Cog):
                 if done and not claimed:
                     claimable.append((q, True))
             embed.add_field(
-                name=f"📅 이번 주 퀘스트  ·  개당 +{int(settings.get('weekly_reward', 0)):,} P",
+                name=f"📅 이번 주 퀘스트 (일~토)  ·  개당 +{int(settings.get('weekly_reward', 0)):,} P",
                 value="\n".join(lines), inline=False)
 
         if settings.get("goal_enabled"):
@@ -620,7 +620,7 @@ class Quest(commands.Cog):
                           ("  **← 받을 수 있습니다**" if reached else ""))),
                 inline=False)
 
-        embed.set_footer(text="퀘스트는 사람마다 다릅니다 · 일일은 매일 자정(KST), 주간은 월요일에 바뀝니다")
+        embed.set_footer(text="퀘스트는 사람마다 다릅니다 · 일일은 매일 밤 12시(KST), 주간은 일요일 밤 12시에 새로 시작됩니다")
         await interaction.followup.send(
             embed=embed, view=QuestView(interaction.user.id, claimable), ephemeral=True)
 

@@ -2115,8 +2115,16 @@ def quest_day(when: datetime | None = None) -> str:
 
 
 def quest_week(when: datetime | None = None) -> str:
-    """ISO 주차 키. 월요일 시작이라 '이번 주'의 경계가 분명합니다."""
-    d = when or datetime.now(KST)
+    """주차 키. **일요일 00:00(KST) 에 새 주가 시작**됩니다.
+
+    파이썬의 `isocalendar()` 는 월요일 시작이라 그대로 쓰면 주간 퀘스트가
+    월요일에 초기화됩니다. 하루를 더해 ISO 기준을 밀어내면 일요일~토요일이
+    한 묶음이 됩니다.
+
+        일요일 -> +1일 = 월요일 -> 새 ISO 주  (여기서 주가 바뀝니다)
+        토요일 -> +1일 = 일요일 -> 같은 ISO 주 (아직 같은 주)
+    """
+    d = (when or datetime.now(KST)) + timedelta(days=1)
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
 

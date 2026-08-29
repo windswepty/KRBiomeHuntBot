@@ -54,7 +54,7 @@ class PointGuideSelect(discord.ui.Select):
             embed = discord.Embed(
                 title="📅 [매일 출석체크로 포인트 얻기]",
                 description="• **/출석** 명령어를 사용하면 하루에 한 번 **100포인트**를 획득하실 수 있습니다!\n\n"
-                            "• 매일 00:00 (한국 시간 기준)에 출석 기록이 리셋됩니다.\n"
+                            "• 매일 밤 12시 (한국 시간 기준)에 출석 기록이 리셋됩니다.\n"
                             "• 명령어를 친 본인에게만 비공개로 결과가 표시됩니다.",
                 color=discord.Color.green()
             )

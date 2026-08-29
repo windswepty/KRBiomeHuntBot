@@ -6,7 +6,7 @@ from flask import Flask, redirect, request, Response, make_response
 
 from utils import link_tokens
 from utils.link_tokens import redeem, peek_owner
-from utils import oauth_gate
+from utils import oauth_gate, roblox_oauth
 
 app = Flask(__name__)
 
@@ -50,6 +50,17 @@ _MESSAGES = {
                   "본인 확인 정보를 저장할 수 없어 입장할 수 없습니다.<br>"
                   "시크릿 모드를 끄거나 쿠키 차단을 해제한 뒤,<br>"
                   "디스코드로 돌아가 버튼을 다시 눌러 주세요."),
+    "rbx_ok": ("로블록스 계정이 연동되었습니다",
+               "디스코드로 돌아가셔도 됩니다.<br>"
+               "이제 개인서버 이용 기록에 로블록스 아이디가 함께 남습니다."),
+    "rbx_taken": ("이미 다른 사람이 연동한 계정입니다",
+                  "이 로블록스 계정은 다른 디스코드 계정에 이미 연결돼 있습니다.<br>"
+                  "본인 계정이 맞다면 관리자에게 문의해 주세요."),
+    "rbx_expired": ("연동 요청이 만료되었습니다",
+                    "디스코드에서 <b>/로블록스연동</b> 을 다시 실행해 주세요."),
+    "rbx_failed": ("로블록스 연동에 실패했습니다",
+                   "잠시 후 다시 시도해 주세요.<br>"
+                   "문제가 계속되면 관리자에게 문의해 주세요."),
     "auth_failed": ("신원 확인에 실패했습니다",
                     "다시 시도해 주세요.<br>"
                     "문제가 계속되면 디스코드 버튼을 다시 눌러 주세요."),
@@ -58,6 +69,7 @@ _MESSAGES = {
 
 def _page(reason: str, status: int = 410) -> Response:
     title, body = _MESSAGES.get(reason, _MESSAGES["unknown"])
+    mark = "✅" if reason.endswith("_ok") else "🔒"
     html = f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -73,7 +85,7 @@ def _page(reason: str, status: int = 410) -> Response:
   .mark {{ font-size:40px; margin-bottom:16px; }}
 </style></head>
 <body><div class="card">
-  <div class="mark">🔒</div>
+  <div class="mark">{mark}</div>
   <h1>{title}</h1>
   <p>{body}</p>
 </div></body></html>"""
@@ -196,6 +208,135 @@ def auth_callback():
         httponly=True, secure=True, samesite="Lax",
     )
     return resp
+
+
+# ── 로블록스 OAuth 심사용 정적 페이지 ────────────────────────────────
+#
+# 로블록스는 앱 심사 시 진입 링크 · 개인정보 처리방침 · 이용약관 URL 을
+# 요구합니다. 별도 사이트를 두지 않고 봇 서버에서 함께 제공합니다.
+
+_DOC_CSS = (
+    "body{margin:0;padding:48px 20px;background:#0f1115;color:#e6e6e6;"
+    "font-family:system-ui,-apple-system,'Segoe UI','Malgun Gothic',sans-serif;"
+    "line-height:1.8}"
+    ".wrap{max-width:720px;margin:0 auto}"
+    "h1{font-size:24px;margin:0 0 8px}"
+    "h2{font-size:16px;margin:28px 0 8px;color:#9db4ff}"
+    "p,li{font-size:14px;color:#c3c9d4}"
+    "code{background:#1b1f28;padding:2px 6px;border-radius:4px}"
+    ".muted{color:#7c8494;font-size:13px}"
+)
+
+
+def _doc(title: str, body_html: str) -> Response:
+    html = (
+        "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>" + title + "</title><style>" + _DOC_CSS + "</style></head>"
+        "<body><div class=\"wrap\">" + body_html + "</div></body></html>"
+    )
+    return Response(html, status=200, mimetype="text/html; charset=utf-8")
+
+
+@app.route('/privacy')
+def privacy():
+    return _doc("개인정보 처리방침 · KR Biome Hunt Verification", """
+<h1>개인정보 처리방침</h1>
+<p class="muted">KR Biome Hunt Verification (한바헌 봇)</p>
+
+<h2>수집하는 정보</h2>
+<p>로블록스 계정을 연동할 때 <code>openid</code> · <code>profile</code> 권한으로
+다음만 받습니다.</p>
+<ul>
+  <li>로블록스 사용자 ID</li>
+  <li>로블록스 사용자명 / 표시 이름</li>
+  <li>계정 생성 일자</li>
+</ul>
+<p>비밀번호, 로벅스, 인벤토리, 결제 정보에는 접근하지 않으며 받지도 않습니다.</p>
+
+<h2>이용 목적</h2>
+<p>디스코드 계정과 로블록스 계정을 연결해, 커뮤니티에서 배포한 비공개 서버
+링크를 누가 받아갔는지 확인하기 위한 용도로만 사용합니다. 링크가 외부로
+유출되었을 때 확인하는 데 쓰입니다.</p>
+
+<h2>보관 및 파기</h2>
+<p>연동 정보는 운영자가 관리하는 데이터베이스에 보관합니다. 이용자가 연동
+해제를 요청하면 즉시 삭제합니다. 디스코드에서 <code>/연동해제</code> 를 관리자에게
+요청하시면 됩니다.</p>
+
+<h2>제3자 제공</h2>
+<p>수집한 정보를 외부에 판매하거나 제공하지 않습니다.</p>
+
+<h2>문의</h2>
+<p>커뮤니티 디스코드 서버의 운영진에게 문의해 주세요.</p>
+""")
+
+
+@app.route('/terms')
+def terms():
+    return _doc("이용약관 · KR Biome Hunt Verification", """
+<h1>이용약관</h1>
+<p class="muted">KR Biome Hunt Verification (한바헌 봇)</p>
+
+<h2>서비스 내용</h2>
+<p>이 애플리케이션은 디스코드 커뮤니티 구성원이 자신의 로블록스 계정을
+연동할 수 있게 하는 도구입니다. 연동은 전적으로 자발적입니다.</p>
+
+<h2>이용자의 책임</h2>
+<p>본인 소유의 로블록스 계정만 연동해야 합니다. 커뮤니티에서 제공한 비공개
+서버 링크를 외부에 배포하지 않아야 하며, 위반 시 커뮤니티 규정에 따라
+이용이 제한될 수 있습니다.</p>
+
+<h2>면책</h2>
+<p>이 서비스는 있는 그대로 제공되며, 로블록스 또는 디스코드의 정책 변경이나
+서비스 중단으로 인한 이용 불가에 대해 책임지지 않습니다.</p>
+
+<h2>변경</h2>
+<p>약관이 변경되면 이 페이지에 반영됩니다.</p>
+""")
+
+
+@app.route('/roblox/callback')
+def roblox_callback():
+    # 미리보기 요청이 1회용 state 를 태우지 않게 합니다.
+    if request.method == "HEAD":
+        return Response(status=204)
+
+    if not roblox_oauth.enabled():
+        print("[RobloxOAuth] 콜백 실패: 환경 변수 누락", flush=True)
+        return _page("rbx_failed")
+
+    err = request.args.get("error")
+    if err:
+        print(f"[RobloxOAuth] 콜백 실패: 로블록스가 거부 - {err} "
+              f"({request.args.get('error_description', '')})", flush=True)
+        return _page("rbx_failed")
+
+    pending = roblox_oauth.take_pending(request.args.get("state") or "")
+    if pending is None:
+        print("[RobloxOAuth] 콜백 실패: state 없음 또는 만료", flush=True)
+        return _page("rbx_expired")
+
+    code = request.args.get("code")
+    if not code:
+        print("[RobloxOAuth] 콜백 실패: code 파라미터 없음", flush=True)
+        return _page("rbx_failed")
+
+    info = roblox_oauth.exchange(code, pending["verifier"])
+    if info is None:
+        return _page("rbx_failed")
+
+    ok, reason = roblox_oauth.save_link(
+        pending["guild_id"], pending["user_id"], info)
+    if not ok:
+        if reason == "taken":
+            return _page("rbx_taken", status=409)
+        print(f"[RobloxOAuth] 저장 거부: {reason}", flush=True)
+        return _page("rbx_failed")
+
+    print(f"[RobloxOAuth] 연동 성공: discord={pending['user_id']} "
+          f"roblox={info['roblox_id']}({info['roblox_name']})", flush=True)
+    return _page("rbx_ok", status=200)
 
 
 def run():

@@ -25,6 +25,7 @@ WATERMARK_FILE = os.path.join(DATA_DIR, "link_watermarks.json")
 GUARDKEY_FILE = os.path.join(DATA_DIR, "guarded_keys.json")
 USAGE_FILE = os.path.join(DATA_DIR, "link_usage.json")
 LOGREF_FILE = os.path.join(DATA_DIR, "log_references.json")
+ROBLOX_FILE = os.path.join(DATA_DIR, "roblox_links.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 KST = timezone(timedelta(hours=9))
@@ -37,6 +38,7 @@ _watermark_lock = asyncio.Lock()
 _guardkey_lock = asyncio.Lock()
 _usage_lock = asyncio.Lock()
 _logref_lock = asyncio.Lock()
+_roblox_lock = asyncio.Lock()
 
 verify_col = None
 linkguard_col = None
@@ -46,6 +48,7 @@ watermark_col = None
 guardkey_col = None
 usage_col = None
 logref_col = None
+roblox_col = None
 
 if MONGO_URI:
     try:
@@ -61,6 +64,7 @@ if MONGO_URI:
         guardkey_col = _db["guarded_keys"]
         usage_col = _db["link_usage"]
         logref_col = _db["log_references"]
+        roblox_col = _db["roblox_links"]
 
         # 인덱스는 없어도 기능은 동작하므로, 생성에 실패해도 Mongo 연결 자체를
         # 포기하지 않도록 별도의 try로 감쌉니다. create_index는 멱등이라
@@ -92,6 +96,11 @@ if MONGO_URI:
             logref_col.create_index(
                 "updated", name="logref_ttl", expireAfterSeconds=30 * 24 * 3600
             )
+            # 로블록스 계정 1개는 디스코드 1개에만 연동되어야 합니다.
+            # 유출자가 남의 계정을 등록해 명단을 오염시키는 것을 막습니다.
+            roblox_col.create_index(
+                [("guild_id", 1), ("roblox_id", 1)], name="roblox_unique", unique=True
+            )
         except Exception as e:
             print(f"MongoDB index setup warning: {e}", flush=True)
 
@@ -106,6 +115,7 @@ if MONGO_URI:
         guardkey_col = None
         usage_col = None
         logref_col = None
+        roblox_col = None
 
 
 def _utcnow():
@@ -897,3 +907,158 @@ async def get_guarded_keys(guild_id: int) -> set[str]:
     result = set(all_keys.get(str_gid, []))
     _guarded_keys_cache[str_gid] = set(result)
     return set(result)
+
+
+# ── 로블록스 계정 연동 ────────────────────────────────────────────────
+#
+# 개인서버 링크를 받아간 사람의 로블록스 아이디를 알아야, 게임 안 플레이어
+# 목록과 대조해 '명단에 없는데 들어와 있는 사람'을 찾아낼 수 있습니다.
+# 그게 서버 밖 유출을 탐지하는 유일한 현실적 경로입니다.
+
+_roblox_cache = _TTLCache(ttl_seconds=600, max_items=3000)
+
+
+def _roblox_key(guild_id: int, user_id: int) -> str:
+    return f"{guild_id}:{user_id}"
+
+
+async def get_roblox_link(guild_id: int, user_id: int) -> dict | None:
+    """이 디스코드 유저에게 연동된 로블록스 계정."""
+    key = _roblox_key(guild_id, user_id)
+    cached = _roblox_cache.get(key)
+    if cached is not None:
+        return dict(cached) if cached else None
+
+    if roblox_col is not None:
+        try:
+            doc = await _db(roblox_col.find_one, {"_id": key})
+            entry = {k: v for k, v in doc.items() if k != "_id"} if doc else None
+            _roblox_cache.set(key, entry or {})
+            return dict(entry) if entry else None
+        except Exception as e:
+            print(f"MongoDB get_roblox_link error: {e}, using local file.", flush=True)
+
+    async with _roblox_lock:
+        entry = _read_json(ROBLOX_FILE).get(key)
+    _roblox_cache.set(key, entry or {})
+    return dict(entry) if entry else None
+
+
+async def find_roblox_owner(guild_id: int, roblox_id: int) -> dict | None:
+    """이 로블록스 계정을 이미 연동한 디스코드 유저가 있는지.
+
+    로블록스 계정 하나는 디스코드 하나에만 연동되어야 합니다. 그러지 않으면
+    여러 명이 같은 계정을 등록해 명단 대조가 무의미해집니다.
+    """
+    str_gid, rid = str(guild_id), int(roblox_id)
+    if roblox_col is not None:
+        try:
+            doc = await _db(roblox_col.find_one,
+                            {"guild_id": str_gid, "roblox_id": rid})
+            return {k: v for k, v in doc.items() if k != "_id"} if doc else None
+        except Exception as e:
+            print(f"MongoDB find_roblox_owner error: {e}, using local file.", flush=True)
+
+    async with _roblox_lock:
+        for entry in _read_json(ROBLOX_FILE).values():
+            if entry.get("guild_id") == str_gid and int(entry.get("roblox_id", 0)) == rid:
+                return dict(entry)
+    return None
+
+
+async def save_roblox_link(guild_id: int, user_id: int, roblox_id: int,
+                           roblox_name: str, method: str = "oauth",
+                           created_at: str = "") -> None:
+    """연동을 저장합니다. 같은 디스코드 유저면 덮어씁니다(재연동)."""
+    key = _roblox_key(guild_id, user_id)
+    entry = {
+        "guild_id": str(guild_id),
+        "user_id": str(user_id),
+        "roblox_id": int(roblox_id),
+        # 로블록스는 개명이 가능하므로 표시용 이름은 갱신 대상입니다.
+        # 불변 식별자는 roblox_id 이며, 대조·중복검사는 항상 이 값으로 합니다.
+        "roblox_name": roblox_name,
+        "method": method,
+        "roblox_created_at": created_at,
+        "linked_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _roblox_cache.set(key, entry)
+
+    if roblox_col is not None:
+        try:
+            await _db(roblox_col.update_one, {"_id": key}, {"$set": entry}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB save_roblox_link error: {e}, using local file.", flush=True)
+
+    async with _roblox_lock:
+        all_links = _read_json(ROBLOX_FILE)
+        all_links[key] = entry
+        _write_json(ROBLOX_FILE, all_links)
+
+
+async def remove_roblox_link(guild_id: int, user_id: int) -> bool:
+    """연동 해제 (관리자용)."""
+    key = _roblox_key(guild_id, user_id)
+    _roblox_cache.pop(key)
+    if roblox_col is not None:
+        try:
+            res = await _db(roblox_col.delete_one, {"_id": key})
+            return res.deleted_count > 0
+        except Exception as e:
+            print(f"MongoDB remove_roblox_link error: {e}, using local file.", flush=True)
+
+    async with _roblox_lock:
+        all_links = _read_json(ROBLOX_FILE)
+        existed = key in all_links
+        all_links.pop(key, None)
+        _write_json(ROBLOX_FILE, all_links)
+    return existed
+
+
+async def list_roblox_links(guild_id: int, limit: int = 1000) -> list[dict]:
+    """길드의 연동 명단 (최신순)."""
+    str_gid = str(guild_id)
+    if roblox_col is not None:
+        try:
+            def _fetch():
+                return list(roblox_col.find({"guild_id": str_gid})
+                            .sort("_id", -1).limit(limit))
+            return [{k: v for k, v in d.items() if k != "_id"} for d in await _db(_fetch)]
+        except Exception as e:
+            print(f"MongoDB list_roblox_links error: {e}, using local file.", flush=True)
+
+    async with _roblox_lock:
+        rows = [e for e in _read_json(ROBLOX_FILE).values()
+                if e.get("guild_id") == str_gid]
+    rows.sort(key=lambda r: r.get("linked_at", ""), reverse=True)
+    return rows[:limit]
+
+
+async def get_roblox_names(guild_id: int, user_ids: list) -> dict:
+    """여러 디스코드 유저의 로블록스 이름을 한 번에 조회합니다.
+
+    링크 사용 명단에 로블록스 아이디를 함께 보여주기 위한 것으로,
+    유저 수만큼 조회를 반복하지 않도록 한 번에 가져옵니다.
+    """
+    str_gid = str(guild_id)
+    wanted = {str(u) for u in user_ids}
+    if not wanted:
+        return {}
+
+    if roblox_col is not None:
+        try:
+            def _fetch():
+                return list(roblox_col.find(
+                    {"guild_id": str_gid, "user_id": {"$in": list(wanted)}},
+                    {"user_id": 1, "roblox_name": 1, "roblox_id": 1}))
+            return {str(d["user_id"]): d.get("roblox_name", "")
+                    for d in await _db(_fetch) if d.get("user_id")}
+        except Exception as e:
+            print(f"MongoDB get_roblox_names error: {e}, using local file.", flush=True)
+
+    async with _roblox_lock:
+        all_links = _read_json(ROBLOX_FILE)
+    return {str(e["user_id"]): e.get("roblox_name", "")
+            for e in all_links.values()
+            if e.get("guild_id") == str_gid and str(e.get("user_id")) in wanted}

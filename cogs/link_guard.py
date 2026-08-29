@@ -25,6 +25,7 @@ from utils.verify_db import (
     register_guarded_keys, get_guarded_keys,
     record_link_usage, get_link_usage,
     save_log_reference, get_log_reference, get_log_reference_by_protected,
+    get_roblox_names,
 )
 
 # 봇 재시작 후에도 버튼이 살아있도록 고정 custom_id 사용
@@ -778,9 +779,11 @@ class UsagePageView(discord.ui.View):
 
     PER_PAGE = 10
 
-    def __init__(self, rows: list[dict]):
+    def __init__(self, rows: list[dict], roblox: dict | None = None):
         super().__init__(timeout=300)
         self.rows = rows
+        # 디스코드 ID -> 로블록스 이름. 게임 내 플레이어 목록과 대조하는 데 씁니다.
+        self.roblox = roblox or {}
         self.page = 0
         self.pages = max(1, (len(rows) + self.PER_PAGE - 1) // self.PER_PAGE)
         self._sync_buttons()
@@ -814,8 +817,12 @@ class UsagePageView(discord.ui.View):
             # 바로 대조할 수 있게 시각 옆에 함께 보여줍니다.
             wm = r.get("watermark") or ""
             wm_part = f" · 표식 `{wm}`" if wm else " · 표식 없음"
+            # 로블록스 아이디가 있으면 함께 보여줍니다. 게임 안 플레이어 목록과
+            # 대조해 '명단에 없는데 들어와 있는 사람'을 찾는 것이 목적입니다.
+            rbx = self.roblox.get(str(r["user_id"])) or ""
+            rbx_part = f" → 🎮 `{rbx}`" if rbx else " → 🎮 `연동 안 함`"
             lines.append(
-                f"`{offset:2}.` <@{r['user_id']}> (`{r['user_id']}`){repeat}\n"
+                f"`{offset:2}.` <@{r['user_id']}> (`{r['user_id']}`){repeat}{rbx_part}\n"
                 f"     └ `{r.get('last', '')}`{wm_part}\n"
                 f"     └ {link_line}"
             )
@@ -840,6 +847,16 @@ class UsagePageView(discord.ui.View):
                 value="\n".join(group),
                 inline=False
             )
+        # 게임 내 플레이어 목록과 눈으로 대조하기 좋게 한 줄로 모읍니다.
+        # 여기 없는 이름이 게임 안에 있으면 유출로 들어온 사람입니다.
+        picked = [self.roblox.get(str(r["user_id"])) for r in chunk]
+        picked = [x for x in picked if x]
+        if picked:
+            embed.add_field(
+                name="🎮 로블록스 아이디 (게임 내 목록과 대조)",
+                value="```" + ", ".join(picked)[:990] + "```",
+                inline=False)
+
         embed.set_footer(text=f"{self.page + 1} / {self.pages} 페이지 · 최근 사용순")
         return embed
 
@@ -882,8 +899,10 @@ class UsageStatsView(discord.ui.View):
 
         protected_id = int(ref["protected_message_id"])
         rows = await get_link_usage(guild.id, protected_id)
+        # 연동한 멤버의 로블록스 이름을 한 번에 가져옵니다 (유저 수만큼 조회하지 않음)
+        roblox = await get_roblox_names(guild.id, [r["user_id"] for r in rows])
 
-        view = UsagePageView(rows)
+        view = UsagePageView(rows, roblox)
         # 한 페이지에 다 들어가면 넘길 버튼을 보여줄 이유가 없습니다
         await interaction.response.send_message(
             embed=view.build_embed(),

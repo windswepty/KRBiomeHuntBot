@@ -1933,11 +1933,15 @@ CHECKIN_SET_FILE = os.path.join(DATA_DIR, "checkin_settings.json")
 _checkin_set_lock = asyncio.Lock()
 
 DEFAULT_CHECKIN_SETTINGS = {
-    "base": 100,          # 기본 지급량 (기존과 동일)
-    "step": 10,           # 연속 하루당 가산
-    "max_bonus": 100,     # 가산 상한 (무한히 벌어지지 않도록)
-    # 특정 연속일수에 한 번만 주는 추가 보상. 키는 문자열(일수).
-    "milestones": {"7": 300, "14": 700, "30": 2000},
+    "base": 100,          # 매일 기본 지급량
+    # 며칠마다 추가 보상을 줄지. 7이면 7·14·21일째에만 붙습니다.
+    "cycle": 7,
+    # 주차마다 커지는 폭. 1주차 +100, 2주차 +200, 3주차 +300 …
+    # 매일 조금씩 얹는 방식이 아니라, **주기 달성일에 한 번** 크게 줍니다.
+    "cycle_step": 100,
+    "cycle_max": 0,       # 추가 보상 상한 (0 = 무제한)
+    # 특정 연속일수에 한 번만 주는 특별 보상 (선택). 키는 문자열(일수).
+    "milestones": {},
 }
 
 
@@ -1948,16 +1952,47 @@ def get_yesterday_str() -> str:
 def streak_reward(streak: int, settings: dict) -> tuple[int, int, int]:
     """연속일수에 대한 보상을 계산합니다.
 
-    반환값은 (기본, 연속가산, 마일스톤) 입니다. 나눠서 돌려주는 이유는
+    반환값은 (기본, 주기보상, 특별보상) 입니다. 나눠서 돌려주는 이유는
     유저에게 "왜 이만큼 받았는지"를 그대로 보여주기 위해서입니다.
+
+    주기 보상은 **주기 달성일에만** 붙고, 주차가 올라갈수록 커집니다.
+    cycle=7, cycle_step=100 이면:
+
+        1~6일   100        (기본만)
+        7일     100 + 100  = 200   ← 1주차
+        8~13일  100
+        14일    100 + 200  = 300   ← 2주차
+        21일    100 + 300  = 400   ← 3주차
+
+    매일 조금씩 얹는 방식보다 '일주일을 채웠다'는 감각이 분명합니다.
     """
     base = int(settings.get("base", 100))
-    step = int(settings.get("step", 0))
-    cap = int(settings.get("max_bonus", 0))
-    # 첫날(streak=1)은 가산이 없습니다. 이틀째부터 붙습니다.
-    bonus = min(max(streak - 1, 0) * step, cap) if step > 0 else 0
+    cycle = int(settings.get("cycle", 0) or 0)
+    step = int(settings.get("cycle_step", 0) or 0)
+    cap = int(settings.get("cycle_max", 0) or 0)
+
+    bonus = 0
+    if cycle > 0 and step > 0 and streak > 0 and streak % cycle == 0:
+        bonus = (streak // cycle) * step
+        if cap > 0:
+            bonus = min(bonus, cap)
+
     milestone = int((settings.get("milestones") or {}).get(str(streak), 0) or 0)
     return base, bonus, milestone
+
+
+def next_cycle_day(streak: int, settings: dict) -> tuple[int, int] | None:
+    """다음 주기 달성일과 그때 받을 추가 보상. 주기를 안 쓰면 None."""
+    cycle = int(settings.get("cycle", 0) or 0)
+    step = int(settings.get("cycle_step", 0) or 0)
+    cap = int(settings.get("cycle_max", 0) or 0)
+    if cycle <= 0 or step <= 0:
+        return None
+    day = ((streak // cycle) + 1) * cycle
+    reward = (day // cycle) * step
+    if cap > 0:
+        reward = min(reward, cap)
+    return day, reward
 
 
 async def get_checkin_settings(guild_id: int) -> dict:

@@ -5,14 +5,16 @@ from discord import app_commands
 from utils.database import (
     checkin_user, get_user_points, get_top_users, get_user_rank,
     is_user_blacklisted, add_user_points, deduct_user_points, add_activity_log,
-    get_checkin_settings, save_checkin_settings, streak_reward,
+    get_checkin_settings, save_checkin_settings, streak_reward, next_cycle_day,
 )
 
-def _next_milestone(streak: int, settings: dict) -> tuple[int, int] | None:
-    """지금 연속일수 기준으로 다음에 올 마일스톤. 없으면 None."""
-    ms = settings.get("milestones") or {}
+def _next_goal(streak: int, settings: dict) -> tuple[int, int] | None:
+    """다음에 올 목표(주기 달성일 또는 특별 보상) 중 가장 가까운 것."""
     upcoming = []
-    for k, v in ms.items():
+    cyc = next_cycle_day(streak, settings)
+    if cyc:
+        upcoming.append(cyc)
+    for k, v in (settings.get("milestones") or {}).items():
         try:
             day = int(k)
         except (TypeError, ValueError):
@@ -85,41 +87,55 @@ class PointGuideView(discord.ui.View):
 class CheckinRewardModal(discord.ui.Modal, title="🔥 연속 출석 보상 설정"):
     """수치를 코드에 박지 않고 운영진이 직접 조정합니다."""
 
-    base = discord.ui.TextInput(label="기본 지급량 (P)", placeholder="예: 100",
+    base = discord.ui.TextInput(label="매일 기본 지급량 (P)", placeholder="예: 100",
                                 required=True, max_length=6)
-    step = discord.ui.TextInput(label="연속 하루당 가산 (P) · 0이면 사용 안 함",
-                                placeholder="예: 10", required=True, max_length=6)
-    max_bonus = discord.ui.TextInput(label="가산 상한 (P)", placeholder="예: 100",
-                                     required=True, max_length=6)
+    cycle = discord.ui.TextInput(label="며칠마다 추가 보상? · 0이면 사용 안 함",
+                                 placeholder="예: 7", required=True, max_length=4)
+    cycle_step = discord.ui.TextInput(
+        label="주기당 증가폭 (P)",
+        placeholder="예: 100 -> 7일 +100, 14일 +200, 21일 +300",
+        required=True, max_length=7)
+    cycle_max = discord.ui.TextInput(label="추가 보상 상한 (P) · 0이면 무제한",
+                                     placeholder="예: 0", required=False, max_length=7)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             base = int(str(self.base.value).strip())
-            step = int(str(self.step.value).strip())
-            cap = int(str(self.max_bonus.value).strip())
+            cycle = int(str(self.cycle.value).strip())
+            step = int(str(self.cycle_step.value).strip())
+            cap = int(str(self.cycle_max.value or "0").strip() or 0)
         except ValueError:
             await interaction.response.send_message(
                 "⚠️ 숫자만 입력해 주세요.", ephemeral=True)
             return
-        if base < 0 or step < 0 or cap < 0:
+        if min(base, cycle, step, cap) < 0:
             await interaction.response.send_message(
                 "⚠️ 0 이상만 입력할 수 있습니다.", ephemeral=True)
             return
+        if cycle > 365:
+            await interaction.response.send_message(
+                "⚠️ 주기는 365일 이하로 정해 주세요.", ephemeral=True)
+            return
 
-        await save_checkin_settings(interaction.guild.id,
-                                    {"base": base, "step": step, "max_bonus": cap})
+        await save_checkin_settings(interaction.guild.id, {
+            "base": base, "cycle": cycle, "cycle_step": step, "cycle_max": cap})
         settings = await get_checkin_settings(interaction.guild.id)
+
         embed = discord.Embed(title="🔥 연속 출석 보상 변경 완료",
                               color=discord.Color.green())
-        embed.add_field(name="기본", value=f"{base:,} P", inline=True)
-        embed.add_field(name="하루당 가산", value=f"+{step:,} P", inline=True)
-        embed.add_field(name="가산 상한", value=f"{cap:,} P", inline=True)
+        embed.add_field(name="매일 기본", value=f"{base:,} P", inline=True)
+        embed.add_field(name="주기",
+                        value=(f"{cycle}일마다" if cycle else "사용 안 함"), inline=True)
+        embed.add_field(name="주기당 증가폭", value=f"+{step:,} P", inline=True)
+        if cap:
+            embed.add_field(name="추가 보상 상한", value=f"{cap:,} P", inline=True)
         embed.add_field(name="📈 이렇게 지급됩니다",
                         value=_reward_preview(settings), inline=False)
+        embed.set_footer(text="추가 보상은 주기를 채운 날에만 붙습니다")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-class MilestoneModal(discord.ui.Modal, title="🎯 연속 달성 보상 설정"):
+class MilestoneModal(discord.ui.Modal, title="🎯 특별 보상 설정"):
     raw = discord.ui.TextInput(
         label="연속일수:보상 (쉼표로 구분)",
         placeholder="예: 7:300, 14:700, 30:2000",
@@ -144,7 +160,7 @@ class MilestoneModal(discord.ui.Modal, title="🎯 연속 달성 보상 설정")
 
         await save_checkin_settings(interaction.guild.id, {"milestones": milestones})
         embed = discord.Embed(
-            title="🎯 연속 달성 보상 변경 완료",
+            title="🎯 특별 보상 변경 완료",
             description=("설정된 목표가 없습니다. (달성 보상 미사용)" if not milestones else
                          "\n".join(f"• **{d}일** 연속 → **+{v:,} P**"
                                      for d, v in sorted(milestones.items(), key=lambda x: int(x[0])))),
@@ -154,12 +170,23 @@ class MilestoneModal(discord.ui.Modal, title="🎯 연속 달성 보상 설정")
 
 
 def _reward_preview(settings: dict) -> str:
-    """설정값이 실제로 얼마가 되는지 미리 보여줍니다."""
+    """설정값이 실제로 얼마가 되는지 미리 보여줍니다.
+
+    숫자만 바꿔놓고 결과를 모르면 조정할 수가 없습니다. 며칠차에 얼마인지
+    직접 계산해서 보여줍니다.
+    """
+    cycle = int(settings.get("cycle", 0) or 0)
+    days = [1]
+    if cycle > 0:
+        days += [cycle - 1, cycle, cycle + 1, cycle * 2, cycle * 3, cycle * 4]
+    else:
+        days += [7, 14, 30]
     rows = []
-    for d in (1, 2, 7, 14, 30):
+    for d in sorted(set(x for x in days if x > 0))[:7]:
         b, bo, ms = streak_reward(d, settings)
-        tag = f"  🎉+{ms:,}" if ms else ""
-        rows.append(f"`{d:2}일차`  {b + bo + ms:,} P  (기본 {b:,} + 가산 {bo:,}){tag}")
+        tag = "  🔥주기 달성" if bo else ""
+        tag += f"  🎉특별 +{ms:,}" if ms else ""
+        rows.append(f"`{d:3}일차`  **{b + bo + ms:,} P**{tag}")
     return "\n".join(rows)
 
 
@@ -170,10 +197,11 @@ class CheckinSettingsSelect(discord.ui.Select):
             options=[
                 discord.SelectOption(
                     label="연속 출석 보상", value="reward", emoji="🔥",
-                    description=(f"기본 {settings.get('base', 100)} P · "
-                                 f"하루당 +{settings.get('step', 0)} P")[:95]),
+                    description=(f"매일 {settings.get('base', 100)} P · "
+                                 f"{settings.get('cycle', 0)}일마다 "
+                                 f"+{settings.get('cycle_step', 0)} P씩")[:95]),
                 discord.SelectOption(
-                    label="연속 달성 보상", value="milestone", emoji="🎯",
+                    label="특별 보상 (선택)", value="milestone", emoji="🎯",
                     description=(f"현재 {len(settings.get('milestones') or {})}개 지정됨")[:95]),
                 discord.SelectOption(
                     label="현재 설정 확인", value="view", emoji="📋",
@@ -190,12 +218,17 @@ class CheckinSettingsSelect(discord.ui.Select):
             settings = await get_checkin_settings(interaction.guild.id)
             embed = discord.Embed(title="📋 현재 출석 보상 설정",
                                   color=discord.Color.blurple())
-            embed.add_field(name="기본", value=f"{settings.get('base', 0):,} P", inline=True)
-            embed.add_field(name="하루당 가산", value=f"+{settings.get('step', 0):,} P", inline=True)
-            embed.add_field(name="가산 상한", value=f"{settings.get('max_bonus', 0):,} P", inline=True)
+            cyc = int(settings.get("cycle", 0) or 0)
+            embed.add_field(name="매일 기본", value=f"{settings.get('base', 0):,} P", inline=True)
+            embed.add_field(name="주기", value=(f"{cyc}일마다" if cyc else "사용 안 함"), inline=True)
+            embed.add_field(name="주기당 증가폭",
+                            value=f"+{settings.get('cycle_step', 0):,} P", inline=True)
+            cap = int(settings.get("cycle_max", 0) or 0)
+            if cap:
+                embed.add_field(name="추가 보상 상한", value=f"{cap:,} P", inline=True)
             ms = settings.get("milestones") or {}
             embed.add_field(
-                name="🎯 연속 달성 보상",
+                name="🎯 특별 보상",
                 value=("\n".join(f"• **{d}일** → **+{int(v):,} P**"
                                    for d, v in sorted(ms.items(), key=lambda x: int(x[0])))
                        if ms else "없음"),
@@ -237,9 +270,9 @@ class CheckIn(commands.Cog):
             # 걸 눈으로 봐야 다음 날 또 오게 됩니다.
             parts = [f"기본 **{result['base']} P**"]
             if result["bonus"]:
-                parts.append(f"연속 보너스 **+{result['bonus']} P**")
+                parts.append(f"🔥 {streak}일 연속 달성 **+{result['bonus']:,} P**")
             if result["milestone"]:
-                parts.append(f"🎉 {streak}일 달성 **+{result['milestone']} P**")
+                parts.append(f"🎉 특별 보상 **+{result['milestone']:,} P**")
 
             embed = discord.Embed(
                 title="✅ 출석체크 완료!",
@@ -252,7 +285,7 @@ class CheckIn(commands.Cog):
             embed.add_field(name="🧮 지급 내역", value="  ·  ".join(parts), inline=False)
 
             settings = await get_checkin_settings(interaction.guild.id)
-            nxt = _next_milestone(streak, settings)
+            nxt = _next_goal(streak, settings)
             if nxt:
                 days, reward = nxt
                 embed.add_field(

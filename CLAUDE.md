@@ -88,10 +88,10 @@ asyncio.run(m())"
 
 | | 포인트 이코노미 | 인증 / 링크 보호 |
 | :--- | :--- | :--- |
-| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` | `verify` `link_guard` `roblox_link` |
+| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
 | 보조 모듈 | `utils/health.py`(공용) | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
-| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
+| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
 
 `verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
 
@@ -245,6 +245,35 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 **세 경로의 파일 형식은 같아야 합니다.** 채널에서 받은 파일을 그대로
 `tools/full_backup.py restore` 에 넣을 수 있어야 백업으로서 의미가 있습니다.
 
+## 퀘스트 · 연속 출석 (포인트 수급처)
+
+채팅·출석만으로는 포인트가 잘 모이지 않아 넓힌 수급처입니다.
+**수치는 전부 설정값**입니다. 운영진이 `/출석설정` `/퀘스트설정` 으로 직접
+조정하므로 코드에 박으면 조정할 때마다 개발자를 불러야 합니다.
+
+- **퀘스트 목록은 저장하지 않습니다.** 무작위 씨앗이 `길드:유저:날짜` 라
+  같은 사람은 하루 동안 같은 목록을 보고, 사람마다 다른 조합을 받습니다.
+  저장하면 1,245명분 문서를 매일 써야 하는데 계산이 더 쌉니다.
+  **씨앗에서 user_id 를 빼지 마세요** — 전원이 같은 퀘스트를 받게 됩니다.
+- **풀 크기가 바뀌면 뽑기 결과가 통째로 달라집니다.** `channel_id` 를 해제하면
+  `channel_chat` 이 풀에서 빠지면서 그날 목록이 바뀝니다. 개수(`daily_count`)
+  변경은 안전합니다(같은 씨앗의 `random.sample` 은 앞부분이 유지됩니다).
+- **진행도는 전부 `$inc`** 입니다. 읽고 계산해서 쓰면 채팅이 몰릴 때 집계가
+  뭉개집니다. 보상 수령도 '아직 안 받음'을 필터에 넣어 서버 측에서 판정합니다.
+- **선착순 등수는 `$inc` 의 반환값을 그대로** 씁니다. 읽고 더하면 동시에
+  출석한 사람들이 같은 등수를 받습니다.
+- **연속 출석 보상은 두 번의 `$inc`** 로 나갑니다. 첫 연산이 `last_checkin` 을
+  오늘로 바꿔 동시 요청을 막으므로, 두 번째(보너스)가 중복될 수 없습니다.
+- **주간 키는 일요일 시작**입니다. `isocalendar()` 는 월요일 시작이라 하루를
+  더해 밀어냅니다. 이걸 되돌리면 주간 퀘스트가 월요일에 초기화됩니다.
+
+### ⚠️ 모든 메시지 경로에 들어가는 코드는 캐시하세요
+
+`get_quest_settings()` 는 `on_message` 에서 불립니다. 캐시 없이 두면
+**채팅 한 줄마다 DB 를 읽습니다.** 블랙리스트를 캐시하는 것과 같은 이유입니다.
+그리고 기능이 **꺼져 있으면 아예 쓰지 않도록** 순서를 잡으세요 —
+꺼진 기능이 모든 메시지마다 DB 에 쓰고 있던 적이 있습니다.
+
 ## 이미 밟은 지뢰
 
 - **매크로 홍보 링크 오인** — 매크로 임베드에는 제작자 사이트 링크가 섞여 있습니다. `roblox_only=True`(기본값)로 로블록스 링크만 보호하고, 나머지는 원문 그대로 둡니다. 이걸 끄면 버튼이 엉뚱한 주소로 연결됩니다.
@@ -262,6 +291,15 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
   새 로그성 컬렉션을 만들 때 **양쪽 경로 모두** 상한을 거세요.
 - **동시 완료 순서는 값의 크기 순이 아닙니다.** 디바운스에 "마지막에 도착한 값"을
   쓰면 20명이 눌렀는데 13명으로 남습니다. 단조 증가하는 값은 **최댓값**을 쓰세요.
+- **설정 화면의 드롭다운 설명은 View 를 만들 때 값으로 굳습니다.** 값을 바꾼 뒤
+  메시지를 다시 그리지 않으면 켰는데도 '꺼짐'으로 보입니다. 컴포넌트·모달
+  상호작용은 `interaction.response.edit_message()` 로 자기를 띄운 메시지를
+  고칠 수 있으니, 저장 후 패널을 다시 그리세요.
+- **패널 임베드는 명령어와 갱신이 같은 함수를 써야 합니다.** 따로 두면 한쪽만
+  고쳐져 다시 어긋납니다.
+- **상수는 쓰는 곳보다 먼저 정의하세요.** `QUEST_PROGRESS_TTL_DAYS` 를 파일
+  아래쪽에 뒀더니 인덱스 생성 시점에 `NameError` 가 나고, 그게 `try/except` 에
+  삼켜져 **TTL 인덱스가 조용히 안 만들어질** 뻔했습니다.
 - **`ObjectId` · `datetime` 을 문자열로 뭉개면 복원이 조용히 망가집니다.**
   TTL 인덱스는 BSON Date 를 요구하므로, 타입이 달라지면 데이터가 영영 안 지워집니다.
   백업은 `{"$oid":...}` `{"$date":...}` 형태로 타입을 보존하세요.

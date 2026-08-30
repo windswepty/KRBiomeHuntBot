@@ -1398,7 +1398,7 @@ class Quest(commands.Cog):
                      "다 같이 채운 목표라 최소한의 참여를 요구합니다.")
         rd = int(settings.get("goal_reset_days", 1))
         if rd <= 1:
-            title = "🤝 오늘의 서버 공동 목표"
+            title = "🤝 서버 공동 목표"
             reset_text = "매일 밤 12시"
         else:
             title = f"🤝 서버 공동 목표 ({rd}일 주기)"

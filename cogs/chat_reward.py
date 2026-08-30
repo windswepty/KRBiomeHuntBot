@@ -372,16 +372,11 @@ class ChatReward(commands.Cog):
             return
 
         # 3. Strip all general URLs (http://, https://)
-        without_urls = re.sub(r'https?://\S+', '', content)
+        without_urls = re.sub(r'https?://\S+', '', content).strip()
 
-        # 4. Strip custom Discord emojis (<:name:id> or <a:name:id>)
-        without_custom_emojis = re.sub(r'<a?:[a-zA-Z0-9_]+:[0-9]+>', '', without_urls)
-
-        # 5. Strip unicode emojis
-        without_emojis = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27ff\u2300-\u23ff\200d\ufe0f]', '', without_custom_emojis).strip()
-
-        # If nothing remains after removing URLs and emojis, ignore.
-        if not without_emojis:
+        # If nothing remains after removing URLs, ignore.
+        # 이모지만 보낸 메시지도 채팅으로 인정합니다.
+        if not without_urls:
             return
 
         # 블랙리스트 검사는 **가장 마지막**에 합니다.

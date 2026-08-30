@@ -1390,13 +1390,28 @@ class Quest(commands.Cog):
         reached = target > 0 and progress >= target
 
         need = goal_min_chat(settings)
-        desc = (f"서버 전체가 함께 **채팅 {target:,}회** 를 채우면\n"
+        rd = int(settings.get("goal_reset_days", 1))
+
+        # 현재 주기의 날짜 범위를 계산합니다.
+        from utils.database import KST
+        now = datetime.datetime.now(KST)
+        if rd <= 1:
+            date_text = f"📅 {now.month}/{now.day}"
+        else:
+            anchor = datetime.datetime(2024, 1, 1, tzinfo=KST)
+            days_since = (now.date() - anchor.date()).days
+            period_start_offset = (days_since // rd) * rd
+            start = anchor.date() + datetime.timedelta(days=period_start_offset)
+            end = start + datetime.timedelta(days=rd - 1)
+            date_text = f"📅 {start.month}/{start.day} ~ {end.month}/{end.day}"
+
+        desc = (f"{date_text}\n\n"
+                f"서버 전체가 함께 **채팅 {target:,}회** 를 채우면\n"
                 f"**+{int(settings.get('goal_reward', 0)):,} P** 가 지급됩니다.")
         if need > 0:
             desc += (f"\n\n단, 본인도 **{need:,}회 이상** 대화해야 받을 수 있습니다."
                      f"\n-# 목표치의 {settings.get('goal_min_percent', 0)}% 입니다. "
                      "다 같이 채운 목표라 최소한의 참여를 요구합니다.")
-        rd = int(settings.get("goal_reset_days", 1))
         if rd <= 1:
             title = "🤝 서버 공동 목표"
             reset_text = "매일 밤 12시"

@@ -110,11 +110,19 @@ def peek_owner(token: str) -> tuple[int, int] | None:
     신원 게이트가 "이 링크가 누구 것인지"를 먼저 알아야 하는데,
     redeem() 을 쓰면 확인만 하고도 링크가 소모돼 버립니다.
     반환값은 (guild_id, user_id) 이며, 없거나 만료면 None 입니다.
+
+    **이미 다 쓴 토큰도 없는 것으로 봅니다.** 여기서 소유자를 돌려주면
+    호출부가 신원 게이트로 보내는데, 유저는 디스코드 로그인을 전부 마치고
+    돌아온 뒤에야 "이미 사용된 링크"를 보게 됩니다. 게다가 그 과정에서
+    죽은 토큰의 수명을 연장해 메모리에 더 오래 남깁니다.
+    None 을 주면 호출부가 곧바로 소비 경로로 넘겨 정확한 사유를 띄웁니다.
     """
     now = time.monotonic()
     with _lock:
         info = _tokens.get(token)
         if info is None or info["expires"] <= now:
+            return None
+        if info["uses"] >= MAX_USES:
             return None
         return info["guild_id"], info["user_id"]
 

@@ -37,6 +37,15 @@ QUEST_PROGRESS_TTL_DAYS = 21
 # 폴백 모드에서 NameError 가 납니다. 항상 존재하도록 미리 둡니다.
 _AFTER = None
 
+# 중복 키 오류는 이 코드베이스에서 **정상 흐름**입니다. 필터에 '아직 안 받음'을
+# 넣고 upsert 하면, 이미 받은 경우 필터에 안 걸려 삽입으로 넘어가고 같은 _id 라
+# 중복 키가 납니다. 그걸로 '이미 받음'을 판정하므로 진짜 장애와 구분해야 합니다.
+try:
+    from pymongo.errors import DuplicateKeyError as _DuplicateKey
+except ImportError:                       # 폴백 모드에서는 잡을 일이 없습니다
+    class _DuplicateKey(Exception):
+        pass
+
 # MongoDB setup
 # 저장 모드 — 포인트가 어디에 쌓이는지 나타냅니다.
 #   "mongo"      : 영구 보존 (정상)
@@ -2340,8 +2349,15 @@ async def claim_quest(guild_id: int, user_id: int, quest_id: str,
                             upsert=True, return_document=_AFTER)
             if doc is None:
                 return False
+        except _DuplicateKey:
+            # 이미 받은 뒤 한 번 더 누른 경우입니다. 필터에 안 걸려 삽입으로
+            # 넘어갔고 같은 _id 라 중복 키가 났습니다. **의도된 동작**이므로
+            # 조용히 넘깁니다. 여기서 로그를 남기면 유저가 버튼을 두 번 누를
+            # 때마다 'DB 오류'처럼 보이는 줄이 쌓입니다. 무인 운영에서 진짜
+            # 장애를 찾을 때 이런 줄이 제일 방해가 됩니다.
+            return False
         except Exception as e:
-            # 중복 키 등으로 실패하면 이미 받은 것으로 봅니다(포인트 보호 우선)
+            # 여기까지 온 것은 진짜 이상입니다. 포인트 보호를 우선해 막습니다.
             print(f"MongoDB claim_quest error: {e}", flush=True)
             return False
         if reward > 0:

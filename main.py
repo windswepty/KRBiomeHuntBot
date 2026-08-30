@@ -235,26 +235,67 @@ def check_storage_or_die() -> None:
 
 
 async def main():
-    check_storage_or_die()
     if not TOKEN:
         print("ERROR: DISCORD_TOKEN is not set in .env file!", flush=True)
         sys.exit(1)
     async with bot:
         await load_cogs()
-        keep_alive()
         await bot.start(TOKEN)
 
 
+# ── 429 재시도 래퍼 ──────────────────────────────────────────────────
+#
+# bot.start(TOKEN) 이 429 로 실패하면 Render 가 프로세스를 재시작합니다.
+# 재시작하면 또 로그인을 시도하고, 그것도 무효 요청으로 집계돼 차단이
+# 연장됩니다. **프로세스 안에서 기다려야** 이 고리가 끊어집니다.
+#
+# 429 를 받으면 60초 간격으로 최대 30회(약 30분) 기다린 뒤 재시도합니다.
+# 그래도 안 되면 그때 프로세스를 종료해 Render 에 맡깁니다.
+
+MAX_429_RETRIES = 30
+RETRY_WAIT_SECONDS = 60
+
+
+def _run_with_429_retry():
+    """429 에 걸려도 프로세스를 즉시 죽이지 않고, 충분히 기다린 뒤 재시도."""
+    import time as _time
+
+    # Flask 헬스 서버를 가장 먼저 띄웁니다. 429 대기 중에도 /health 가
+    # 응답해야 Render 가 프로세스를 강제 종료하지 않습니다.
+    check_storage_or_die()
+    keep_alive()
+
+    for attempt in range(1, MAX_429_RETRIES + 1):
+        try:
+            asyncio.run(main())
+            # main() 이 정상 반환 → 봇이 스스로 종료 (무인 운영에서는 비정상)
+            return
+        except KeyboardInterrupt:
+            return
+        except discord.HTTPException as e:
+            if e.status == 429:
+                health.mark_rate_limited()
+                print(f"[Boot] 429 전역 레이트 리밋 — "
+                      f"{RETRY_WAIT_SECONDS}초 대기 후 재시도 "
+                      f"({attempt}/{MAX_429_RETRIES})", flush=True)
+                _time.sleep(RETRY_WAIT_SECONDS)
+                continue
+            # 429 가 아닌 HTTP 오류는 재시도해도 의미 없음
+            print(f"FATAL: {type(e).__name__}: {e}", flush=True)
+            sys.exit(1)
+        except Exception as e:
+            print(f"FATAL: {type(e).__name__}: {e}", flush=True)
+            sys.exit(1)
+
+    # 30회 재시도(약 30분) 후에도 실패
+    print(f"[Boot] {MAX_429_RETRIES}회 재시도 후에도 429 — "
+          "프로세스를 종료합니다", flush=True)
+    sys.exit(1)
+
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        # 어떤 이유로든 떨어지면 **실패로 끝내야** 호스팅이 다시 띄웁니다.
-        # 조용히 0 으로 끝나면 '정상 종료'로 보고 그대로 멈춰 있을 수 있습니다.
-        print(f"FATAL: {type(e).__name__}: {e}", flush=True)
-        sys.exit(1)
+    _run_with_429_retry()
     # 정상 흐름으로 여기까지 왔다는 것은 봇이 스스로 종료된 것입니다.
     # 무인 운영에서는 이것도 비정상이므로 재시작을 유도합니다.
     sys.exit(1)
+

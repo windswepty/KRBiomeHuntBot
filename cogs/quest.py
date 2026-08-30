@@ -1037,9 +1037,10 @@ class GoalSettingsSelect(discord.ui.Select):
                                  else "현재: 꺼짐")),
                 discord.SelectOption(
                     label="수치 설정", value="numbers", emoji="📊",
-                    description=(f"채팅 {settings.get('goal_target', 0):,}회 → "
-                                 f"{settings.get('goal_reward', 0):,} P · "
-                                 f"본인 {goal_min_chat(settings):,}회 이상")[:95]),
+                    description=(f"{settings.get('goal_target', 0):,}회→"
+                                 f"{settings.get('goal_reward', 0):,}P·"
+                                 f"최소{goal_min_chat(settings):,}회·"
+                                 f"{settings.get('goal_reset_days', 1)}일 주기")[:95]),
                 discord.SelectOption(
                     label="안내 채널", value="channel", emoji="📢",
                     description=(f"현재: #{gch.name}" if gch else "미설정")[:95]),

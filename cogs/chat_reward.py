@@ -418,6 +418,9 @@ class ChatReward(commands.Cog):
                         channel_field(message.channel.id, weekly=True), weekly=True)
                 if settings.get("goal_enabled"):
                     await bump_server_goal(message.guild.id)
+                    quest_cog = self.bot.get_cog("Quest")
+                    if quest_cog:
+                        quest_cog.notify_goal_changed(message.guild.id)
                 await bump_event_progress(message.guild.id, message.author.id, "chat")
         except Exception as e:
             print(f"[Quest] 채팅 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)

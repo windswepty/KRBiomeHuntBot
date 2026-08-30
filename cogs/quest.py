@@ -13,6 +13,7 @@
 """
 
 import re
+import time
 import datetime
 
 import discord
@@ -32,9 +33,13 @@ from utils.database import (
     QUEST_KINDS,
 )
 
-# 공동 목표 진행 임베드를 몇 초마다 갱신할지. 메시지 수정이라 채널이
-# 올라가지 않고 알림도 울리지 않습니다.
+# 공동 목표 진행 임베드의 폴백 갱신 주기. 채팅 이벤트로 실시간 갱신되지만,
+# 이벤트를 놓쳤을 때를 대비해 주기적으로도 갱신합니다.
 GOAL_REFRESH_SECONDS = 120
+
+# 채팅 이벤트에 의한 실시간 갱신 쿨다운. 이 시간 이내에 여러 채팅이 와도
+# 임베드 수정은 한 번만 합니다.
+GOAL_UPDATE_COOLDOWN = 10
 
 NL = chr(10)
 
@@ -1265,10 +1270,53 @@ class QuestSettingsView(discord.ui.View):
 class Quest(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._goal_dirty: dict[int, bool] = {}   # guild_id → 갱신 필요 여부
+        self._goal_last_update: dict[int, float] = {}  # guild_id → 마지막 갱신 시각
         self.goal_refresh.start()
+        self._goal_realtime.start()
 
     def cog_unload(self):
         self.goal_refresh.cancel()
+        self._goal_realtime.cancel()
+
+    def notify_goal_changed(self, guild_id: int) -> None:
+        """외부 cog에서 공동 목표 진행도가 변했을 때 호출합니다."""
+        self._goal_dirty[guild_id] = True
+
+    @tasks.loop(seconds=3)
+    async def _goal_realtime(self):
+        """dirty 플래그가 켜진 길드만 쿨다운 후 갱신합니다.
+
+        3초마다 확인하되, 마지막 갱신으로부터 GOAL_UPDATE_COOLDOWN 초가
+        지나지 않았으면 건너뜁니다. 채팅이 몰려도 10초에 1회만 수정합니다.
+        """
+        await self.bot.wait_until_ready()
+        if health.goal_backoff.active():
+            return
+        now = time.monotonic()
+        for guild_id in list(self._goal_dirty):
+            if not self._goal_dirty.get(guild_id):
+                continue
+            last = self._goal_last_update.get(guild_id, 0)
+            if now - last < GOAL_UPDATE_COOLDOWN:
+                continue   # 쿨다운 중
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                self._goal_dirty.pop(guild_id, None)
+                continue
+            try:
+                await self.update_goal_message(guild)
+                health.goal_backoff.reset()
+                self._goal_last_update[guild_id] = time.monotonic()
+            except Exception as e:
+                print(f"[Quest] {guild.name}: 실시간 목표 갱신 실패 - "
+                      f"{type(e).__name__}: {e}", flush=True)
+            finally:
+                self._goal_dirty[guild_id] = False
+
+    @_goal_realtime.error
+    async def _goal_realtime_error(self, error):
+        await health.revive_loop(self._goal_realtime, "_goal_realtime", error)
 
     # ── 공동 목표 ────────────────────────────────────────────────────
 

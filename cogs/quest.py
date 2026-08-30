@@ -313,17 +313,22 @@ class RandomChannelSelect(discord.ui.ChannelSelect):
 
 
 class GoalChannelSelect(discord.ui.ChannelSelect):
-    """공동 목표 진행도를 보여줄 채널 (하나)."""
+    """공동 목표 진행도를 보여줄 채널 또는 스레드 (하나)."""
 
     def __init__(self):
-        super().__init__(placeholder="공동 목표 안내 채널을 고르세요...",
-                         channel_types=[discord.ChannelType.text],
+        super().__init__(placeholder="공동 목표 안내 채널/스레드를 고르세요...",
+                         channel_types=[
+                             discord.ChannelType.text,
+                             discord.ChannelType.public_thread,
+                             discord.ChannelType.private_thread,
+                         ],
                          min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        ch = interaction.guild.get_channel(self.values[0].id)
+        ch = (interaction.guild.get_channel_or_thread(self.values[0].id)
+              or interaction.guild.get_channel(self.values[0].id))
         if ch is None:
-            await interaction.response.send_message("⚠️ 채널을 찾을 수 없습니다.",
+            await interaction.response.send_message("⚠️ 채널/스레드를 찾을 수 없습니다.",
                                                     ephemeral=True)
             return
         if not ch.permissions_for(interaction.guild.me).send_messages:
@@ -1000,7 +1005,8 @@ class WeeklySettingsView(discord.ui.View):
 
 class GoalSettingsSelect(discord.ui.Select):
     def __init__(self, settings: dict, guild: discord.Guild):
-        gch = (guild.get_channel(int(settings["goal_channel_id"]))
+        gch = ((guild.get_channel_or_thread(int(settings["goal_channel_id"]))
+                or guild.get_channel(int(settings["goal_channel_id"])))
                if settings.get("goal_channel_id") else None)
         super().__init__(
             placeholder="공동 목표 설정...",
@@ -1196,7 +1202,8 @@ class QuestSettingsSelect(discord.ui.Select):
             for cid in chans:
                 ch = guild.get_channel(int(cid))
                 cur.append(ch.mention if ch else f"`#{cid}`")
-            gch = (guild.get_channel(int(settings["goal_channel_id"]))
+            gch = ((guild.get_channel_or_thread(int(settings["goal_channel_id"]))
+                    or guild.get_channel(int(settings["goal_channel_id"])))
                    if settings.get("goal_channel_id") else None)
             goals = settings.get("goals", {})
             events = await list_events(guild.id)
@@ -1300,9 +1307,16 @@ class Quest(commands.Cog):
         channel_id = settings.get("goal_channel_id")
         if not channel_id:
             return
-        channel = guild.get_channel(int(channel_id))
+        channel = (guild.get_channel_or_thread(int(channel_id))
+                   or guild.get_channel(int(channel_id)))
         if channel is None or not channel.permissions_for(guild.me).send_messages:
             return
+        # 스레드가 보관(archived)되어 있으면 되살립니다.
+        if isinstance(channel, discord.Thread) and channel.archived:
+            try:
+                await channel.edit(archived=False)
+            except discord.HTTPException:
+                return  # 권한 부족 등으로 되살리지 못하면 포기
 
         state = await get_server_goal(guild.id)
         target = int(settings.get("goal_target", 0) or 0)

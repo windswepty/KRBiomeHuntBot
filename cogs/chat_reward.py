@@ -417,7 +417,10 @@ class ChatReward(commands.Cog):
                         message.guild.id, message.author.id,
                         channel_field(message.channel.id, weekly=True), weekly=True)
                 if settings.get("goal_enabled"):
-                    await bump_server_goal(message.guild.id)
+                    await bump_server_goal(
+                        message.guild.id,
+                        reset_days=settings.get("goal_reset_days", 1)
+                    )
                     quest_cog = self.bot.get_cog("Quest")
                     if quest_cog:
                         quest_cog.notify_goal_changed(message.guild.id)

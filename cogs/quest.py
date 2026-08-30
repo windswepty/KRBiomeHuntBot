@@ -196,8 +196,11 @@ def build_quest_panel(settings: dict) -> discord.Embed:
                     inline=True)
     embed.add_field(name="일일 퀘스트",
                     value=f"{settings.get('daily_count', 0)}개 / 일", inline=True)
+    reset_days = settings.get("goal_reset_days", 1)
+    reset_text = f"{reset_days}일마다" if reset_days > 1 else "매일"
+    
     embed.add_field(name="공동 목표",
-                    value="✅ 켜짐" if settings.get("goal_enabled") else "❌ 꺼짐",
+                    value=f"{'✅ 켜짐' if settings.get('goal_enabled') else '❌ 꺼짐'} ({reset_text})",
                     inline=True)
 
     # 관리자 전용 모드는 '켜짐' 위에 얹는 필터입니다. 퀘스트가 꺼져 있으면
@@ -247,12 +250,18 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
         label="본인 최소 참여 (%) · 0이면 조건 없음",
         placeholder="예: 1  ->  목표 3,000회면 본인이 30회 이상",
         required=False, max_length=4)
+    reset_days = discord.ui.TextInput(
+        label="초기화 주기 (일)",
+        placeholder="예: 1 (매일), 3 (3일마다)",
+        required=False, max_length=3, default="1")
+
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             t = int(str(self.target.value).strip())
             r = int(str(self.reward.value).strip())
             pct = float(str(self.min_percent.value or "0").strip() or 0)
+            rd = int(str(self.reset_days.value or "1").strip() or 1)
         except ValueError:
             await interaction.response.send_message("⚠️ 숫자만 입력해 주세요.",
                                                     ephemeral=True)
@@ -265,9 +274,14 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
             await interaction.response.send_message(
                 "⚠️ 참여 비율은 0~100 사이여야 합니다.", ephemeral=True)
             return
+        if rd < 1:
+            await interaction.response.send_message(
+                "⚠️ 초기화 주기는 1일 이상이어야 합니다.", ephemeral=True)
+            return
+            
         await save_quest_settings(interaction.guild.id,
                                   {"goal_target": t, "goal_reward": r,
-                                   "goal_min_percent": pct})
+                                   "goal_min_percent": pct, "goal_reset_days": rd})
         embed = discord.Embed(title="🤝 공동 목표 변경 완료",
                               color=discord.Color.green())
         embed.add_field(name="목표", value=f"서버 전체 채팅 {t:,}회", inline=True)
@@ -278,7 +292,8 @@ class ServerGoalModal(discord.ui.Modal, title="🤝 서버 공동 목표 설정"
             name="🔒 본인 최소 참여",
             value=(f"{pct:g}% = **{need:,}회 이상**" if need else "조건 없음"),
             inline=True)
-        embed.set_footer(text="목표는 매일 밤 12시(KST)에 초기화됩니다")
+        reset_text = f"매일 밤 12시" if rd <= 1 else f"{rd}일마다 자정"
+        embed.set_footer(text=f"목표는 {reset_text}(KST)에 초기화됩니다")
         await refresh_panel(interaction, embed)
 
 
@@ -1366,7 +1381,7 @@ class Quest(commands.Cog):
             except discord.HTTPException:
                 return  # 권한 부족 등으로 되살리지 못하면 포기
 
-        state = await get_server_goal(guild.id)
+        state = await get_server_goal(guild.id, reset_days=settings.get("goal_reset_days", 1))
         target = int(settings.get("goal_target", 0) or 0)
         progress = state["progress"]
         reached = target > 0 and progress >= target
@@ -1418,7 +1433,11 @@ class Quest(commands.Cog):
         except discord.HTTPException as e:
             print(f"[Quest] 공동 목표 생성 실패: {e}", flush=True)
             return
-        await mark_server_goal(guild.id, goal_message_id=str(msg.id))
+        await mark_server_goal(
+            guild.id, 
+            reset_days=settings.get("goal_reset_days", 1), 
+            goal_message_id=str(msg.id)
+        )
 
     # ── 유저용 ───────────────────────────────────────────────────────
 
@@ -1571,7 +1590,7 @@ class Quest(commands.Cog):
 
         # ── 공동 목표 ───────────────────────────────────────────────
         if settings.get("goal_enabled"):
-            state = await get_server_goal(guild.id)
+            state = await get_server_goal(guild.id, reset_days=settings.get("goal_reset_days", 1))
             target = int(settings.get("goal_target", 0) or 0)
             prog = state["progress"]
             reached = target > 0 and prog >= target

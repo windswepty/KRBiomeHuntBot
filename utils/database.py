@@ -2150,6 +2150,7 @@ DEFAULT_QUEST_SETTINGS = {
     # 받아가는 무임승차를 막습니다. 0 이면 조건 없음.
     "goal_min_percent": 1,
     "goal_channel_id": None,   # 진행도를 보여줄 채널
+    "goal_reset_days": 1,      # 며칠마다 초기화할지 (기본 1일 = 매일)
 }
 
 
@@ -2170,6 +2171,25 @@ def quest_week(when: datetime | None = None) -> str:
     d = (when or datetime.now(KST)) + timedelta(days=1)
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
+
+
+def quest_goal_period(reset_days: int, when: datetime | None = None) -> str:
+    """공동 목표 초기화 주기에 따른 키를 생성합니다.
+    reset_days가 1 이하면 매일 초기화와 동일합니다.
+    """
+    if reset_days <= 1:
+        return quest_day(when)
+    
+    # 2024년 1월 1일을 기준일로 삼아 경과 일수를 계산합니다.
+    # 이렇게 하면 서버 시작일과 무관하게 모든 서버가 같은 주기를 공유하게 됩니다.
+    anchor = datetime(2024, 1, 1, tzinfo=KST)
+    d = when or datetime.now(KST)
+    days_since = (d.date() - anchor.date()).days
+    
+    # 예: reset_days가 3이면, 0~2일은 0, 3~5일은 1이 됩니다.
+    period_idx = days_since // reset_days
+    
+    return f"G{reset_days}D-{period_idx}"
 
 
 def _quest_key(guild_id: int, user_id: int, period_key: str) -> str:
@@ -2569,9 +2589,9 @@ def goal_min_chat(settings: dict) -> int:
     return max(1, math.ceil(target * pct / 100))
 
 
-async def bump_server_goal(guild_id: int, amount: int = 1) -> int:
+async def bump_server_goal(guild_id: int, amount: int = 1, reset_days: int = 1) -> int:
     """서버 공동 목표 진행도를 올리고 현재값을 돌려줍니다."""
-    key = f"{guild_id}:{quest_day()}"
+    key = f"{guild_id}:{quest_goal_period(reset_days)}"
     if quest_state_col is not None:
         try:
             doc = await _db(quest_state_col.find_one_and_update,
@@ -2595,9 +2615,9 @@ async def bump_server_goal(guild_id: int, amount: int = 1) -> int:
         return row["goal_progress"]
 
 
-async def get_server_goal(guild_id: int) -> dict:
+async def get_server_goal(guild_id: int, reset_days: int = 1) -> dict:
     """오늘 공동 목표 진행 상황."""
-    key = f"{guild_id}:{quest_day()}"
+    key = f"{guild_id}:{quest_goal_period(reset_days)}"
     doc = {}
     if quest_state_col is not None:
         try:
@@ -2617,8 +2637,8 @@ async def get_server_goal(guild_id: int) -> dict:
             "announced": bool(doc.get("goal_announced"))}
 
 
-async def mark_server_goal(guild_id: int, **patch) -> None:
-    key = f"{guild_id}:{quest_day()}"
+async def mark_server_goal(guild_id: int, reset_days: int = 1, **patch) -> None:
+    key = f"{guild_id}:{quest_goal_period(reset_days)}"
     if quest_state_col is not None:
         try:
             await _db(quest_state_col.update_one, {"_id": key},

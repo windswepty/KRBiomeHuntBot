@@ -356,7 +356,8 @@ class GoalChannelSelect(discord.ui.ChannelSelect):
                 f"⚠️ {ch.mention} 에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
             return
         await save_quest_settings(interaction.guild.id,
-                                  {"goal_channel_id": str(ch.id)})
+                                  {"goal_channel_id": str(ch.id),
+                                   "goal_message_id": None})
         await refresh_panel(interaction, discord.Embed(
             title="✅ 공동 목표 안내 채널 설정 완료",
             description=f"{ch.mention} 으로 지정했습니다.",
@@ -395,7 +396,8 @@ class QuestChannelView(discord.ui.View):
                 color=discord.Color.orange())
         else:
             await save_quest_settings(interaction.guild.id,
-                                      {"goal_channel_id": None})
+                                      {"goal_channel_id": None,
+                                       "goal_message_id": None})
             embed = discord.Embed(
                 title="🚫 공동 목표 안내 채널 해제",
                 description="진행도 안내를 올리지 않습니다.\n"
@@ -1394,8 +1396,15 @@ class Quest(commands.Cog):
             desc += (f"\n\n단, 본인도 **{need:,}회 이상** 대화해야 받을 수 있습니다."
                      f"\n-# 목표치의 {settings.get('goal_min_percent', 0)}% 입니다. "
                      "다 같이 채운 목표라 최소한의 참여를 요구합니다.")
+        rd = int(settings.get("goal_reset_days", 1))
+        if rd <= 1:
+            title = "🤝 오늘의 서버 공동 목표"
+            reset_text = "매일 밤 12시"
+        else:
+            title = f"🤝 서버 공동 목표 ({rd}일 주기)"
+            reset_text = f"{rd}일마다 자정"
         embed = discord.Embed(
-            title="🤝 오늘의 서버 공동 목표",
+            title=title,
             description=desc,
             color=discord.Color.gold() if reached else discord.Color.blurple())
         pct = (progress / target * 100) if target else 0
@@ -1407,17 +1416,18 @@ class Quest(commands.Cog):
             embed.add_field(
                 name="🎁 보상 받는 법",
                 value="`/퀘스트` 를 열어 **[보상 받기]** 를 눌러 주세요."
-                      + (f"\n-# 오늘 **{need:,}회 이상** 대화한 분만 받을 수 있습니다."
+                      + (f"\n-# **{need:,}회 이상** 대화한 분만 받을 수 있습니다."
                          if need > 0 else ""),
                 inline=False)
-        rd = int(settings.get("goal_reset_days", 1))
-        reset_text = f"매일 밤 12시" if rd <= 1 else f"{rd}일마다 자정"
         embed.set_footer(text=f"{reset_text}(KST)에 새로 시작됩니다")
         embed.timestamp = discord.utils.utcnow()
 
-        if state["message_id"]:
+        # 메시지 ID는 설정(guild 단위)에 저장하여 주기가 바뀌어도 같은 메시지를
+        # 계속 수정합니다. 매번 새 메시지를 보내지 않습니다.
+        existing_msg_id = settings.get("goal_message_id")
+        if existing_msg_id:
             try:
-                msg = await channel.fetch_message(int(state["message_id"]))
+                msg = await channel.fetch_message(int(existing_msg_id))
                 await msg.edit(embed=embed)
                 return
             except discord.NotFound:
@@ -1436,11 +1446,7 @@ class Quest(commands.Cog):
         except discord.HTTPException as e:
             print(f"[Quest] 공동 목표 생성 실패: {e}", flush=True)
             return
-        await mark_server_goal(
-            guild.id, 
-            reset_days=settings.get("goal_reset_days", 1), 
-            goal_message_id=str(msg.id)
-        )
+        await save_quest_settings(guild.id, {"goal_message_id": str(msg.id)})
 
     # ── 유저용 ───────────────────────────────────────────────────────
 

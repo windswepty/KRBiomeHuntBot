@@ -2633,7 +2633,6 @@ async def get_server_goal(guild_id: int, reset_days: int = 1) -> dict:
             except Exception:
                 doc = {}
     return {"progress": int(doc.get("goal_progress", 0) or 0),
-            "message_id": doc.get("goal_message_id"),
             "announced": bool(doc.get("goal_announced"))}
 
 

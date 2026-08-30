@@ -1410,7 +1410,9 @@ class Quest(commands.Cog):
                       + (f"\n-# 오늘 **{need:,}회 이상** 대화한 분만 받을 수 있습니다."
                          if need > 0 else ""),
                 inline=False)
-        embed.set_footer(text="매일 밤 12시(KST)에 새로 시작됩니다")
+        rd = int(settings.get("goal_reset_days", 1))
+        reset_text = f"매일 밤 12시" if rd <= 1 else f"{rd}일마다 자정"
+        embed.set_footer(text=f"{reset_text}(KST)에 새로 시작됩니다")
         embed.timestamp = discord.utils.utcnow()
 
         if state["message_id"]:

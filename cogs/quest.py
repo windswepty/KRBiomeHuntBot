@@ -183,14 +183,33 @@ def build_quest_panel(settings: dict) -> discord.Embed:
         description="퀘스트는 **유저마다 다르게, 매일 무작위로** 뽑힙니다." + NL
                     + "수치는 전부 여기서 조정할 수 있습니다.",
         color=discord.Color.blurple())
-    embed.add_field(name="상태",
-                    value="✅ 켜짐" if settings.get("enabled") else "❌ 꺼짐",
+    on = bool(settings.get("enabled"))
+    admin_only = bool(settings.get("admin_only"))
+    embed.add_field(name="상태", value="✅ 켜짐" if on else "❌ 꺼짐", inline=True)
+    embed.add_field(name="공개 범위",
+                    value="🔧 관리자만" if admin_only else "👥 모두",
                     inline=True)
     embed.add_field(name="일일 퀘스트",
                     value=f"{settings.get('daily_count', 0)}개 / 일", inline=True)
     embed.add_field(name="공동 목표",
                     value="✅ 켜짐" if settings.get("goal_enabled") else "❌ 꺼짐",
                     inline=True)
+
+    # 관리자 전용 모드는 '켜짐' 위에 얹는 필터입니다. 퀘스트가 꺼져 있으면
+    # 관리자도 못 씁니다. 이걸 안 알려주면 "켰는데 왜 안 되지"가 됩니다.
+    if admin_only and not on:
+        embed.add_field(
+            name="⚠️ 지금은 아무도 쓸 수 없습니다",
+            value="관리자 전용 모드는 **퀘스트가 켜져 있을 때만** 의미가 있습니다."
+                  + NL + "`⚡ 퀘스트 켜기` 를 눌러야 관리자끼리 테스트할 수 있습니다.",
+            inline=False)
+    elif admin_only:
+        embed.add_field(
+            name="🔧 테스트 중",
+            value="관리자만 `/퀘스트` 를 볼 수 있습니다. 일반 유저에게는 "
+                  "**꺼진 것과 똑같이** 보입니다." + NL
+                  + "-# 진행도는 평소처럼 쌓이므로 공개하면 그대로 이어집니다.",
+            inline=False)
     return embed
 
 
@@ -1114,6 +1133,14 @@ class QuestSettingsSelect(discord.ui.Select):
                        if new else
                        "모든 유저가 `/퀘스트` 를 쓸 수 있습니다."),
                 inline=False)
+            # 이 모드만 켜 두면 아무 일도 일어나지 않습니다. 바로 알려줍니다.
+            if new and not settings.get("enabled"):
+                embed.add_field(
+                    name="⚠️ 아직 퀘스트가 꺼져 있습니다",
+                    value="이 모드는 **퀘스트가 켜져 있을 때만** 동작합니다."
+                          + NL + "`⚡ 퀘스트 켜기` 까지 눌러야 관리자끼리 "
+                          "테스트할 수 있습니다.",
+                    inline=False)
             await refresh_panel(interaction, embed)
 
         elif c == "reward":
@@ -1330,24 +1357,39 @@ class Quest(commands.Cog):
         guild = interaction.guild
         settings = await get_quest_settings(guild.id)
 
+        is_admin = interaction.user.guild_permissions.administrator
+
+        # 일반 유저에게 나가는 문구는 **어느 이유든 똑같아야** 합니다.
+        # 다르면 "지금 준비 중이구나"가 드러납니다.
+        closed = discord.Embed(
+            title="⚠️ 퀘스트가 아직 열리지 않았습니다",
+            description="관리자가 설정을 마치면 이용하실 수 있습니다.",
+            color=discord.Color.orange())
+
         if not settings.get("enabled"):
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title="⚠️ 퀘스트가 아직 열리지 않았습니다",
-                    description="관리자가 설정을 마치면 이용하실 수 있습니다.",
-                    color=discord.Color.orange()),
-                ephemeral=True)
+            # 관리자에게 같은 문구를 주면 무엇을 해야 할지 알 수 없습니다.
+            # 관리자 전용 모드를 켜 둔 채 여기 걸리는 경우가 특히 헷갈립니다.
+            if is_admin:
+                hint = discord.Embed(
+                    title="⚙️ 퀘스트가 꺼져 있습니다",
+                    description="`/퀘스트설정` → **⚡ 퀘스트 켜기** 를 눌러 주세요.",
+                    color=discord.Color.orange())
+                if settings.get("admin_only"):
+                    hint.add_field(
+                        name="🔧 관리자 전용 모드는 켜져 있습니다",
+                        value="이 모드는 **퀘스트가 켜져 있을 때만** 동작하는 "
+                              "필터입니다." + NL
+                              + "퀘스트를 켜면 관리자만 보이는 상태로 시작합니다.",
+                        inline=False)
+                await interaction.followup.send(embed=hint, ephemeral=True)
+                return
+            await interaction.followup.send(embed=closed, ephemeral=True)
             return
 
         # 공개 전에 관리자끼리 돌려보기 위한 모드입니다. 일반 유저에게는
         # 꺼진 것과 똑같이 보여, 준비 중이라는 사실이 드러나지 않습니다.
-        if settings.get("admin_only") and not interaction.user.guild_permissions.administrator:
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title="⚠️ 퀘스트가 아직 열리지 않았습니다",
-                    description="관리자가 설정을 마치면 이용하실 수 있습니다.",
-                    color=discord.Color.orange()),
-                ephemeral=True)
+        if settings.get("admin_only") and not is_admin:
+            await interaction.followup.send(embed=closed, ephemeral=True)
             return
 
         events = await active_events(guild.id)

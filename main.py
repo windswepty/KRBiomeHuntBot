@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import hashlib
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -22,6 +23,26 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # 이상을 발견하면 사람을 기다리지 않고 프로세스를 끝냅니다.
 # 호스팅(Render)이 죽은 프로세스를 자동으로 새로 띄웁니다.
 WATCHDOG_INTERVAL = 60          # 초
+
+# ── 명령어 동기화 지문 ────────────────────────────────────────────────
+#
+# tree.sync() 는 등록된 전 명령어를 디스코드에 보내므로, 재시작마다
+# 호출하면 레이트 리밋을 직격합니다. 명령어 집합이 바뀌지 않았으면
+# 건너뛰고, FORCE_SYNC=1 이면 무조건 동기화합니다.
+
+SYNC_HASH_FILE = os.path.join("data", ".sync_hash")
+
+
+def _command_fingerprint(tree) -> str:
+    """명령어 이름·설명·옵션을 정렬해 해시. 변경이 없으면 같은 값."""
+    items = []
+    for cmd in sorted(tree.get_commands(), key=lambda c: c.name):
+        parts = [cmd.name, cmd.description or ""]
+        for p in sorted(getattr(cmd, "parameters", []),
+                        key=lambda p: p.name):
+            parts.extend([p.name, str(p.type), str(p.required)])
+        items.append("|".join(parts))
+    return hashlib.sha256("\n".join(items).encode()).hexdigest()[:16]
 
 
 @bot.event
@@ -45,14 +66,51 @@ async def on_ready():
 
     health.mark_ready(len(bot.guilds), storage)
 
-    # Sync Slash Commands
+    # ── 조건부 명령어 동기화 ──────────────────────────────────────────
+    #
+    # 재배포·재시작마다 27개 명령어를 전역 동기화하면 레이트 리밋을
+    # 직격합니다. 명령어 집합이 바뀌지 않았으면 건너뜁니다.
+    fingerprint = _command_fingerprint(bot.tree)
+    force = os.getenv("FORCE_SYNC", "").strip() == "1"
+    prev_hash = ""
     try:
-        synced = await bot.tree.sync()
-        health.set_command_count(len(synced))
-        print(f"Synced {len(synced)} slash command(s).", flush=True)
-    except Exception as e:
-        print(f"Failed to sync slash commands: {e}", flush=True)
-        health.add_note(f"슬래시 명령어 동기화 실패: {e}")
+        os.makedirs("data", exist_ok=True)
+        if os.path.exists(SYNC_HASH_FILE):
+            with open(SYNC_HASH_FILE, "r") as f:
+                prev_hash = f.read().strip()
+    except Exception:
+        pass
+
+    if fingerprint == prev_hash and not force:
+        # 명령어가 바뀌지 않았으므로 동기화를 건너뜁니다.
+        # 이전에 등록한 명령어가 디스코드에 그대로 남아 있습니다.
+        health.set_command_count(len(bot.tree.get_commands()))
+        print(f"tree.sync() 건너뜀 — 명령어 지문 일치 ({fingerprint})", flush=True)
+    else:
+        reason = "FORCE_SYNC=1" if force else f"지문 변경 ({prev_hash[:8]}→{fingerprint[:8]})"
+        print(f"tree.sync() 실행 — {reason}", flush=True)
+        try:
+            synced = await bot.tree.sync()
+            health.set_command_count(len(synced))
+            print(f"Synced {len(synced)} slash command(s).", flush=True)
+            # 성공했으면 지문 저장
+            try:
+                with open(SYNC_HASH_FILE, "w") as f:
+                    f.write(fingerprint)
+            except Exception:
+                pass
+        except discord.HTTPException as e:
+            if e.status == 429:
+                health.mark_rate_limited()
+                print(f"tree.sync() 429 레이트 리밋 — 재시도 없이 기동 계속", flush=True)
+            else:
+                print(f"Failed to sync slash commands: {e}", flush=True)
+            health.set_command_count(len(bot.tree.get_commands()))
+            health.add_note(f"슬래시 명령어 동기화 실패: {e}")
+        except Exception as e:
+            print(f"Failed to sync slash commands: {e}", flush=True)
+            health.set_command_count(len(bot.tree.get_commands()))
+            health.add_note(f"슬래시 명령어 동기화 실패: {e}")
 
     if not watchdog.is_running():
         watchdog.start()
@@ -92,8 +150,13 @@ async def watchdog():
                 health.mark_disconnected()
 
         if health.should_restart():
+            health.record_restart()
             secs = round(health.unhealthy_seconds())
-            health.hard_exit(f"디스코드 연결이 {secs}초째 끊겨 있습니다")
+            if health.rate_limited_recently():
+                print(f"[Watchdog] 레이트 리밋 억제 중 — 재시작 보류 "
+                      f"(끊김 {secs}초)", flush=True)
+            else:
+                health.hard_exit(f"디스코드 연결이 {secs}초째 끊겨 있습니다")
     except Exception as e:
         # 감시 자체가 죽으면 감시가 없는 것과 같습니다. 절대 조용히 넘기지 않습니다.
         print(f"[Watchdog] 점검 중 오류: {type(e).__name__}: {e}", flush=True)

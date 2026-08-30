@@ -28,6 +28,22 @@ STARTUP_GRACE_SECONDS = 180
 # 재접속하므로, 그걸로도 안 되는 상황만 여기까지 옵니다.
 RESTART_AFTER_SECONDS = 300
 
+# ── 레이트 리밋 대응 ─────────────────────────────────────────────────
+#
+# 디스코드 전역 레이트 리밋(429)에 걸리면, 재시작은 차단을 연장할 뿐입니다.
+# 로그인 + sync 가 무효 요청으로 집계돼 CloudFlare 차단이 더 길어지기
+# 때문입니다. **기다리는 것이 유일한 해법**이므로, 429 를 관측하면 잠시
+# 재시작을 억제합니다. 단, 영원히 억제하면 진짜 좀비를 못 잡으므로 상한
+# 을 둡니다.
+
+# 429 관측 후 최대 이 시간(초) 동안 watchdog 재시작을 억제합니다
+RATE_LIMIT_SUPPRESS_SECONDS = 1800   # 30분
+
+# 짧은 시간에 반복 재시작하는 것도 막습니다
+RESTART_COOLDOWN_WINDOW = 1800       # 최근 30분
+RESTART_COOLDOWN_LIMIT = 3           # 이 횟수 이상이면 대기 시간 늘림
+RESTART_COOLDOWN_EXTRA = 300         # 추가 대기 5분
+
 _lock = threading.Lock()
 _state = {
     "booted_at": time.monotonic(),
@@ -46,7 +62,52 @@ _state = {
     "ext_total": 0,
     "ext_failed": [],
     "commands": 0,
+    "rate_limited_at": None,      # 마지막 429 관측 시각 (monotonic)
+    "restart_times": [],          # 최근 재시작 시각들 (monotonic)
 }
+
+
+# ── 지수 백오프 ──────────────────────────────────────────────────────
+#
+# 주기 작업(status_refresh, goal_refresh)이 429 를 받으면 다음 주기에
+# 똑같이 다시 시도합니다. 차단을 연장시키는 행동이므로, 한동안 시도
+# 자체를 멈춰야 합니다. 성공하면 즉시 초기화됩니다.
+
+class Backoff:
+    """지수 백오프. 429 를 만나면 점점 더 오래 기다립니다."""
+
+    __slots__ = ("name", "initial", "max_delay", "delay", "_until")
+
+    def __init__(self, name: str, initial: float = 300,
+                 max_delay: float = 1800):
+        self.name = name
+        self.initial = initial     # 첫 백오프: 5분
+        self.max_delay = max_delay # 상한: 30분
+        self.delay = 0.0
+        self._until = 0.0         # monotonic
+
+    def hit(self) -> None:
+        """429 를 받았을 때 호출. 다음 대기 시간을 늘립니다."""
+        self.delay = min((self.delay * 2) or self.initial, self.max_delay)
+        self._until = time.monotonic() + self.delay
+
+    def active(self) -> bool:
+        """아직 백오프 중인가. True 면 요청을 **보내지 않아야** 합니다."""
+        return time.monotonic() < self._until
+
+    def reset(self) -> None:
+        """성공 시 호출. 백오프를 초기화합니다."""
+        self.delay = 0.0
+        self._until = 0.0
+
+    def remaining(self) -> float:
+        """남은 백오프 시간(초). 0 이면 백오프가 아닙니다."""
+        return max(0.0, self._until - time.monotonic())
+
+
+# 주기 작업별 백오프 인스턴스. cog 에서 import 해서 씁니다.
+status_backoff = Backoff("status_refresh")
+goal_backoff = Backoff("goal_refresh")
 
 
 def set_extensions(loaded: int, total: int, failed: list[str]) -> None:
@@ -98,6 +159,68 @@ def mark_resumed() -> None:
         _state["last_ok"] = time.monotonic()
 
 
+# ── 레이트 리밋 추적 ─────────────────────────────────────────────────
+
+def mark_rate_limited() -> None:
+    """429 전역 레이트 리밋을 관측했을 때 호출합니다.
+
+    이 시각을 기준으로 watchdog 재시작을 일정 시간 억제합니다.
+    429 응답 자체가 무효 요청으로 집계되므로, 차단 중에 재시작하면
+    차단이 연장됩니다. 기다리는 것이 유일한 해법입니다.
+    """
+    with _lock:
+        _state["rate_limited_at"] = time.monotonic()
+    print("[Health] 전역 레이트 리밋(429) 관측 — "
+          f"{RATE_LIMIT_SUPPRESS_SECONDS}초간 재시작 억제", flush=True)
+
+
+def rate_limited_recently() -> bool:
+    """최근에 429 를 관측했는가. True 면 재시작을 미뤄야 합니다."""
+    with _lock:
+        at = _state["rate_limited_at"]
+    if at is None:
+        return False
+    return (time.monotonic() - at) < RATE_LIMIT_SUPPRESS_SECONDS
+
+
+def record_restart() -> None:
+    """watchdog 이 재시작을 결정했을 때 호출. 이력을 남깁니다."""
+    now = time.monotonic()
+    with _lock:
+        times = _state["restart_times"]
+        cutoff = now - RESTART_COOLDOWN_WINDOW
+        _state["restart_times"] = [t for t in times if t > cutoff] + [now]
+
+
+def restart_suppressed() -> bool:
+    """최근 30분 내 재시작이 너무 잦으면 True.
+
+    True 면 다음 재시작 전 추가 대기(RESTART_COOLDOWN_EXTRA)를 적용합니다.
+    """
+    now = time.monotonic()
+    with _lock:
+        cutoff = now - RESTART_COOLDOWN_WINDOW
+        recent = [t for t in _state["restart_times"] if t > cutoff]
+    return len(recent) >= RESTART_COOLDOWN_LIMIT
+
+
+def backoff_status() -> dict | None:
+    """상태 임베드에 백오프 정보를 표시하기 위한 요약.
+
+    백오프 중인 작업이 없으면 None.
+    """
+    items = []
+    for bo in (status_backoff, goal_backoff):
+        r = bo.remaining()
+        if r > 0:
+            items.append(f"`{bo.name}` {r:.0f}초 남음")
+    if not items:
+        return None
+    return {"remaining": max(status_backoff.remaining(),
+                             goal_backoff.remaining()),
+            "details": items}
+
+
 def add_note(note: str) -> None:
     """기동 중 발견한 이상을 남깁니다 (헬스 응답과 알림에 실립니다)."""
     with _lock:
@@ -138,7 +261,25 @@ def is_healthy() -> bool:
 
 
 def should_restart() -> bool:
-    return unhealthy_seconds() >= RESTART_AFTER_SECONDS
+    """재시작이 필요한가.
+
+    레이트 리밋(429) 관측 직후에는 재시작해도 차단만 연장하므로
+    **기다립니다**. 단, 영원히 억제하면 진짜 좀비를 못 잡으므로
+    RATE_LIMIT_SUPPRESS_SECONDS 가 지나면 원래대로 재시작합니다.
+
+    짧은 시간에 반복 재시작하는 것도 막습니다. 최근 30분 내 3회 이상
+    재시작했다면 추가 대기(5분)를 적용합니다.
+    """
+    secs = unhealthy_seconds()
+    if secs < RESTART_AFTER_SECONDS:
+        return False
+    # 429 관측 후 30분 이내면 재시작 억제 (기다리는 게 유일한 해법)
+    if rate_limited_recently():
+        return False
+    # 최근 30분 내 3회 이상 재시작했으면 추가 대기
+    if restart_suppressed():
+        return secs >= RESTART_AFTER_SECONDS + RESTART_COOLDOWN_EXTRA
+    return True
 
 
 def hard_exit(reason: str) -> None:

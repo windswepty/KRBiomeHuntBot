@@ -320,7 +320,7 @@ class ChatReward(commands.Cog):
     def cog_unload(self):
         self.check_boost_expiration.cancel()
 
-    @tasks.loop(seconds=5)
+    @tasks.loop(seconds=30)
     async def check_boost_expiration(self):
         await self.bot.wait_until_ready()
         try:

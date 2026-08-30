@@ -1271,11 +1271,17 @@ class Quest(commands.Cog):
 
         매번 새로 보내면 채널이 도배됩니다. 메시지 ID 를 저장해 두고
         **수정**하므로 알림이 울리지 않습니다.
+
+        429 를 만나면 백오프에 들어가 시도 자체를 멈춥니다.
+        성공하면 백오프를 즉시 초기화합니다.
         """
         await self.bot.wait_until_ready()
+        if health.goal_backoff.active():
+            return   # 429 백오프 중 — 시도하지 않습니다
         for guild in self.bot.guilds:
             try:
                 await self.update_goal_message(guild)
+                health.goal_backoff.reset()
             except Exception as e:
                 print(f"[Quest] {guild.name}: 공동 목표 갱신 실패 - "
                       f"{type(e).__name__}: {e}", flush=True)
@@ -1337,7 +1343,13 @@ class Quest(commands.Cog):
             except discord.NotFound:
                 pass            # 지워졌으니 새로 만듭니다
             except discord.HTTPException as e:
-                print(f"[Quest] 공동 목표 수정 실패: {e}", flush=True)
+                if e.status == 429:
+                    health.mark_rate_limited()
+                    health.goal_backoff.hit()
+                    print(f"[Quest] 429 레이트 리밋 — "
+                          f"{health.goal_backoff.delay:.0f}초 백오프", flush=True)
+                else:
+                    print(f"[Quest] 공동 목표 수정 실패: {e}", flush=True)
                 return
         try:
             msg = await channel.send(embed=embed)

@@ -386,6 +386,16 @@ async def build_status_embed(bot, guild, state: dict | None = None) -> discord.E
         embed.add_field(name="⚠️ 기동 중 발견된 문제",
                         value="\n".join(f"• {n}" for n in notes), inline=False)
 
+    # 주기 작업이 429 백오프 중이면 알려둡니다
+    bo = health.backoff_status()
+    if bo:
+        embed.add_field(
+            name="⏳ 레이트 리밋 백오프 중",
+            value="디스코드 API 제한(429)으로 일부 갱신을 잠시 멈췄습니다.\n"
+                  + "\n".join(f"• {d}" for d in bo["details"])
+                  + "\n-# 정상화되면 이 항목은 사라집니다.",
+            inline=False)
+
     # 아래 시각이 멈춰 있으면 그 자체가 이상 신호입니다. 명시적으로 알려둡니다.
     embed.set_footer(text="1분마다 갱신 · 아래 시각이 멈춰 있으면 봇이 멈춘 것입니다")
     embed.timestamp = discord.utils.utcnow()
@@ -421,7 +431,13 @@ async def upsert_status_message(bot, guild) -> bool:
         except discord.Forbidden:
             return False
         except discord.HTTPException as e:
-            print(f"[Status] 임베드 수정 실패: {e}", flush=True)
+            if e.status == 429:
+                health.mark_rate_limited()
+                health.status_backoff.hit()
+                print(f"[Status] 429 레이트 리밋 — "
+                      f"{health.status_backoff.delay:.0f}초 백오프", flush=True)
+            else:
+                print(f"[Status] 임베드 수정 실패: {e}", flush=True)
             return False
 
     try:
@@ -773,13 +789,18 @@ class PointBackup(commands.Cog):
         가동 시간·응답 속도가 계속 갱신되므로, 마지막 갱신 시각만 봐도
         봇이 살아 있는지 알 수 있습니다.
 
-        갱신 실패가 쌓여도 봇 자체는 계속 돌아야 하므로 예외를 삼킵니다.
-        (연결이 끊긴 동안에는 편집이 실패하는 것이 정상입니다)
+        429 를 만나면 백오프에 들어갑니다. 백오프 중에는 편집을 **아예
+        시도하지 않습니다.** 차단 중에 계속 요청하면 차단이 연장됩니다.
+        성공하면 백오프를 즉시 초기화합니다.
         """
         await self.bot.wait_until_ready()
+        if health.status_backoff.active():
+            return   # 429 백오프 중 — 시도하지 않습니다
         for guild in self.bot.guilds:
             try:
-                await upsert_status_message(self.bot, guild)
+                ok = await upsert_status_message(self.bot, guild)
+                if ok:
+                    health.status_backoff.reset()
             except Exception as e:
                 print(f"[Status] {guild.name}: 상태 갱신 실패 - "
                       f"{type(e).__name__}: {e}", flush=True)

@@ -25,7 +25,7 @@ from utils.database import (
     get_quest_settings, save_quest_settings,
     get_daily_quests, weekly_quests, get_quest_progress,
     quest_progress_value, quest_done, quest_label, claim_quest,
-    get_server_goal, mark_server_goal, add_activity_log,
+    get_server_goal, add_activity_log,
     quest_channels, goal_min_chat,
     active_events, event_status, event_period_key, KST,
     list_events, get_event, save_event, delete_event, event_is_active,
@@ -1393,7 +1393,6 @@ class Quest(commands.Cog):
         rd = int(settings.get("goal_reset_days", 1))
 
         # 현재 주기의 날짜 범위를 계산합니다.
-        from utils.database import KST
         now = datetime.datetime.now(KST)
         if rd <= 1:
             date_text = f"📅 {now.month}/{now.day}"

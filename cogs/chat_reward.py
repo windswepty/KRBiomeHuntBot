@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from utils import health
 from utils.database import (
     process_chat_message, is_user_blacklisted,
     set_channel_boost, get_channel_boost, get_all_active_boosts, add_activity_log,
@@ -343,6 +344,14 @@ class ChatReward(commands.Cog):
                             pass
         except Exception as e:
             print(f"check_boost_expiration loop error: {e}", flush=True)
+
+    # 주기 작업은 예상 못한 예외가 **한 번** 나면 그대로 영구히 멈춥니다.
+    # 재시도도 알림도 없고, 프로세스는 멀쩡해 호스팅도 감지하지 못합니다.
+    # 무인 운영에서는 몇 달 뒤에야 발견되므로 스스로 되살립니다.
+    @check_boost_expiration.error
+    async def check_boost_expiration_error(self, error):
+        await health.revive_loop(self.check_boost_expiration,
+                                 "check_boost_expiration", error)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

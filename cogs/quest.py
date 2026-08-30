@@ -19,6 +19,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from utils import health
 from utils.database import (
     get_quest_settings, save_quest_settings,
     get_daily_quests, weekly_quests, get_quest_progress,
@@ -319,21 +320,45 @@ class GoalChannelSelect(discord.ui.ChannelSelect):
 
 
 class QuestChannelView(discord.ui.View):
+    """랜덤 채널 후보와 공동 목표 안내 채널이 **같은 View 를 함께 씁니다.**
+
+    그래서 해제 버튼은 반드시 `field` 를 보고 자기 설정만 지워야 합니다.
+    예전에는 어느 화면에서 눌러도 랜덤 채널 후보를 지웠는데, 공동 목표
+    화면에서 누른 관리자는 건드린 적도 없는 설정이 날아간 것을 모릅니다.
+    게다가 후보가 비면 그날 뽑기 풀이 바뀌어 **전원의 퀘스트 목록이**
+    통째로 달라집니다.
+    """
+
     def __init__(self, field: str, label: str):
         super().__init__(timeout=180)
+        self.field = field
+        self.label = label
         self.add_item(RandomChannelSelect() if field == "channel_id"
                       else GoalChannelSelect())
+        self.clear.label = ("후보 전체 해제" if field == "channel_id"
+                            else "안내 채널 해제")
 
-    @discord.ui.button(label="후보 전체 해제", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="해제", style=discord.ButtonStyle.secondary,
                        emoji="🚫", row=1)
     async def clear(self, interaction: discord.Interaction,
                     button: discord.ui.Button):
-        await save_quest_settings(interaction.guild.id,
-                                  {"channel_ids": [], "channel_id": None})
-        await refresh_panel(interaction, discord.Embed(
-            title="🚫 랜덤 채널 후보 해제",
-            description="후보가 없으면 채널 퀘스트는 **출제되지 않습니다.**",
-            color=discord.Color.orange()))
+        if self.field == "channel_id":
+            await save_quest_settings(interaction.guild.id,
+                                      {"channel_ids": [], "channel_id": None})
+            embed = discord.Embed(
+                title="🚫 랜덤 채널 후보 해제",
+                description="후보가 없으면 채널 퀘스트는 **출제되지 않습니다.**",
+                color=discord.Color.orange())
+        else:
+            await save_quest_settings(interaction.guild.id,
+                                      {"goal_channel_id": None})
+            embed = discord.Embed(
+                title="🚫 공동 목표 안내 채널 해제",
+                description="진행도 안내를 올리지 않습니다.\n"
+                            "-# 공동 목표 자체는 그대로 돌아갑니다. "
+                            "`/퀘스트` 에서는 계속 보입니다.",
+                color=discord.Color.orange())
+        await refresh_panel(interaction, embed)
 
 
 def _kind_label(kind: str, goal: int) -> str:
@@ -396,10 +421,25 @@ class EventBasicModal(discord.ui.Modal, title="🎉 이벤트 만들기"):
                 "⚠️ 방식은 `단계` 또는 `모두` 로 적어 주세요.", ephemeral=True)
             return
 
-        eid = self.event_id or f"e{int(datetime.datetime.now(KST).timestamp())}"
+        title = str(self.name.value).strip()
+        if not title:
+            await interaction.response.send_message(
+                "⚠️ 이벤트 이름을 적어 주세요.", ephemeral=True)
+            return
+
+        eid = self.event_id
+        if eid is None:
+            # 초 단위 타임스탬프만 쓰면 같은 초에 만든 이벤트가 앞의 것을
+            # **말없이 덮어씁니다.** 이미 있는 id 는 피해 갑니다.
+            base = f"e{int(datetime.datetime.now(KST).timestamp())}"
+            taken = {e["id"] for e in await list_events(interaction.guild.id)}
+            eid, n = base, 1
+            while eid in taken:
+                eid, n = f"{base}_{n}", n + 1
+
         old = await get_event(interaction.guild.id, eid) or {}
         data = dict(old)
-        data.update({"name": str(self.name.value).strip(), "mode": mode,
+        data.update({"name": title, "mode": mode,
                      "starts": starts, "ends": ends})
         data.setdefault("enabled", True)
         if mode == "tier":
@@ -1212,6 +1252,13 @@ class Quest(commands.Cog):
             except Exception as e:
                 print(f"[Quest] {guild.name}: 공동 목표 갱신 실패 - "
                       f"{type(e).__name__}: {e}", flush=True)
+
+    # 주기 작업은 예상 못한 예외가 **한 번** 나면 그대로 영구히 멈춥니다.
+    # 재시도도 알림도 없고, 프로세스는 멀쩡해 호스팅도 감지하지 못합니다.
+    # 무인 운영에서는 몇 달 뒤에야 발견되므로 스스로 되살립니다.
+    @goal_refresh.error
+    async def goal_refresh_error(self, error):
+        await health.revive_loop(self.goal_refresh, "goal_refresh", error)
 
     async def update_goal_message(self, guild) -> None:
         settings = await get_quest_settings(guild.id)

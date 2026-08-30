@@ -153,3 +153,72 @@ def hard_exit(reason: str) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(1)
+
+
+# ── 주기 작업 감시 ───────────────────────────────────────────────────
+#
+# discord.py 의 tasks.loop 은 **예상 못한 예외가 한 번 나면 영구히 멈춥니다.**
+# 재시도도, 알림도 없습니다. 프로세스는 멀쩡하니 호스팅도 감지하지 못하고,
+# 무인 운영에서는 몇 달 뒤에야 발견됩니다 — 그동안 자동 백업이 한 번도
+# 돌지 않았다는 뜻입니다. 그래서 직접 되살리되, 같은 곳에서 계속 터지면
+# 포기하고 상태에 남겨 임베드에 보이게 합니다.
+
+LOOP_RESTART_LIMIT = 5
+LOOP_RESTART_DELAY = 10.0
+
+_loop_failures: dict[str, int] = {}
+
+
+def loop_failure_count(name: str) -> int:
+    with _lock:
+        return _loop_failures.get(name, 0)
+
+
+def dead_loops() -> list[str]:
+    """되살리기를 포기한 주기 작업 목록."""
+    with _lock:
+        return [n for n, c in _loop_failures.items() if c > LOOP_RESTART_LIMIT]
+
+
+def _record_loop_failure(name: str) -> int:
+    with _lock:
+        _loop_failures[name] = _loop_failures.get(name, 0) + 1
+        return _loop_failures[name]
+
+
+async def revive_loop(task_loop, name: str, error: BaseException,
+                      delay: float = LOOP_RESTART_DELAY) -> None:
+    """예외로 멈춘 tasks.loop 을 되살립니다. `@루프.error` 에서 부릅니다.
+
+    지금은 죽어가는 태스크 **안**이라 곧바로 start() 를 부를 수 없습니다
+    ("이미 실행 중"으로 거부됩니다). 그래서 별도 태스크로 잠시 뒤에 켭니다.
+    restart() 는 이미 끝난 태스크에는 아무 일도 하지 않으므로 쓰지 않습니다.
+    """
+    import asyncio
+    import traceback
+
+    print(f"[Loop] 주기 작업 '{name}' 이 예외로 멈췄습니다: "
+          f"{type(error).__name__}: {error}", flush=True)
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    n = _record_loop_failure(name)
+    if n > LOOP_RESTART_LIMIT:
+        add_note(f"주기 작업 `{name}` 이 {n}회 실패해 멈춰 있습니다")
+        print(f"[Loop] '{name}' {n}회째 실패 — 되살리기를 포기합니다. "
+              "상태 임베드를 확인하세요.", flush=True)
+        return
+
+    async def _again():
+        await asyncio.sleep(delay)
+        if task_loop.is_running():
+            return
+        try:
+            task_loop.start()
+            print(f"[Loop] '{name}' 재시작 완료 ({n}/{LOOP_RESTART_LIMIT})",
+                  flush=True)
+        except Exception as e:
+            add_note(f"주기 작업 `{name}` 재시작 실패")
+            print(f"[Loop] '{name}' 재시작 실패: {type(e).__name__}: {e}",
+                  flush=True)
+
+    asyncio.create_task(_again())

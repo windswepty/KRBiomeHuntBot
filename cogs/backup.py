@@ -784,6 +784,14 @@ class PointBackup(commands.Cog):
                 print(f"[Status] {guild.name}: 상태 갱신 실패 - "
                       f"{type(e).__name__}: {e}", flush=True)
 
+    # 주기 작업은 예상 못한 예외가 **한 번** 나면 그대로 영구히 멈춥니다.
+    # 재시도도 알림도 없고, 프로세스는 멀쩡해 호스팅도 감지하지 못합니다.
+    # 무인 운영에서는 몇 달 뒤에야 발견되므로 스스로 되살립니다.
+    # 자동 백업이 조용히 멈추는 것이 이 봇에서 가장 위험한 고장입니다.
+    @status_refresh.error
+    async def status_refresh_error(self, error):
+        await health.revive_loop(self.status_refresh, "status_refresh", error)
+
     def cog_unload(self):
         self.daily_snapshot.cancel()
         self.status_refresh.cancel()
@@ -857,6 +865,10 @@ class PointBackup(commands.Cog):
                           f"{result.get('error', '알 수 없음')}", flush=True)
             except Exception as e:
                 print(f"[Backup] {guild.name}: 따라잡기 백업 중 오류 - {e}", flush=True)
+
+    @daily_snapshot.error
+    async def daily_snapshot_error(self, error):
+        await health.revive_loop(self.daily_snapshot, "daily_snapshot", error)
 
     @app_commands.command(
         name="백업설정",

@@ -99,6 +99,16 @@ async def watchdog():
         print(f"[Watchdog] 점검 중 오류: {type(e).__name__}: {e}", flush=True)
 
 
+@watchdog.error
+async def watchdog_error(error):
+    """감시가 죽으면 자가 재시작 능력이 통째로 사라집니다.
+
+    좀비 상태를 감지할 사람이 없다는 것이 이 봇의 전제라, 감시만은
+    무슨 일이 있어도 다시 살아나야 합니다.
+    """
+    await health.revive_loop(watchdog, "watchdog", error)
+
+
 @watchdog.before_loop
 async def before_watchdog():
     await bot.wait_until_ready()

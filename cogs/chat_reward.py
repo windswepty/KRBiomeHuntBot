@@ -359,25 +359,29 @@ class ChatReward(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # 1. Exclude photos/files/GIF attachments and stickers
-        if message.attachments or message.stickers:
+        # 1. Exclude photos/files/GIF attachments
+        if message.attachments:
             return
 
+        # 스티커만 보낸 메시지도 채팅으로 인정합니다.
         content = message.content.strip()
-        if not content:
+        if not content and not message.stickers:
             return
 
-        # 2. Exclude GIF links (Tenor, Giphy, Gfycat, or .gif/.gifv URLs)
-        if re.search(r'https?://\S*(?:tenor\.com|giphy\.com|gfycat\.com|\.gif|\.gifv)', content, re.IGNORECASE):
-            return
+        # 텍스트가 있는 경우에만 GIF/URL 필터를 적용합니다.
+        # 스티커만 보낸 경우 content가 빈 문자열이므로 건너뜁니다.
+        if content:
+            # 2. Exclude GIF links (Tenor, Giphy, Gfycat, or .gif/.gifv URLs)
+            if re.search(r'https?://\S*(?:tenor\.com|giphy\.com|gfycat\.com|\.gif|\.gifv)', content, re.IGNORECASE):
+                return
 
-        # 3. Strip all general URLs (http://, https://)
-        without_urls = re.sub(r'https?://\S+', '', content).strip()
+            # 3. Strip all general URLs (http://, https://)
+            without_urls = re.sub(r'https?://\S+', '', content).strip()
 
-        # If nothing remains after removing URLs, ignore.
-        # 이모지만 보낸 메시지도 채팅으로 인정합니다.
-        if not without_urls:
-            return
+            # If nothing remains after removing URLs, ignore.
+            # 이모지만 보낸 메시지도 채팅으로 인정합니다.
+            if not without_urls:
+                return
 
         # 블랙리스트 검사는 **가장 마지막**에 합니다.
         # 이 함수는 서버의 모든 메시지마다 호출되는데, 위 필터들은 순수 메모리

@@ -2615,9 +2615,10 @@ async def bump_server_goal(guild_id: int, amount: int = 1, reset_days: int = 1) 
         return row["goal_progress"]
 
 
-async def get_server_goal(guild_id: int, reset_days: int = 1) -> dict:
-    """오늘 공동 목표 진행 상황."""
-    key = f"{guild_id}:{quest_goal_period(reset_days)}"
+async def get_server_goal(guild_id: int, reset_days: int = 1,
+                          when: datetime | None = None) -> dict:
+    """공동 목표 진행 상황. when을 넘기면 해당 시점의 주기를 조회합니다."""
+    key = f"{guild_id}:{quest_goal_period(reset_days, when)}"
     doc = {}
     if quest_state_col is not None:
         try:

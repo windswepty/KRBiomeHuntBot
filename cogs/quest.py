@@ -1426,6 +1426,34 @@ class Quest(commands.Cog):
             name=("🎉 달성!" if reached else "📊 진행 상황"),
             value=f"`{progress:,} / {target:,}`  ({pct:.0f}%)\n{_bar(progress, target, 20)}",
             inline=False)
+
+        # ── 이전 주기 결과 ──────────────────────────────────────────
+        # 날짜가 넘어가면 전날(이전 주기) 얼마나 채웠는지 보여줍니다.
+        prev_when = now - datetime.timedelta(days=rd)
+        prev_state = await get_server_goal(
+            guild.id, reset_days=rd, when=prev_when)
+        prev_progress = prev_state["progress"]
+        if prev_progress > 0 and target > 0:
+            prev_pct = prev_progress / target * 100
+            if prev_progress >= target:
+                prev_label = "✅ 달성 완료!"
+            else:
+                prev_label = f"❌ 미달성 ({prev_progress:,} / {target:,})"
+            if rd <= 1:
+                prev_title = f"📋 어제 결과 ({prev_when.month}/{prev_when.day})"
+            else:
+                anchor = datetime.datetime(2024, 1, 1, tzinfo=KST)
+                days_since_prev = (prev_when.date() - anchor.date()).days
+                ps_offset = (days_since_prev // rd) * rd
+                ps = anchor.date() + datetime.timedelta(days=ps_offset)
+                pe = ps + datetime.timedelta(days=rd - 1)
+                prev_title = f"📋 이전 주기 결과 ({ps.month}/{ps.day}~{pe.month}/{pe.day})"
+            embed.add_field(
+                name=prev_title,
+                value=f"{prev_label}\n`{prev_progress:,} / {target:,}`  ({prev_pct:.0f}%)",
+                inline=False)
+        # ────────────────────────────────────────────────────────────
+
         if reached:
             embed.add_field(
                 name="🎁 보상 받는 법",

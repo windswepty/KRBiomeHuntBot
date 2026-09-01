@@ -2,7 +2,9 @@ import os
 import sys
 import asyncio
 import hashlib
+import traceback
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from keep_alive import keep_alive
@@ -114,6 +116,33 @@ async def on_ready():
 
     if not watchdog.is_running():
         watchdog.start()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """슬래시 명령어 실행 중 오류가 발생했을 때 처리합니다.
+
+    핸들러가 없으면 defer된 인터랙션이 응답을 받지 못해
+    디스코드에서 '생각 중이에요...' 무한 로딩 상태로 남습니다.
+    """
+    cmd_name = interaction.command.name if interaction.command else "알 수 없음"
+    print(f"[Slash Command Error] /{cmd_name}: {error}", flush=True)
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        msg = "⚠️ 이 명령어를 실행할 권한이 없습니다."
+    elif isinstance(error, app_commands.errors.CheckFailure):
+        msg = "⚠️ 이 명령어를 실행할 수 없습니다."
+    else:
+        msg = "⚠️ 명령어를 처리하는 도중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception as e:
+        print(f"[Slash Command Error] 오류 메시지 전송 실패: {e}", flush=True)
 
 
 # ── 연결 상태 추적 ────────────────────────────────────────────────────

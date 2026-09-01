@@ -1576,6 +1576,7 @@ class Quest(commands.Cog):
 
         events = await active_events(guild.id)
         dailies = await get_daily_quests(guild.id, settings, interaction.user.id)
+        weeklies = weekly_quests(settings, guild.id, interaction.user.id)
         rd = int(settings.get("goal_reset_days", 1) or 1)
         gperiod = quest_goal_period(rd)
         extra_periods = [event_period_key(e["id"]) for e in events]

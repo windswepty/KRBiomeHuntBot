@@ -1716,7 +1716,7 @@ class Quest(commands.Cog):
                 claimable.append({
                     "id": "g:server", "name": "🤝 서버 공동 목표",
                     "points": int(settings.get("goal_reward", 0) or 0),
-                    "role_id": None, "weekly": False, "period": None})
+                    "role_id": None, "weekly": False, "period": gperiod})
 
             if claimed:
                 mark, tail = "✅", "  **수령 완료**"

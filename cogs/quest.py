@@ -25,7 +25,7 @@ from utils.database import (
     get_quest_settings, save_quest_settings,
     get_daily_quests, weekly_quests, get_quest_progress,
     quest_progress_value, quest_done, quest_label, claim_quest,
-    get_server_goal, add_activity_log,
+    get_server_goal, add_activity_log, get_user_points,
     quest_channels, goal_min_chat, quest_goal_period,
     active_events, event_status, event_period_key, KST,
     list_events, get_event, save_event, delete_event, event_is_active,
@@ -148,6 +148,7 @@ class QuestView(discord.ui.View):
                 "이미 모두 수령하셨습니다.", ephemeral=True)
             return
 
+        total_points = await get_user_points(interaction.guild.id, interaction.user.id)
         desc = f"**+{total:,} P** 를 획득하셨습니다!" if total else "보상을 받았습니다!"
         embed = discord.Embed(title="🎁 퀘스트 보상 수령", description=desc,
                               color=discord.Color.green())
@@ -163,6 +164,8 @@ class QuestView(discord.ui.View):
                 value="\n".join(f"• {x}" for x in role_failed)[:1024]
                       + "\n-# 포인트는 정상 지급되었습니다. 관리자에게 알려 주세요.",
                 inline=False)
+        embed.add_field(name="💰 보유 포인트",
+                        value=f"**{total_points:,} P**", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
         try:

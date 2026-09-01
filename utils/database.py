@@ -2146,9 +2146,12 @@ DEFAULT_QUEST_SETTINGS = {
     "goal_target": 2000,       # 서버 전체 채팅 수
     "goal_reward": 300,        # 참여자 전원에게
     # 보상을 받으려면 목표치의 몇 %를 본인이 채워야 하는지.
-    # 목표 3,000회 · 1% 면 본인이 30회는 쳐야 합니다. 아무것도 안 하고
+    # 목표 3,000회 · 2% 면 본인이 60회는 쳐야 합니다. 아무것도 안 하고
     # 받아가는 무임승차를 막습니다. 0 이면 조건 없음.
-    "goal_min_percent": 1,
+    "goal_min_percent": 2,
+    # 목표 달성 후 뒤늦게 참여한 유저(늦참자)에게 요구할 최소 참여 %.
+    # 0이면 달성 후에도 goal_min_percent와 동일하게 적용합니다.
+    "goal_late_min_percent": 4,
     "goal_channel_id": None,   # 진행도를 보여줄 채널
     "goal_reset_days": 1,      # 며칠마다 초기화할지 (기본 1일 = 매일)
 }
@@ -2576,13 +2579,17 @@ async def take_checkin_rank(guild_id: int) -> int:
         return row["checkin_seq"]
 
 
-def goal_min_chat(settings: dict) -> int:
+def goal_min_chat(settings: dict, is_late: bool = False) -> int:
     """공동 목표 보상을 받기 위해 **본인이** 쳐야 하는 최소 채팅 수.
 
-    목표치에 비례하므로, 목표를 바꿔도 따로 조정할 필요가 없습니다.
+    is_late=False: 목표 달성 전 기본 참여 기준 (goal_min_percent)
+    is_late=True: 목표 달성 후 늦참 참여 기준 (goal_late_min_percent)
     """
     target = int(settings.get("goal_target", 0) or 0)
-    pct = float(settings.get("goal_min_percent", 0) or 0)
+    pct_key = "goal_late_min_percent" if is_late else "goal_min_percent"
+    pct = float(settings.get(pct_key, 0) or 0)
+    if is_late and pct <= 0:
+        pct = float(settings.get("goal_min_percent", 0) or 0)
     if target <= 0 or pct <= 0:
         return 0
     import math

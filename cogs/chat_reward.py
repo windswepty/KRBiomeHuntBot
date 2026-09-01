@@ -10,6 +10,7 @@ from utils.database import (
     check_and_clear_expired_boosts,
     bump_quest_progress, get_quest_settings, bump_server_goal,
     quest_channels, channel_field, bump_event_progress,
+    quest_goal_period,
 )
 
 
@@ -416,13 +417,25 @@ class ChatReward(commands.Cog):
                         message.guild.id, message.author.id,
                         channel_field(message.channel.id, weekly=True), weekly=True)
                 if settings.get("goal_enabled"):
-                    await bump_server_goal(
+                    rd = int(settings.get("goal_reset_days", 1) or 1)
+                    gperiod = quest_goal_period(rd)
+                    new_prog = await bump_server_goal(
                         message.guild.id,
-                        reset_days=settings.get("goal_reset_days", 1)
+                        reset_days=rd
                     )
                     quest_cog = self.bot.get_cog("Quest")
                     if quest_cog:
                         quest_cog.notify_goal_changed(message.guild.id)
+                    target = int(settings.get("goal_target", 0) or 0)
+                    # 공동 목표 주기 내 본인 총 채팅 수
+                    await bump_quest_progress(
+                        message.guild.id, message.author.id,
+                        "goal_chat_total", period=gperiod)
+                    # 목표 달성 전(또는 달성되는 순간까지)의 기여 채팅 수
+                    if target > 0 and (new_prog - 1) < target:
+                        await bump_quest_progress(
+                            message.guild.id, message.author.id,
+                            "goal_chat_early", period=gperiod)
                 await bump_event_progress(message.guild.id, message.author.id, "chat")
         except Exception as e:
             print(f"[Quest] 채팅 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)

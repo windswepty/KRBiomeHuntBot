@@ -1525,11 +1525,18 @@ class Quest(commands.Cog):
         existing_msg_id = settings.get("goal_message_id")
         if existing_msg_id:
             try:
-                msg = await channel.fetch_message(int(existing_msg_id))
-                await msg.edit(embed=embed)
+                # 조회 없이 바로 수정합니다 (fetch + edit = API 2회였습니다).
+                await channel.get_partial_message(
+                    int(existing_msg_id)).edit(embed=embed)
                 return True
             except discord.NotFound:
                 pass            # 지워졌으니 새로 만듭니다
+            except discord.Forbidden:
+                # 권한 상실도 백오프에 넣습니다 — 403 은 무효 요청입니다
+                health.goal_backoff.hit()
+                print(f"[Quest] 채널 권한 없음(403) — "
+                      f"{health.goal_backoff.delay:.0f}초 백오프", flush=True)
+                return False
             except discord.HTTPException as e:
                 if e.status == 429:
                     health.mark_rate_limited()

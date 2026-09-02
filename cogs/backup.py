@@ -423,12 +423,20 @@ async def upsert_status_message(bot, guild) -> bool:
 
     if state["message_id"]:
         try:
-            msg = await channel.fetch_message(state["message_id"])
-            await msg.edit(embed=embed)
+            # get_partial_message 는 **조회 없이** 바로 수정합니다.
+            # fetch_message + edit 이면 갱신 1회에 API 를 2번 쓰는데,
+            # 60초마다 도는 작업이라 그 절반이 순수 낭비였습니다.
+            # 메시지가 없으면 edit 이 NotFound 를 내므로 아래 분기는 그대로입니다.
+            await channel.get_partial_message(state["message_id"]).edit(embed=embed)
             return True
         except discord.NotFound:
             pass          # 지워졌으니 아래에서 새로 만듭니다
         except discord.Forbidden:
+            # 권한을 잃으면 매 주기 403 이 반복됩니다. 403 도 무효 요청으로
+            # 집계되므로(60초마다 = 하루 1,440건) 백오프에 넣습니다.
+            health.status_backoff.hit()
+            print(f"[Status] 채널 권한 없음(403) — "
+                  f"{health.status_backoff.delay:.0f}초 백오프", flush=True)
             return False
         except discord.HTTPException as e:
             if e.status == 429:

@@ -3,6 +3,7 @@ import sys
 import asyncio
 import hashlib
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -36,14 +37,35 @@ SYNC_HASH_FILE = os.path.join("data", ".sync_hash")
 
 
 def _command_fingerprint(tree) -> str:
-    """명령어 이름·설명·옵션을 정렬해 해시. 변경이 없으면 같은 값."""
+    """디스코드에 등록되는 내용을 전부 담아 해시. 바뀌지 않았으면 같은 값.
+
+    ⚠️ **빠뜨린 항목은 "바뀌었는데 안 바뀐 것"으로 판정됩니다.** 그러면
+    동기화를 건너뛰어 변경이 디스코드에 영영 반영되지 않습니다.
+    특히 `default_permissions` 는 누가 그 명령어를 쓸 수 있는지를 정하므로,
+    권한을 조였는데 반영되지 않으면 그대로 열려 있게 됩니다.
+    서브커맨드 그룹도 재귀로 훑습니다(지금은 없지만 나중에 생길 수 있습니다).
+    """
+    def _one(cmd, prefix=""):
+        out = []
+        name = f"{prefix}{cmd.name}"
+        parts = [name, cmd.description or ""]
+        # 누가 쓸 수 있는지 — 빠지면 권한 변경이 조용히 묻힙니다
+        parts.append(str(getattr(cmd, "default_permissions", None)))
+        parts.append(str(getattr(cmd, "guild_only", None)))
+        parts.append(str(getattr(cmd, "nsfw", None)))
+        for p in sorted(getattr(cmd, "parameters", []), key=lambda p: p.name):
+            parts.extend([p.name, str(p.type), str(p.required),
+                          p.description or "",
+                          ",".join(str(c.value) for c in (p.choices or []))])
+        out.append("|".join(parts))
+        for sub in sorted(getattr(cmd, "commands", []) or [],
+                          key=lambda c: c.name):
+            out.extend(_one(sub, prefix=f"{name} "))
+        return out
+
     items = []
     for cmd in sorted(tree.get_commands(), key=lambda c: c.name):
-        parts = [cmd.name, cmd.description or ""]
-        for p in sorted(getattr(cmd, "parameters", []),
-                        key=lambda p: p.name):
-            parts.extend([p.name, str(p.type), str(p.required)])
-        items.append("|".join(parts))
+        items.extend(_one(cmd))
     return hashlib.sha256("\n".join(items).encode()).hexdigest()[:16]
 
 
@@ -274,6 +296,23 @@ async def main():
     if not TOKEN:
         print("ERROR: DISCORD_TOKEN is not set in .env file!", flush=True)
         sys.exit(1)
+
+    # ── DB 워커 스레드 수 ────────────────────────────────────────────
+    #
+    # 모든 pymongo 호출은 `_db()` 를 통해 `asyncio.to_thread` 로 넘어가고,
+    # 그것은 이벤트 루프의 **기본 실행기**를 씁니다. 기본 크기는
+    # `min(32, cpu_count + 4)` 라 2코어 서버에서는 **워커가 6개뿐**입니다.
+    #
+    # 그런데 이 작업들은 CPU 가 아니라 **Atlas 응답을 기다리는 시간**이
+    # 대부분입니다. CPU 수로 정할 값이 아닙니다. 개인서버 링크에 수백 명이
+    # 몰리면 클릭 뒷정리 작업이 이 6개에 줄을 서고, 그동안 슬래시 명령어의
+    # DB 조회까지 밀려 **디스코드 3초 제한**을 넘깁니다.
+    workers = max(4, int(os.getenv("DB_WORKERS", "24") or 24))
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="db"))
+    print(f"DB 워커 스레드: {workers}개 (기본값 "
+          f"{min(32, (os.cpu_count() or 1) + 4)}개에서 상향)", flush=True)
+
     async with bot:
         await load_cogs()
         await bot.start(TOKEN)

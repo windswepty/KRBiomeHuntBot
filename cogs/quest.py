@@ -1403,6 +1403,12 @@ class Quest(commands.Cog):
         settings = await get_quest_settings(guild.id)
         if not (settings.get("enabled") and settings.get("goal_enabled")):
             return
+        # 관리자 전용 모드는 "일반 유저에게는 꺼진 것과 똑같이 보인다"가 약속입니다.
+        # 그런데 이 안내 임베드는 공개 채널에 올라가므로, 검사를 빼먹으면
+        # 준비 중이라는 사실이 6,500명에게 그대로 드러납니다.
+        # (진행도는 평소처럼 쌓이고 /퀘스트 안에서도 정상으로 보입니다)
+        if settings.get("admin_only"):
+            return
         channel_id = settings.get("goal_channel_id")
         if not channel_id:
             return

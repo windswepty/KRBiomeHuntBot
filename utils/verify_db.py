@@ -96,6 +96,12 @@ if MONGO_URI:
             logref_col.create_index(
                 "updated", name="logref_ttl", expireAfterSeconds=30 * 24 * 3600
             )
+            # 유출 감지 색인. TTL 도 상한도 없어 영구 누적이었습니다.
+            # 보호 링크 자체가 7일 TTL 이므로 그보다 넉넉한 30일로 둡니다.
+            # (지난 링크를 다시 뿌리는 것도 한동안은 잡아야 하므로)
+            guardkey_col.create_index(
+                "updated", name="guardkey_ttl", expireAfterSeconds=30 * 24 * 3600
+            )
             # 로블록스 계정 1개는 디스코드 1개에만 연동되어야 합니다.
             # 유출자가 남의 계정을 등록해 명단을 오염시키는 것을 막습니다.
             roblox_col.create_index(
@@ -646,10 +652,14 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
     if guardkey_col is not None:
         try:
             def _write():
+                now = datetime.now(timezone.utc)
                 for key in keys:
                     guardkey_col.update_one(
                         {"_id": f"{guild_id}:{key}"},
-                        {"$set": {"guild_id": str_gid, "key": key}},
+                        # updated 가 있어야 TTL 인덱스가 동작합니다.
+                        # 같은 링크가 다시 보호되면 갱신되어 수명이 늘어납니다.
+                        {"$set": {"guild_id": str_gid, "key": key,
+                                  "updated": now}},
                         upsert=True
                     )
             await _db(_write)

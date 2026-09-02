@@ -183,13 +183,41 @@ def rate_limited_recently() -> bool:
     return (time.monotonic() - at) < RATE_LIMIT_SUPPRESS_SECONDS
 
 
+# 재시작 이력 파일. **메모리에 두면 안 됩니다** — 바로 다음 줄에서
+# os._exit 로 프로세스가 죽으므로, 다음 기동은 이력이 비어 있는 상태로
+# 시작합니다. 그러면 "최근 3회 이상이면 더 기다린다"는 제동 장치가
+# 영원히 작동하지 않습니다. 크래시 루프에 브레이크가 없다는 뜻입니다.
+RESTART_LOG_FILE = os.path.join("data", ".restart_times")
+
+
+def _read_restart_times() -> list[float]:
+    """최근 재시작 시각(벽시계). monotonic 은 재시작을 넘기지 못합니다."""
+    try:
+        with open(RESTART_LOG_FILE, "r") as f:
+            raw = [float(x) for x in f.read().split() if x.strip()]
+    except Exception:
+        return []
+    cutoff = time.time() - RESTART_COOLDOWN_WINDOW
+    return [t for t in raw if t > cutoff]
+
+
 def record_restart() -> None:
-    """watchdog 이 재시작을 결정했을 때 호출. 이력을 남깁니다."""
-    now = time.monotonic()
+    """watchdog 이 재시작을 결정했을 때 호출. 이력을 남깁니다.
+
+    곧바로 프로세스가 죽으므로 **디스크에** 적습니다.
+    """
+    times = _read_restart_times() + [time.time()]
     with _lock:
-        times = _state["restart_times"]
-        cutoff = now - RESTART_COOLDOWN_WINDOW
-        _state["restart_times"] = [t for t in times if t > cutoff] + [now]
+        _state["restart_times"] = list(times)
+    try:
+        os.makedirs(os.path.dirname(RESTART_LOG_FILE) or ".", exist_ok=True)
+        with open(RESTART_LOG_FILE, "w") as f:
+            f.write("\n".join(f"{t:.0f}" for t in times[-20:]))
+    except Exception as e:
+        # 조용히 넘기면 제동 장치가 없는 줄도 모릅니다
+        print(f"*** 재시작 이력 저장 실패 ({RESTART_LOG_FILE}): "
+              f"{type(e).__name__}: {e} — 크래시 루프 제동이 동작하지 "
+              f"않습니다 ***", flush=True)
 
 
 def restart_suppressed() -> bool:
@@ -197,11 +225,12 @@ def restart_suppressed() -> bool:
 
     True 면 다음 재시작 전 추가 대기(RESTART_COOLDOWN_EXTRA)를 적용합니다.
     """
-    now = time.monotonic()
-    with _lock:
-        cutoff = now - RESTART_COOLDOWN_WINDOW
-        recent = [t for t in _state["restart_times"] if t > cutoff]
-    return len(recent) >= RESTART_COOLDOWN_LIMIT
+    return len(_read_restart_times()) >= RESTART_COOLDOWN_LIMIT
+
+
+def recent_restart_count() -> int:
+    """최근 30분 내 재시작 횟수. 상태 임베드에 보여 주기 위한 것입니다."""
+    return len(_read_restart_times())
 
 
 def backoff_status() -> dict | None:
@@ -270,16 +299,41 @@ def should_restart() -> bool:
     짧은 시간에 반복 재시작하는 것도 막습니다. 최근 30분 내 3회 이상
     재시작했다면 추가 대기(5분)를 적용합니다.
     """
+    return restart_decision()[0]
+
+
+def restart_decision() -> tuple[bool, str]:
+    """(재시작할까, 이유). **이유를 함께 돌려주는 것이 핵심입니다.**
+
+    예전에는 watchdog 이 `should_restart()` 로 물어본 뒤 그 안에서 이미
+    False 가 된 억제 조건을 다시 검사했습니다. 그 분기는 도달할 수 없어
+    **억제가 걸려도 로그에 한 줄도 남지 않았습니다.** 무인 운영에서는
+    "억제가 동작하고 있다"를 확인할 방법이 사라진다는 뜻입니다.
+    """
     secs = unhealthy_seconds()
     if secs < RESTART_AFTER_SECONDS:
-        return False
+        return False, ""
     # 429 관측 후 30분 이내면 재시작 억제 (기다리는 게 유일한 해법)
     if rate_limited_recently():
-        return False
+        return False, (f"레이트 리밋 억제 중 — 재시작 보류 "
+                       f"(끊김 {secs:.0f}초)")
     # 최근 30분 내 3회 이상 재시작했으면 추가 대기
-    if restart_suppressed():
-        return secs >= RESTART_AFTER_SECONDS + RESTART_COOLDOWN_EXTRA
-    return True
+    if restart_suppressed() and secs < RESTART_AFTER_SECONDS + RESTART_COOLDOWN_EXTRA:
+        return False, (f"최근 30분 내 재시작 {recent_restart_count()}회 — "
+                       f"추가 대기 중 (끊김 {secs:.0f}초)")
+    return True, f"디스코드 연결이 {secs:.0f}초째 끊겨 있습니다"
+
+
+_last_suppress_log = [0.0]
+
+
+def log_suppression(reason: str, every: float = 300.0) -> None:
+    """억제 사유를 남기되 60초마다 도배하지 않습니다."""
+    now = time.monotonic()
+    if now - _last_suppress_log[0] < every:
+        return
+    _last_suppress_log[0] = now
+    print(f"[Watchdog] {reason}", flush=True)
 
 
 def hard_exit(reason: str) -> None:
@@ -306,25 +360,36 @@ def hard_exit(reason: str) -> None:
 
 LOOP_RESTART_LIMIT = 5
 LOOP_RESTART_DELAY = 10.0
+# 실패는 **이 시간 안의 것만** 셉니다. 누적으로 세면 몇 달 도는 봇에서
+# 몇 주에 한 번씩 나는 일시적 네트워크 오류만으로도 결국 상한에 닿아
+# 주기 작업이 영구히 멈춥니다. 무인 운영에서는 그게 조용한 죽음입니다.
+LOOP_FAILURE_WINDOW = 3600.0
 
-_loop_failures: dict[str, int] = {}
+_loop_failures: dict[str, list[float]] = {}
+
+
+def _recent_failures(name: str) -> list[float]:
+    cutoff = time.monotonic() - LOOP_FAILURE_WINDOW
+    return [t for t in _loop_failures.get(name, []) if t > cutoff]
 
 
 def loop_failure_count(name: str) -> int:
     with _lock:
-        return _loop_failures.get(name, 0)
+        return len(_recent_failures(name))
 
 
 def dead_loops() -> list[str]:
     """되살리기를 포기한 주기 작업 목록."""
     with _lock:
-        return [n for n, c in _loop_failures.items() if c > LOOP_RESTART_LIMIT]
+        return [n for n in _loop_failures
+                if len(_recent_failures(n)) > LOOP_RESTART_LIMIT]
 
 
 def _record_loop_failure(name: str) -> int:
     with _lock:
-        _loop_failures[name] = _loop_failures.get(name, 0) + 1
-        return _loop_failures[name]
+        times = _recent_failures(name) + [time.monotonic()]
+        _loop_failures[name] = times
+        return len(times)
 
 
 async def revive_loop(task_loop, name: str, error: BaseException,

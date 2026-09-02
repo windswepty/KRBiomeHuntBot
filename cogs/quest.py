@@ -1356,8 +1356,10 @@ class Quest(commands.Cog):
                 self._goal_dirty.pop(guild_id, None)
                 continue
             try:
-                await self.update_goal_message(guild)
-                health.goal_backoff.reset()
+                # 성공했을 때만 백오프를 풉니다. 무조건 풀면 429 로 방금 건
+                # 백오프가 그 자리에서 사라져 백오프가 통째로 무효가 됩니다.
+                if await self.update_goal_message(guild):
+                    health.goal_backoff.reset()
                 self._goal_last_update[guild_id] = time.monotonic()
             except Exception as e:
                 print(f"[Quest] {guild.name}: 실시간 목표 갱신 실패 - "
@@ -1386,8 +1388,8 @@ class Quest(commands.Cog):
             return   # 429 백오프 중 — 시도하지 않습니다
         for guild in self.bot.guilds:
             try:
-                await self.update_goal_message(guild)
-                health.goal_backoff.reset()
+                if await self.update_goal_message(guild):
+                    health.goal_backoff.reset()
             except Exception as e:
                 print(f"[Quest] {guild.name}: 공동 목표 갱신 실패 - "
                       f"{type(e).__name__}: {e}", flush=True)
@@ -1399,29 +1401,36 @@ class Quest(commands.Cog):
     async def goal_refresh_error(self, error):
         await health.revive_loop(self.goal_refresh, "goal_refresh", error)
 
-    async def update_goal_message(self, guild) -> None:
+    async def update_goal_message(self, guild) -> bool:
+        """공동 목표 안내를 갱신합니다. **성공했을 때만 True.**
+
+        ⚠️ bool 을 돌려주는 것이 중요합니다. 예전에는 아무것도 돌려주지
+        않아서, 429 로 실패해도 호출부가 정상 반환으로 보고 `reset()` 을
+        불렀습니다. 방금 건 백오프가 그 자리에서 지워져 **차단 중에도 계속
+        요청**했고, 429 는 무효 요청으로 집계되므로 차단이 연장됐습니다.
+        """
         settings = await get_quest_settings(guild.id)
         if not (settings.get("enabled") and settings.get("goal_enabled")):
-            return
+            return False
         # 관리자 전용 모드는 "일반 유저에게는 꺼진 것과 똑같이 보인다"가 약속입니다.
         # 그런데 이 안내 임베드는 공개 채널에 올라가므로, 검사를 빼먹으면
         # 준비 중이라는 사실이 6,500명에게 그대로 드러납니다.
         # (진행도는 평소처럼 쌓이고 /퀘스트 안에서도 정상으로 보입니다)
         if settings.get("admin_only"):
-            return
+            return False
         channel_id = settings.get("goal_channel_id")
         if not channel_id:
-            return
+            return False
         channel = (guild.get_channel_or_thread(int(channel_id))
                    or guild.get_channel(int(channel_id)))
         if channel is None or not channel.permissions_for(guild.me).send_messages:
-            return
+            return False
         # 스레드가 보관(archived)되어 있으면 되살립니다.
         if isinstance(channel, discord.Thread) and channel.archived:
             try:
                 await channel.edit(archived=False)
             except discord.HTTPException:
-                return  # 권한 부족 등으로 되살리지 못하면 포기
+                return False  # 권한 부족 등으로 되살리지 못하면 포기
 
         state = await get_server_goal(guild.id, reset_days=settings.get("goal_reset_days", 1))
         target = int(settings.get("goal_target", 0) or 0)
@@ -1518,7 +1527,7 @@ class Quest(commands.Cog):
             try:
                 msg = await channel.fetch_message(int(existing_msg_id))
                 await msg.edit(embed=embed)
-                return
+                return True
             except discord.NotFound:
                 pass            # 지워졌으니 새로 만듭니다
             except discord.HTTPException as e:
@@ -1529,13 +1538,22 @@ class Quest(commands.Cog):
                           f"{health.goal_backoff.delay:.0f}초 백오프", flush=True)
                 else:
                     print(f"[Quest] 공동 목표 수정 실패: {e}", flush=True)
-                return
+                return False
         try:
             msg = await channel.send(embed=embed)
         except discord.HTTPException as e:
-            print(f"[Quest] 공동 목표 생성 실패: {e}", flush=True)
-            return
+            # 수정 경로에만 429 처리가 있었습니다. 메시지가 지워진 뒤에는
+            # 매번 이 경로로 오므로, 여기가 비어 있으면 백오프가 걸리지 않습니다.
+            if e.status == 429:
+                health.mark_rate_limited()
+                health.goal_backoff.hit()
+                print(f"[Quest] 429 레이트 리밋(생성) — "
+                      f"{health.goal_backoff.delay:.0f}초 백오프", flush=True)
+            else:
+                print(f"[Quest] 공동 목표 생성 실패: {e}", flush=True)
+            return False
         await save_quest_settings(guild.id, {"goal_message_id": str(msg.id)})
+        return True
 
     # ── 유저용 ───────────────────────────────────────────────────────
 

@@ -185,14 +185,14 @@ async def watchdog():
             else:
                 health.mark_disconnected()
 
-        if health.should_restart():
+        # 이유를 함께 받습니다. 억제가 걸린 경우에도 로그가 남아야
+        # "제동 장치가 동작 중"임을 밖에서 확인할 수 있습니다.
+        go, reason = health.restart_decision()
+        if go:
             health.record_restart()
-            secs = round(health.unhealthy_seconds())
-            if health.rate_limited_recently():
-                print(f"[Watchdog] 레이트 리밋 억제 중 — 재시작 보류 "
-                      f"(끊김 {secs}초)", flush=True)
-            else:
-                health.hard_exit(f"디스코드 연결이 {secs}초째 끊겨 있습니다")
+            health.hard_exit(reason)
+        elif reason:
+            health.log_suppression(reason)
     except Exception as e:
         # 감시 자체가 죽으면 감시가 없는 것과 같습니다. 절대 조용히 넘기지 않습니다.
         print(f"[Watchdog] 점검 중 오류: {type(e).__name__}: {e}", flush=True)
@@ -303,6 +303,14 @@ def _run_with_429_retry():
 
     for attempt in range(1, MAX_429_RETRIES + 1):
         try:
+            # ⚠️ `async with bot:` 이 끝날 때 close() 가 불려 `_closed` 가
+            # True 로 남습니다. discord.py 의 connect() 는
+            # `while not self.is_closed():` 라, 그대로 재시도하면 **즉시
+            # 반환**해 버립니다. 차단이 풀렸어도 연결하지 못한 채 프로세스가
+            # 끝나고, 그 재시작이 다시 무효 요청이 됩니다 — 이 재시도 루프가
+            # 막으려던 바로 그 고리입니다. clear() 로 되살려야 합니다.
+            if attempt > 1:
+                bot.clear()
             asyncio.run(main())
             # main() 이 정상 반환 → 봇이 스스로 종료 (무인 운영에서는 비정상)
             return

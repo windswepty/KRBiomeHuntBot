@@ -68,6 +68,18 @@ class ReportModal(discord.ui.Modal, title="티켓을 생성하기전 2차 절차
             )
             return
 
+        # 이미 열려 있는 티켓이 있으면 그리로 안내합니다.
+        # 없으면 제출할 때마다 채널이 하나씩 생기는데, 6,500명이 누를 수 있는
+        # 버튼이라 길드 채널 상한(500개)까지 밀어 넣을 수 있습니다.
+        # 권한 덮어쓰기로 찾으므로 닉네임이 바뀌어도 정확히 걸립니다.
+        for existing in category.text_channels:
+            if existing.overwrites_for(user).view_channel:
+                await interaction.response.send_message(
+                    f"⚠️ 이미 열려 있는 제보가 있습니다 → {existing.mention}\n"
+                    "-# 그 채널에 이어서 적어 주세요. 처리되면 자동으로 닫힙니다.",
+                    ephemeral=True)
+                return
+
         # 비공개 채널 권한 설정 (제보자 + 관리자만 볼 수 있음)
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),

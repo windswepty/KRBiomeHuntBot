@@ -443,7 +443,15 @@ async def upsert_status_message(bot, guild) -> bool:
     try:
         msg = await channel.send(embed=embed)
     except discord.HTTPException as e:
-        print(f"[Status] 임베드 생성 실패: {e}", flush=True)
+        # 수정 경로에만 429 처리가 있었습니다. 임베드가 지워진 뒤에는 매번
+        # 이 경로로 오므로, 여기가 비어 있으면 백오프가 걸리지 않습니다.
+        if e.status == 429:
+            health.mark_rate_limited()
+            health.status_backoff.hit()
+            print(f"[Status] 429 레이트 리밋(생성) — "
+                  f"{health.status_backoff.delay:.0f}초 백오프", flush=True)
+        else:
+            print(f"[Status] 임베드 생성 실패: {e}", flush=True)
         return False
     await set_status_message(guild.id, msg.id)
     return True

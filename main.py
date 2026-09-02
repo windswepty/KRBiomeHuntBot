@@ -95,12 +95,19 @@ async def on_ready():
             synced = await bot.tree.sync()
             health.set_command_count(len(synced))
             print(f"Synced {len(synced)} slash command(s).", flush=True)
-            # 성공했으면 지문 저장
+            # 성공했으면 지문 저장.
+            # ⚠️ 여기서 실패를 조용히 넘기면 안 됩니다. 실제로 data/ 가 root
+            # 소유라 쓰기가 계속 실패했고, 그 탓에 건너뛰기가 **9번의 기동 동안
+            # 한 번도 동작하지 않은 채** 매번 전역 동기화가 나갔습니다.
+            # 아무도 몰랐던 이유가 정확히 이 `except: pass` 였습니다.
             try:
                 with open(SYNC_HASH_FILE, "w") as f:
                     f.write(fingerprint)
-            except Exception:
-                pass
+            except Exception as e:
+                msg = (f"지문 저장 실패 ({SYNC_HASH_FILE}): {type(e).__name__}: {e}"
+                       " — 다음 기동에서도 전역 동기화가 반복됩니다")
+                print(f"*** {msg} ***", flush=True)
+                health.add_note(msg)
         except discord.HTTPException as e:
             if e.status == 429:
                 health.mark_rate_limited()

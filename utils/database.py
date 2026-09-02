@@ -1838,18 +1838,57 @@ async def save_status_channel(guild_id: int, channel_id: int | None) -> None:
             json.dump(allset, f, ensure_ascii=False, indent=2)
 
 
+def _git_head() -> str:
+    """작업 폴더의 `.git` 에서 현재 커밋 해시를 직접 읽습니다.
+
+    `git` 명령을 부르지 않습니다 — 기동 경로라 하위 프로세스를 띄우고 싶지
+    않고, 파일 두 개만 읽으면 되기 때문입니다.
+    """
+    try:
+        with open(os.path.join(".git", "HEAD"), "r", encoding="utf-8") as f:
+            head = f.read().strip()
+    except Exception:
+        return ""
+
+    if not head.startswith("ref:"):
+        return head[:12]        # 분리된 HEAD — 해시가 그대로 들어 있습니다
+
+    ref = head[4:].strip()
+    try:
+        with open(os.path.join(".git", *ref.split("/")), "r", encoding="utf-8") as f:
+            return f.read().strip()[:12]
+    except Exception:
+        pass
+    # 느슨한 ref 파일이 없으면 packed-refs 를 뒤집니다 (git gc 후에 이렇게 됩니다)
+    try:
+        with open(os.path.join(".git", "packed-refs"), "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref:
+                    return parts[0][:12]
+    except Exception:
+        pass
+    return ""
+
+
 def current_version() -> str:
     """지금 돌고 있는 코드의 버전(커밋 해시). 알 수 없으면 빈 문자열.
 
-    Render 는 배포마다 RENDER_GIT_COMMIT 을 넣어 줍니다. 이 값이 있으면
-    **재배포로 인한 재시작**과 **같은 코드가 계속 죽는 크래시 루프**를
-    구분할 수 있습니다. 둘은 대응이 정반대라 섞이면 안 됩니다.
+    이 값이 있어야 **재배포로 인한 재시작**과 **같은 코드가 계속 죽는
+    크래시 루프**를 구분할 수 있습니다. 둘은 대응이 정반대라 섞이면 안 됩니다.
+
+    ⚠️ Render 시절에는 `RENDER_GIT_COMMIT` 하나만 봤습니다. Oracle 로 옮긴
+    뒤 그 변수가 사라져 **항상 빈 문자열**이 되었고, 크래시 루프 경보가
+    조용히 죽어 있었습니다. 무인 운영에서는 그 경보가 유일한 신호이므로,
+    호스팅에 기대지 않고 `.git` 에서 직접 읽습니다.
     """
     for key in ("RENDER_GIT_COMMIT", "GIT_COMMIT", "SOURCE_VERSION"):
         v = (os.getenv(key) or "").strip()
         if v:
             return v[:12]
-    return ""
+    return _git_head()
 
 
 async def record_boot(guild_id: int) -> dict:

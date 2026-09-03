@@ -16,7 +16,6 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 
-@app.route('/')
 @app.route('/health')
 def home():
     """생존 확인 — **디스코드 연결 상태까지** 반영합니다.
@@ -52,6 +51,61 @@ def home():
     return resp
 
 
+
+
+@app.route('/')
+def landing():
+    """앱 소개 페이지 — 사람이 보는 곳.
+
+    예전에는 여기도 /health 와 같은 JSON 을 돌려줬습니다. 그런데 이 주소는
+    **로블록스 OAuth 앱의 Entry Link** 라 심사자가 직접 눌러 봅니다.
+    JSON 덩어리만 보이면 "앱 소개가 없다"고 판단할 수 있습니다.
+    (실제로 옛 주소가 죽어 있어 한 번 반려된 적이 있습니다.)
+
+    좀비 판정이 필요한 감시는 **/health 하나로** 유지합니다. 여기까지
+    503 을 내면, 일시적인 끊김 중에 심사자가 들어왔을 때 "서비스가
+    고장났다"로 보여 반려될 수 있습니다. 그래서 이 페이지는 항상 200 이고,
+    상태는 본문에 글로 적어 사람이 읽게 합니다.
+    """
+    st = health.snapshot()
+    ok = health.is_healthy()
+    status_line = ("정상 작동 중" if ok else "일시적으로 점검 중입니다")
+    return _doc("KR Biome Hunt Verification", """
+<h1>KR Biome Hunt Verification</h1>
+<p class="muted">한국 바이옴 헌트 · 디스코드 인증 봇</p>
+
+<h2>What this service does</h2>
+<p>This service links a Discord member to their Roblox account so that a
+Korean Roblox community (Sol&#39;s RNG biome hunting, about 6,500 members)
+can grant verified roles and keep private-server links from being leaked.
+It is used only inside that one Discord server.</p>
+
+<h2>무엇을 하는 서비스인가요</h2>
+<p>디스코드 계정과 로블록스 계정을 연결해, <b>본인이 맞는지 확인</b>합니다.
+확인된 사람에게만 인증 역할을 주고, 개인서버 링크가 밖으로 새지 않도록
+1회용 주소로 전달합니다.</p>
+
+<h2>받는 정보</h2>
+<p>로블록스에서 <code>openid</code> · <code>profile</code> 권한으로 아래만 받습니다.</p>
+<ul>
+  <li>로블록스 사용자 ID</li>
+  <li>사용자명 / 표시 이름</li>
+  <li>계정 생성 일자</li>
+</ul>
+<p>비밀번호·이메일·결제 정보는 받지 않으며, 로블록스 계정에 어떤 변경도
+하지 않습니다. 자세한 내용은 아래 문서를 봐 주세요.</p>
+
+<h2>문서</h2>
+<ul>
+  <li><a href="/privacy">개인정보 처리방침 (Privacy Policy)</a></li>
+  <li><a href="/terms">이용약관 (Terms of Service)</a></li>
+</ul>
+
+<h2>상태</h2>
+<p>""" + status_line + """ · 서버 """ + str(st["guilds"]) + """개 · 명령어 """
+        + str(st.get("commands", 0)) + """개</p>
+<p class="muted">서비스 상태를 기계가 읽는 주소는 <code>/health</code> 입니다.</p>
+""")
 # ── 개인서버 링크 중계 ────────────────────────────────────────────────
 #
 # 봇이 인증을 통과한 유저에게 이 주소를 주고, 실제 로블록스 링크는

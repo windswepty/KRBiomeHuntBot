@@ -1,0 +1,165 @@
+# Oracle 인스턴스가 정지되면 자동으로 다시 켭니다.
+#
+# 왜 필요한가
+#   Always Free 계정은 7일간 CPU·네트워크 사용률이 낮으면 '유휴'로 판정되어
+#   인스턴스가 **정지**됩니다(삭제 아님). 디스코드 봇은 대부분 대기 상태라
+#   잘 돌고 있어도 이 기준에 걸립니다. 정지된 인스턴스를 다시 켜는 것은
+#   Oracle 이 명시적으로 허용한 동작입니다.
+#
+#   운영자가 오래 자리를 비우는 것이 이 봇의 설계 전제라, "이메일을 보고
+#   사람이 켠다"에 기댈 수 없습니다.
+#
+# 필요한 저장소 시크릿 (Settings → Secrets and variables → Actions)
+#   OCI_CLI_USER          ocid1.user.oc1..~
+#   OCI_CLI_TENANCY       ocid1.tenancy.oc1..~
+#   OCI_CLI_FINGERPRINT   xx:xx:...:xx
+#   OCI_CLI_KEY_CONTENT   개인키 PEM 전문 (-----BEGIN 부터 END----- 까지)
+#   OCI_CLI_REGION        ap-tokyo-1
+#   OCI_INSTANCE_ID       ocid1.instance.oc1.ap-tokyo-1.~
+#   BOT_HEALTH_URL        (선택) http://<IP>:8080/health
+#
+# 알림은 이 워크플로가 아니라 UptimeRobot 이 담당합니다.
+# 여기서 실패(=이메일)는 **스스로 고칠 수 없는 경우**에만 냅니다.
+# 늘 빨간 표시는 없는 것보다 나쁩니다 — 익숙해져서 진짜 경고를 놓칩니다.
+
+name: 인스턴스 자동 재시작
+
+on:
+  schedule:
+    # 3시간마다. 분을 17로 흩어 정각 혼잡을 피합니다.
+    # 월 약 240회 × 1.5분 = 360분 (비공개 저장소 무료 2,000분 중 18%)
+    - cron: "17 */3 * * *"
+  workflow_dispatch:        # 수동 실행 (Actions 탭에서 버튼)
+
+permissions:
+  contents: write           # 60일 비활성 방지용 빈 커밋
+
+concurrency:
+  group: oci-keepalive
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OCI CLI 설치
+        run: pip install --quiet --disable-pip-version-check oci-cli
+
+      - name: 인증 준비
+        # 환경변수만으로도 되지만, CI 에서 ~/.oci/config 가 없어 실패하는
+        # 사례가 흔합니다. 설정 파일을 명시적으로 만들어 경로를 하나로 굳힙니다.
+        # 개인키는 600 이어야 CLI 가 받아 줍니다.
+        env:
+          U: ${{ secrets.OCI_CLI_USER }}
+          T: ${{ secrets.OCI_CLI_TENANCY }}
+          F: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          K: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          R: ${{ secrets.OCI_CLI_REGION }}
+        run: |
+          set -euo pipefail
+          for v in U T F K R; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::시크릿이 비어 있습니다 — .github/KEEPALIVE-SETUP.md 를 보세요 ($v)"
+              exit 1
+            fi
+          done
+          mkdir -p ~/.oci
+          # PEM 에는 역슬래시가 없으므로 echo 로 충분합니다
+          echo "$K" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          # 값 자체는 로그에 남기지 않습니다 (GitHub 이 가려 주지만 이중으로)
+          {
+            echo "[DEFAULT]"
+            echo "user=$U"
+            echo "tenancy=$T"
+            echo "fingerprint=$F"
+            echo "region=$R"
+            echo "key_file=$HOME/.oci/key.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/config || true
+          echo "설정 완료"
+
+      - name: 인스턴스 상태 확인 · 꺼져 있으면 켜기
+        env:
+          INSTANCE: ${{ secrets.OCI_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INSTANCE:-}" ]; then
+            echo "::error::OCI_INSTANCE_ID 시크릿이 없습니다. 설정을 마쳐 주세요."
+            exit 1
+          fi
+
+          state=$(oci compute instance get --instance-id "$INSTANCE" \
+                    --query 'data."lifecycle-state"' --raw-output)
+          echo "현재 상태: $state"
+
+          case "$state" in
+            RUNNING)
+              echo "정상 가동 중 — 할 일 없음"
+              ;;
+            STOPPED)
+              echo "::warning::인스턴스가 정지되어 있습니다. 재시작합니다."
+              oci compute instance action --instance-id "$INSTANCE" \
+                  --action START --wait-for-state RUNNING --max-wait-seconds 600
+              echo "재시작 완료 — 봇은 systemd 가 부팅 시 자동으로 띄웁니다"
+              echo "RESTARTED=1" >> "$GITHUB_ENV"
+              ;;
+            STARTING|STOPPING)
+              # 전환 중에 끼어들면 오히려 꼬입니다. 다음 주기에 봅니다.
+              echo "전환 중($state) — 다음 주기에 다시 확인합니다"
+              ;;
+            TERMINATED|TERMINATING)
+              echo "::error::인스턴스가 삭제되었습니다. 자동 복구 불가 — 직접 확인이 필요합니다."
+              exit 1
+              ;;
+            *)
+              echo "::error::예상치 못한 상태: $state"
+              exit 1
+              ;;
+          esac
+
+      - name: 봇 응답 확인
+        if: ${{ env.RESTARTED == '1' }}
+        env:
+          URL: ${{ secrets.BOT_HEALTH_URL }}
+        run: |
+          set -uo pipefail
+          if [ -z "${URL:-}" ]; then
+            echo "BOT_HEALTH_URL 미설정 — 건너뜁니다"
+            exit 0
+          fi
+          # 부팅 + 디스코드 로그인까지 시간이 걸립니다. /health 는 기동 유예
+          # 180초 안에서는 200 을 주므로, 넉넉히 기다렸다가 봅니다.
+          for i in $(seq 1 10); do
+            sleep 30
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$URL" || echo 000)
+            echo "  시도 $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "봇 응답 정상"
+              exit 0
+            fi
+          done
+          echo "::error::인스턴스는 켰지만 봇이 5분 안에 응답하지 않습니다."
+          exit 1
+
+      - name: 60일 비활성 방지
+        # GitHub 은 커밋이 60일간 없으면 예약 워크플로를 **자동으로 끕니다.**
+        # 꺼진 뒤에는 스스로 되살릴 수 없습니다(실행이 안 되니까).
+        # 태그·이슈·PR 은 타이머를 되돌리지 않습니다 — 오직 커밋뿐입니다.
+        run: |
+          set -euo pipefail
+          age=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "마지막 커밋: ${age}일 전"
+          if [ "$age" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty \
+              -m "chore: 예약 워크플로 유지용 빈 커밋 (60일 비활성 방지)"
+            git push
+            echo "빈 커밋을 남겼습니다 — 타이머 초기화"
+          fi

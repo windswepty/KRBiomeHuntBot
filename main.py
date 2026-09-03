@@ -158,6 +158,21 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     print(f"[Slash Command Error] /{cmd_name}: {error}", flush=True)
     traceback.print_exception(type(error), error, error.__traceback__)
 
+    # 응답을 보낼 수 없는 오류인가.
+    #   10062 Unknown interaction        — 3초 안에 응답 못 해 토큰이 죽음
+    #   40060 already acknowledged       — 이미 응답됨(재전송 등)
+    # 이때 응답을 시도하면 **반드시 또 실패**합니다.
+    # 그리고 그 실패는 400/404 — 디스코드가 무효 요청으로 집계하는
+    # 값입니다(10분에 10,000건이면 1시간 차단). 즉 오류 하나당
+    # 무효 요청이 두 배로 늘어나, 몰림 때 스스로 차단을 당기는
+    # 피드백이 됩니다. 실제로 오류 14건 전부가 그렇게 두 줄씩 남았습니다.
+    orig = getattr(error, "original", error)
+    code = getattr(orig, "code", None)
+    if code in (10062, 40060):
+        print(f"[Slash Command Error] 응답 불가(code {code}) — "
+              f"재시도하지 않습니다", flush=True)
+        return
+
     if isinstance(error, app_commands.errors.MissingPermissions):
         msg = "⚠️ 이 명령어를 실행할 권한이 없습니다."
     elif isinstance(error, app_commands.errors.CheckFailure):
@@ -170,6 +185,17 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.followup.send(msg, ephemeral=True)
         else:
             await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException as e:
+        # is_done() 은 **이 프로세스의 기억**일 뿐입니다. 디스코드 쪽이
+        # 이미 응답된 것으로 알고 있으면 40060 이 나오는데,
+        # 그때는 followup 으로는 보낼 수 있습니다. 딱 한 번만 더 시도합니다.
+        if e.code == 40060 and not interaction.response.is_done():
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+                return
+            except discord.HTTPException as e2:
+                e = e2
+        print(f"[Slash Command Error] 오류 메시지 전송 실패: {e}", flush=True)
     except Exception as e:
         print(f"[Slash Command Error] 오류 메시지 전송 실패: {e}", flush=True)
 

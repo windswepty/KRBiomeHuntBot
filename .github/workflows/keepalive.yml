@@ -114,51 +114,77 @@ jobs:
           oci setup repair-file-permissions --file ~/.oci/config || true
           echo "설정 완료"
 
-      - name: 인스턴스 상태 확인 · 꺼져 있으면 켜기
+      - name: 인스턴스 전부 확인 · 꺼져 있으면 켜기
         env:
-          INSTANCE: ${{ secrets.OCI_INSTANCE_ID }}
+          TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          # 이름을 쉼표로 나열하면 그 인스턴스는 건드리지 않습니다.
+          # (일부러 꺼 둔 것을 워크플로가 다시 켜지 않게 하는 탈출구)
+          SKIP: ${{ vars.KEEPALIVE_SKIP }}
         run: |
           set -euo pipefail
-          if [ -z "${INSTANCE:-}" ]; then
-            echo "::error::OCI_INSTANCE_ID 시크릿이 없습니다. 설정을 마쳐 주세요."
-            exit 1
-          fi
+          TENANCY=$(printf %s "$TENANCY" | tr -d "[:space:]")
 
-          INSTANCE=$(printf %s "$INSTANCE" | tr -d "[:space:]")
-          # 실패하면 오류 본문을 보여 줍니다. 안 그러면 exit 1 만 남아
-          # 무엇이 잘못됐는지 알 수 없습니다.
-          if ! state=$(oci compute instance get --instance-id "$INSTANCE" \
-                         --query 'data."lifecycle-state"' --raw-output 2>/tmp/oci_err); then
+          # OCID 를 박아 두지 않고 구획에서 찾아옵니다. 인스턴스를 새로
+          # 만들거나 다시 만들어도 설정을 고칠 필요가 없습니다.
+          if ! oci compute instance list --compartment-id "$TENANCY" --all \
+                 --query 'data[].{id:id,name:"display-name",state:"lifecycle-state"}' \
+                 --output json > /tmp/inst.json 2>/tmp/oci_err; then
             echo "::error::OCI 호출 실패 — 아래 메시지를 확인하세요"
             head -30 /tmp/oci_err
             exit 1
           fi
-          echo "현재 상태: $state"
 
-          case "$state" in
-            RUNNING)
-              echo "정상 가동 중 — 할 일 없음"
-              ;;
-            STOPPED)
-              echo "::warning::인스턴스가 정지되어 있습니다. 재시작합니다."
-              oci compute instance action --instance-id "$INSTANCE" \
-                  --action START --wait-for-state RUNNING --max-wait-seconds 600
-              echo "재시작 완료 — 봇은 systemd 가 부팅 시 자동으로 띄웁니다"
-              echo "RESTARTED=1" >> "$GITHUB_ENV"
-              ;;
-            STARTING|STOPPING)
-              # 전환 중에 끼어들면 오히려 꼬입니다. 다음 주기에 봅니다.
-              echo "전환 중($state) — 다음 주기에 다시 확인합니다"
-              ;;
-            TERMINATED|TERMINATING)
-              echo "::error::인스턴스가 삭제되었습니다. 자동 복구 불가 — 직접 확인이 필요합니다."
-              exit 1
-              ;;
-            *)
-              echo "::error::예상치 못한 상태: $state"
-              exit 1
-              ;;
-          esac
+          count=$(jq length /tmp/inst.json)
+          echo "인스턴스 ${count}개를 찾았습니다"
+          if [ "$count" = "0" ]; then
+            echo "::error::하나도 못 찾았습니다. 하위 구획에 있는지 확인하세요."
+            exit 1
+          fi
+
+          # 파이프가 아니라 리다이렉션으로 읽습니다. 파이프면 서브셸이라
+          # 아래에서 세는 fail/restarted 가 루프 밖에서 사라집니다.
+          jq -r '.[] | [.id, .name, .state] | join("|")' /tmp/inst.json > /tmp/inst.txt
+          fail=0
+          restarted=""
+          while IFS="|" read -r id name state; do
+            case ",$SKIP," in
+              *",$name,"*) echo "  $name : 건너뜀 (KEEPALIVE_SKIP)"; continue ;;
+            esac
+            case "$state" in
+              RUNNING)
+                echo "  $name : RUNNING — 할 일 없음" ;;
+              STOPPED)
+                echo "::warning::$name 이 정지되어 있습니다. 재시작합니다."
+                if oci compute instance action --instance-id "$id" \
+                     --action START --wait-for-state RUNNING \
+                     --max-wait-seconds 600 > /dev/null 2>/tmp/start_err; then
+                  echo "  $name : 재시작 완료 (봇은 systemd 가 부팅 시 띄웁니다)"
+                  restarted="$restarted $name"
+                else
+                  echo "::error::$name 재시작 실패"
+                  head -20 /tmp/start_err
+                  fail=1
+                fi ;;
+              STARTING|STOPPING)
+                # 전환 중에 끼어들면 오히려 꼬입니다. 다음 주기에 봅니다.
+                echo "  $name : $state — 전환 중, 다음 주기에 확인" ;;
+              TERMINATED|TERMINATING)
+                # 삭제는 되살릴 수 없으니 경고만 냅니다. 실패로 잡으면
+                # 일부러 지운 인스턴스 하나 때문에 워크플로가 영원히
+                # 빨간불이 되고, 그러면 진짜 실패를 놓칩니다.
+                # 봇 인스턴스가 삭제된 경우는 UptimeRobot 이 즉시 잡습니다.
+                echo "::warning::$name 이 삭제된 상태입니다 — 자동 복구 대상 아님" ;;
+              *)
+                echo "::error::$name : 예상치 못한 상태 ($state)"
+                fail=1 ;;
+            esac
+          done < /tmp/inst.txt
+
+          if [ -n "$restarted" ]; then
+            echo "RESTARTED=1" >> "$GITHUB_ENV"
+            echo "재시작한 인스턴스:$restarted"
+          fi
+          exit $fail
 
       - name: 봇 응답 확인
         if: ${{ env.RESTARTED == '1' }}

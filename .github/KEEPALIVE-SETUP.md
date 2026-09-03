@@ -69,8 +69,10 @@ GitHub → windswepty/KRBiomeHuntBot
 | `OCI_CLI_FINGERPRINT` | 1단계에서 복사한 `fingerprint=` 값 |
 | `OCI_CLI_KEY_CONTENT` | 내려받은 개인키 `.pem` 파일을 **메모장으로 열어 전문 복사** (`-----BEGIN` 줄부터 `-----END` 줄까지, 줄바꿈 포함) |
 | `OCI_CLI_REGION` | `ap-tokyo-1` |
-| `OCI_INSTANCE_ID` | `ocid1.instance.oc1.ap-tokyo-1.anxhiljrnpj2phic7ri7wksaftv6lf6f73c2awkvxqpkgcspu4efgsmwiyfa` |
 | `OCI_CLI_TENANCY` | `ocid1.tenancy.oc1..aaaaaaaawybaw2eo7ts53w5mshjfvhig2ddbcbsz7nfm77msxr3hy6huogna` |
+
+> 예전에는 `OCI_INSTANCE_ID` 도 필요했습니다. 지금은 **구획에서 인스턴스를
+> 찾아오므로 필요 없습니다.** 이미 등록해 두셨다면 그냥 두셔도 무해합니다.
 
 선택 사항 (넣으면 재시작 후 봇이 실제로 살아났는지까지 확인합니다):
 
@@ -120,6 +122,31 @@ Flask 만 살아 있고 봇이 죽은 경우까지 잡힌다는 뜻입니다.
 기동 유예 180초가 있어 재배포 때는 오탐하지 않습니다.
 
 ---
+
+## 어떤 인스턴스를 지키나
+
+**계정(루트 구획)의 인스턴스를 전부** 확인해 꺼져 있으면 켭니다.
+OCID 를 박아 두지 않으므로 인스턴스를 새로 만들거나 다시 만들어도
+설정을 고칠 필요가 없습니다.
+
+```
+현재    krbiomehuntbot (봇)  ·  windweaver
+```
+
+**일부러 꺼 두고 싶은 인스턴스가 생기면** 저장소 변수로 제외하세요.
+시크릿이 아니라 변수(Variables)입니다 — 이름은 비밀이 아니니까요.
+
+```
+Settings → Secrets and variables → Actions → Variables 탭
+  → New repository variable
+     Name  : KEEPALIVE_SKIP
+     Value : windweaver          (여러 개면 쉼표로: a,b)
+```
+
+삭제된(TERMINATED) 인스턴스는 **경고만** 내고 실패로 잡지 않습니다.
+일부러 지운 인스턴스 하나 때문에 워크플로가 영원히 빨간불이 되면,
+정작 진짜 실패를 놓치게 됩니다. 봇 인스턴스가 삭제된 경우는
+UptimeRobot 이 즉시 잡습니다.
 
 ## 알아 두실 것
 

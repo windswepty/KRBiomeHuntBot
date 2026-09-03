@@ -2597,8 +2597,13 @@ async def take_checkin_rank(guild_id: int) -> int:
     key = f"{guild_id}:{quest_day()}"
     if quest_state_col is not None:
         try:
+            # created 를 함께 씁니다. 없으면 quest_state_ttl 인덱스가
+            # **한 번도 발동하지 않습니다** — TTL 은 필드가 없는 문서를
+            # 건드리지 않기 때문입니다. 실제로 5건 전부 영구 잔류였습니다.
             doc = await _db(quest_state_col.find_one_and_update,
-                            {"_id": key}, {"$inc": {"checkin_seq": 1}},
+                            {"_id": key},
+                            {"$inc": {"checkin_seq": 1},
+                             "$set": {"created": datetime.now(timezone.utc)}},
                             upsert=True, return_document=_AFTER)
             return int((doc or {}).get("checkin_seq", 1) or 1)
         except Exception as e:
@@ -2640,8 +2645,14 @@ async def bump_server_goal(guild_id: int, amount: int = 1, reset_days: int = 1) 
     key = f"{guild_id}:{quest_goal_period(reset_days)}"
     if quest_state_col is not None:
         try:
+            # $setOnInsert 가 아니라 매번 갱신합니다. 공동 목표 주기가
+            # TTL(21일)보다 길게 설정되면, 고정해 둔 created 때문에
+            # **진행 중인 목표 문서가 도중에 지워져** 진행도가 조용히
+            # 0 이 됩니다. 마지막 활동 기준으로 만료되게 둡니다.
             doc = await _db(quest_state_col.find_one_and_update,
-                            {"_id": key}, {"$inc": {"goal_progress": amount}},
+                            {"_id": key},
+                            {"$inc": {"goal_progress": amount},
+                             "$set": {"created": datetime.now(timezone.utc)}},
                             upsert=True, return_document=_AFTER)
             return int((doc or {}).get("goal_progress", 0) or 0)
         except Exception as e:
@@ -2688,7 +2699,7 @@ async def mark_server_goal(guild_id: int, reset_days: int = 1, **patch) -> None:
     if quest_state_col is not None:
         try:
             await _db(quest_state_col.update_one, {"_id": key},
-                      {"$set": patch}, upsert=True)
+                      {"$set": {**patch, "created": datetime.now(timezone.utc)}}, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB mark_server_goal error: {e}", flush=True)

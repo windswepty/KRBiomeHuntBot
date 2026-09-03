@@ -61,6 +61,10 @@ jobs:
           F: ${{ secrets.OCI_CLI_FINGERPRINT }}
           K: ${{ secrets.OCI_CLI_KEY_CONTENT }}
           R: ${{ secrets.OCI_CLI_REGION }}
+          # OCI CLI 는 키 파일 끝에 OCI_API_KEY 라벨이 없으면 매번 경고를
+          # 냅니다. CI 의 일회용 파일이라 해당 없는 권고인데, 늘 노란불이
+          # 뜨면 진짜 경고를 놓치게 되므로 끕니다.
+          SUPPRESS_LABEL_WARNING: 'True'
         run: |
           set -euo pipefail
           for v in U T F K R; do

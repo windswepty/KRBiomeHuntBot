@@ -672,6 +672,16 @@ DEFAULT_REPORT_SETTINGS = {
     "default_points": 500,
     "notify_role_id": None,
     "report_channel_id": None,
+    # ── /제보 안내 임베드 꾸미기 ──────────────────────────────────
+    # 전부 None 이면 cogs/report.py 의 기본 문구를 씁니다. 그래서 이 항목이
+    # 생기기 전에 설정한 서버도 아무것도 바꾸지 않고 예전 그대로 보입니다.
+    "embed_title": None,
+    "embed_description": None,
+    "embed_color": None,          # "파랑" 또는 "#5865F2"
+    "embed_footer": None,
+    "embed_image": None,
+    "embed_thumbnail": None,
+    "button_label": None,
 }
 
 async def get_report_settings(guild_id: int) -> dict:

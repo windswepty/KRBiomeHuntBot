@@ -138,6 +138,43 @@ async def main():
         total += r.calls + f.calls
     note(total == 0, "실제 발생 12건 → 낭비 요청 0회", f"예전 12회 → 지금 {total}회")
 
+
+def test_stray_guard():
+    """옛 호스팅에서 두 번째 인스턴스가 도는 것을 막는가.
+
+    2026-09-08 에 실제로 Render 인스턴스가 같이 돌고 있었습니다.
+    양쪽 다 `/health` 가 초록이라 아무도 몰랐고, 발급된 중계 주소의
+    **60%(19/32)** 가 그쪽 것이었습니다. 그쪽은 잠들었다 깨는 데 25초가
+    걸리는데 토큰 수명은 90초라, 받은 사람은 개인서버에 못 들어갔습니다.
+    """
+    print("")
+    print("=== 옛 호스팅에서는 기동하지 않아야 ===")
+    keep = {k: os.environ.get(k)
+            for k in ("RENDER_EXTERNAL_URL", "ALLOW_LEGACY_HOST")}
+    for k in keep:
+        os.environ.pop(k, None)
+    note(mainmod.stray_instance_reason() == "", "정상 환경에서는 조용히 통과")
+
+    os.environ["RENDER_EXTERNAL_URL"] = "https://x.onrender.com"
+    reason = mainmod.stray_instance_reason()
+    note(reason != "", "옛 호스팅 변수를 발견하면 잡아냄")
+    note("onrender" in reason,
+         "무엇을 보고 판정했는지 이유를 함께 돌려줌", reason)
+
+    os.environ["ALLOW_LEGACY_HOST"] = "1"
+    note(mainmod.stray_instance_reason() == "",
+         "정말 거기서 돌려야 할 때 빠져나갈 문이 있음")
+
+    for k, v in keep.items():
+        os.environ.pop(k, None)
+        if v is not None:
+            os.environ[k] = v
+    note(mainmod.stray_instance_reason() == "", "환경을 원래대로 되돌림")
+
+
+test_stray_guard()
+
+
 asyncio.run(main())
 print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
 for x in F.FAILS:

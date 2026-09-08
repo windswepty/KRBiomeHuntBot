@@ -290,6 +290,56 @@ async def load_cogs():
         health.add_note(f"로드 실패한 기능: {', '.join(failed)}")
 
 
+def stray_instance_reason() -> str:
+    """옛 호스팅에서 돌고 있는지 판정합니다. 정상이면 빈 문자열.
+
+    **판정과 조치를 분리합니다** — 이유를 돌려주지 않으면 억제가 걸려도
+    로그에 한 줄도 안 남아, 무엇 때문에 멈췄는지 알 수 없습니다.
+    """
+    if (os.getenv("ALLOW_LEGACY_HOST") or "").strip():
+        return ""
+    legacy = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+    if legacy:
+        return f"RENDER_EXTERNAL_URL = {legacy}"
+    return ""
+
+
+def check_single_home_or_die() -> None:
+    """**이 봇은 한 곳에서만 돌아야 합니다.**
+
+    Oracle 로 옮긴 뒤 옛 호스팅(Render)의 서비스를 지우지 않으면, 같은
+    토큰으로 두 번째 인스턴스가 계속 붙어 있습니다. 겉보기에는 아무 문제가
+    없습니다 — 양쪽 다 `/health` 가 초록이고 로그도 깨끗합니다.
+    실제로는 이런 일이 벌어집니다.
+
+      · 버튼 클릭을 둘이 나눠 처리해서, **어느 쪽이 잡느냐에 따라 서로 다른
+        중계 주소**가 나갑니다. 실제로 2026-09-08 에 재 보니 발급된 주소의
+        **60%(19/32)** 가 옛 호스팅 것이었습니다.
+      · 그쪽은 유휴 시 잠들어 첫 요청에 **25초 넘게** 걸립니다. 토큰 수명은
+        90초이고, 깨어나며 프로세스가 새로 뜨면 메모리의 토큰이 통째로
+        사라집니다 — **받은 사람은 개인서버에 못 들어갑니다.**
+      · 상호작용을 둘이 동시에 처리해 10062 / 40060 이 늘어납니다.
+      · 둘 다 같은 DB 에 씁니다.
+
+    그래서 옛 호스팅에서는 **아예 기동하지 않습니다.** 근본 해결은 그쪽
+    서비스를 지우는 것이고, 이건 그때까지의 안전장치입니다.
+    정말 그쪽에서 돌려야 하면 `ALLOW_LEGACY_HOST=1` 을 주세요.
+    """
+    reason = stray_instance_reason()
+    if not reason:
+        return
+    print("=" * 60, flush=True)
+    print("옛 호스팅 환경에서 실행됐습니다. 기동을 중단합니다.", flush=True)
+    print(f"  감지: {reason}", flush=True)
+    print("이 봇은 Oracle 인스턴스 한 곳에서만 돌아야 합니다.", flush=True)
+    print("두 곳에서 돌면 클릭을 나눠 처리해 잠든 쪽 주소가 발급되고,", flush=True)
+    print("그 주소를 받은 사람은 개인서버에 들어가지 못합니다.", flush=True)
+    print("Render 대시보드에서 이 서비스를 Suspend 또는 Delete 하세요.", flush=True)
+    print("=" * 60, flush=True)
+    sys.stdout.flush()
+    os._exit(1)
+
+
 def check_storage_or_die() -> None:
     """MONGO_URI 를 줬는데 접속이 안 되면 **차라리 죽습니다**.
 
@@ -363,6 +413,7 @@ def _run_with_429_retry():
 
     # Flask 헬스 서버를 가장 먼저 띄웁니다. 429 대기 중에도 /health 가
     # 응답해야 Render 가 프로세스를 강제 종료하지 않습니다.
+    check_single_home_or_die()
     check_storage_or_die()
     keep_alive()
 

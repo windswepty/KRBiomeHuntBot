@@ -39,7 +39,7 @@ ORDER = [
     "mongo_path", "linkflow", "linkguard_debounce", "relay_leak",
     "report_flow", "report_decor", "ticket_guard",
     "adminonly", "goal_adminonly", "backup_roundtrip",
-    "roblox_flow", "panels_roster",
+    "roblox_flow", "panels_roster", "server_compare",
 ]
 
 

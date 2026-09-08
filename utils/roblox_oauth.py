@@ -181,6 +181,62 @@ def exchange(code: str, verifier: str) -> dict | None:
         return None
 
 
+
+# 사용자 이름 조회 (공개 API — 인증이 필요 없습니다)
+USERS_BATCH = "https://users.roblox.com/v1/users"
+
+# 한 번에 물어볼 수 있는 최대 인원
+NAMES_BATCH_SIZE = 100
+
+
+def fetch_names(roblox_ids: list) -> dict:
+    """로블록스 아이디 → `{"name": 사용자명, "display": 표시이름}`.
+
+    **저장해 둔 이름만 믿으면 대조가 어긋납니다.**
+      · 로블록스는 개명이 가능해서 연동 당시 이름이 낡습니다.
+      · **게임 안 플레이어 목록은 표시이름(displayName)을 보여줍니다.**
+        사용자명만 가지고 맞춰 보면 대부분 안 맞습니다.
+
+    OAuth 설정과 무관하게 동작합니다(로그인이 필요 없는 공개 API).
+    실패하면 **빈 dict** 를 돌려줍니다 — 호출부는 저장된 이름으로 대조를
+    계속하고 그 사실을 화면에 알립니다. 조용히 틀린 결과를 주는 것보다
+    낫습니다.
+    """
+    out: dict[int, dict] = {}
+    ids = []
+    for value in roblox_ids or []:
+        try:
+            num = int(value)
+        except (TypeError, ValueError):
+            continue
+        if num > 0 and num not in ids:
+            ids.append(num)
+
+    for start_at in range(0, len(ids), NAMES_BATCH_SIZE):
+        chunk = ids[start_at:start_at + NAMES_BATCH_SIZE]
+        try:
+            body = json.dumps({"userIds": chunk,
+                               "excludeBannedUsers": False}).encode()
+            res = _request(USERS_BATCH, body, {
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            }, "POST")
+            for row in (res or {}).get("data") or []:
+                rid = row.get("id")
+                if rid is None:
+                    continue
+                out[int(rid)] = {"name": row.get("name") or "",
+                                 "display": row.get("displayName") or ""}
+        except urllib.error.HTTPError as e:
+            print(f"[RobloxOAuth] 이름 조회 실패 HTTP {e.code}", flush=True)
+        except (OSError, http.client.HTTPException,
+                ValueError, KeyError, TypeError, AttributeError) as e:
+            # 응답을 읽는 중에 나는 예외는 URLError 로 감싸이지 않습니다.
+            print(f"[RobloxOAuth] 이름 조회 실패: {type(e).__name__}: {e}", flush=True)
+    return out
+
+
 def clear() -> None:
     """테스트용."""
     with _lock:

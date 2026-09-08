@@ -12,6 +12,7 @@
 
 import asyncio
 import io
+import re
 
 import discord
 from discord.ext import commands
@@ -21,7 +22,7 @@ from utils import roblox_oauth
 from utils.verify_db import (
     get_roblox_link, find_roblox_owner, save_roblox_link,
     remove_roblox_link, list_roblox_links, search_roblox_links,
-    get_verify_settings, get_linkguard_settings,
+    get_verify_settings, get_linkguard_settings, get_usage_summary,
 )
 
 
@@ -246,6 +247,182 @@ class RelinkConfirmView(discord.ui.View):
             color=discord.Color.greyple())
         await interaction.response.send_message(embed=embed, ephemeral=True)
         self.stop()
+
+
+def normalize_name(raw: str) -> str:
+    """대조용으로 이름을 다듬습니다.
+
+    붙여넣은 목록에는 `@이름`, 앞뒤 공백, 대소문자 차이가 섞입니다.
+    로블록스 사용자명은 대소문자를 구분하지 않으므로 접어서 맞춥니다.
+    """
+    return (raw or "").strip().strip("@").strip().casefold()
+
+
+def split_names(text: str) -> list[str]:
+    """붙여넣은 덩어리를 이름 목록으로 자릅니다.
+
+    **공백으로는 자르지 않습니다** — 표시이름에는 공백이 들어갈 수 있어서,
+    공백까지 자르면 한 사람이 두 명으로 쪼개집니다.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for piece in re.split(r"[\n,;]+", text or ""):
+        name = piece.strip().strip("@").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _join_capped(items: list[str], limit: int = 900) -> str:
+    """임베드 필드(1024자) 안에 들어가도록 잘라 붙입니다."""
+    shown: list[str] = []
+    used = 0
+    for piece in items:
+        if used + len(piece) + 1 > limit:
+            break
+        shown.append(piece)
+        used += len(piece) + 1
+    text = " ".join(shown) if shown else "—"
+    if len(shown) < len(items):
+        text += f" …외 {len(items) - len(shown):,}명"
+    return text
+
+
+async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.File | None]:
+    """게임 안 플레이어 목록을 연동 명단·수령 명단과 대조합니다.
+
+    유출된 개인서버 주소에는 워터마크가 남지 않습니다(로블록스가 공유링크를
+    펼치면서 프래그먼트를 버립니다). 그래서 **링크 쪽이 아니라 게임 쪽에서**
+    확인합니다 — 받아 간 적이 없는데 들어와 있으면 누군가 넘긴 것입니다.
+    """
+    names = split_names(raw_text)
+    links = await list_roblox_links(guild.id)
+    usage = await get_usage_summary(guild.id)
+
+    # 저장된 이름은 낡습니다(개명). 게임 목록은 표시이름을 보여주므로
+    # 현재 이름을 물어봐야 대조가 맞습니다. 실패해도 계속 진행합니다.
+    fresh = await asyncio.to_thread(
+        roblox_oauth.fetch_names, [r.get("roblox_id") for r in links])
+
+    index: dict[str, list[dict]] = {}
+    paired: set[tuple[str, str]] = set()
+    for row in links:
+        try:
+            rid = int(row.get("roblox_id") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        current = fresh.get(rid) or {}
+        uid = str(row.get("user_id"))
+        for candidate in (row.get("roblox_name"),
+                          current.get("name"), current.get("display")):
+            key = normalize_name(candidate or "")
+            if not key or (key, uid) in paired:
+                continue
+            paired.add((key, uid))
+            index.setdefault(key, []).append(row)
+
+    received: list[str] = []
+    not_received: list[str] = []
+    unknown: list[str] = []
+    report: list[str] = []
+
+    for name in names:
+        rows = index.get(normalize_name(name)) or []
+        if not rows:
+            unknown.append(name)
+            report.append(f"[연동 명단에 없음]\t{name}")
+            continue
+        for row in rows:
+            uid = str(row.get("user_id"))
+            got = usage.get(uid)
+            if got:
+                received.append(f"<@{uid}>")
+                report.append(f"[받아 감]\t{name}\t{uid}\t"
+                              f"링크 {got['links']}개\t{got.get('last', '')}")
+            else:
+                not_received.append(f"<@{uid}>")
+                report.append(f"[받은 기록 없음]\t{name}\t{uid}")
+
+    suspicious = len(not_received) + len(unknown)
+    embed = discord.Embed(
+        title="🎮 개인서버 플레이어 대조",
+        description=(f"입력한 플레이어 **{len(names):,}명** · "
+                     f"연동 명단 **{len(links):,}명**\n"
+                     + ("확인이 필요한 사람이 **없습니다.**" if not suspicious
+                        else f"확인이 필요한 사람 **{suspicious:,}명** 입니다.")),
+        color=discord.Color.green() if not suspicious else discord.Color.orange())
+
+    if received:
+        embed.add_field(
+            name=f"✅ 보호된 링크를 받아 간 사람 ({len(received)}명)",
+            value=_join_capped(received), inline=False)
+
+    if not_received:
+        embed.add_field(
+            name=f"⚠️ 연동했는데 받은 기록이 없음 ({len(not_received)}명)",
+            value=("최근 30일 안에 **보호된 링크를 받은 적이 없습니다.**\n"
+                   "남에게 받았거나, 사람이 직접 공유하는 채널에서 받았을 수 "
+                   "있습니다.\n" + _join_capped(not_received, 700)),
+            inline=False)
+
+    if unknown:
+        embed.add_field(
+            name=f"🚨 연동 명단에 없음 ({len(unknown)}명)",
+            value=("이름만으로는 누구인지 알 수 없습니다. **유출로 들어온 "
+                   "사람일 수도, 그냥 연동을 안 한 사람일 수도** 있습니다.\n"
+                   + _join_capped([f"`{n}`" for n in unknown], 700)),
+            inline=False)
+
+    if links and not fresh:
+        embed.add_field(
+            name="⚠️ 로블록스 이름 조회 실패",
+            value=("저장된 이름으로만 대조했습니다. 개명했거나 표시이름이 "
+                   "다른 사람은 '명단에 없음'으로 잘못 나올 수 있습니다."),
+            inline=False)
+
+    embed.set_footer(
+        text=f"연동 완료 {len(links):,}명 — 연동자가 적으면 '명단에 없음'이 "
+             "많이 나옵니다. 그 자체는 유출의 증거가 아닙니다.")
+
+    attachment = None
+    if len(report) > 12:
+        head = ("# 개인서버 플레이어 대조 결과\n"
+                f"# 입력 {len(names)}명 · 연동 명단 {len(links)}명\n"
+                "# 구분 / 게임 내 이름 / 디스코드ID / 비고\n")
+        data = io.BytesIO((head + "\n".join(report)).encode("utf-8"))
+        attachment = discord.File(data, filename="개인서버대조.txt")
+
+    return embed, attachment
+
+
+class ServerCompareModal(discord.ui.Modal, title="🎮 개인서버 플레이어 대조"):
+    """게임 안 플레이어 목록을 붙여넣는 창.
+
+    슬래시 명령어 옵션으로는 여러 줄을 붙여넣기가 어려워 모달을 씁니다.
+    """
+
+    players = discord.ui.TextInput(
+        label="게임 안 플레이어 이름",
+        style=discord.TextStyle.paragraph,
+        placeholder="줄바꿈이나 쉼표로 구분해 붙여넣으세요",
+        max_length=4000,
+        required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # 로블록스 이름 조회가 끼어 있어 3초를 넘길 수 있습니다.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        embed, attachment = await compare_players(
+            interaction.guild, str(self.players))
+        if attachment is not None:
+            await interaction.followup.send(embed=embed, file=attachment,
+                                            ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class RobloxLink(commands.Cog):
@@ -481,6 +658,21 @@ class RobloxLink(commands.Cog):
         if len(rows) >= 10:
             embed.set_footer(text="결과가 10건을 넘어 잘렸습니다 · 더 정확한 검색어를 입력해 보세요")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="개인서버대조",
+        description="[관리자 전용] 게임 안 플레이어 목록을 연동·수령 명단과 대조합니다."
+    )
+    # DM 에서는 interaction.guild 가 None 이라 길드를 쓰는 순간 죽습니다.
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def compare_server(self, interaction: discord.Interaction):
+        """유출된 링크에는 워터마크가 남지 않으므로, 게임 쪽에서 확인합니다.
+
+        받아 간 적이 없는데 개인서버에 들어와 있으면 누군가 넘긴 것입니다.
+        """
+        await interaction.response.send_modal(ServerCompareModal())
 
     @app_commands.command(
         name="연동해제",

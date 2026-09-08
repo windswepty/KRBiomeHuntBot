@@ -853,6 +853,51 @@ async def find_issued_to(guild_id: int, needle: str) -> dict | None:
     return None
 
 
+async def get_usage_summary(guild_id: int) -> dict:
+    """이 길드에서 **보호된 링크를 실제로 받아 간 사람** 전체 집계.
+
+    보호 메시지마다 따로 쌓인 기록을 사람 기준으로 합칩니다.
+    반환: `{user_id: {"name", "count"(총 클릭), "links"(서로 다른 링크 수), "last"}}`
+
+    **여기 없다고 곧 유출은 아닙니다.** 보관 기간(30일)이 지났을 수도 있고,
+    보호되지 않은 경로(사람이 직접 공유하는 채널)로 받았을 수도 있습니다.
+    화면에서 그렇게 안내해야 합니다.
+    """
+    str_gid = str(guild_id)
+    out: dict[str, dict] = {}
+
+    def _add(uid, info: dict) -> None:
+        row = out.setdefault(str(uid),
+                             {"name": "", "count": 0, "links": 0, "last": ""})
+        row["name"] = info.get("name") or row["name"]
+        row["count"] += int(info.get("count", 1) or 1)
+        row["links"] += 1
+        last = info.get("last") or ""
+        if last > row["last"]:
+            row["last"] = last
+
+    if usage_col is not None:
+        try:
+            def _fetch():
+                return list(usage_col.find({"guild_id": str_gid}, {"users": 1}))
+            for doc in await _db(_fetch):
+                for uid, info in (doc.get("users") or {}).items():
+                    _add(uid, info)
+            return out
+        except Exception as e:
+            print(f"MongoDB get_usage_summary error: {e}, using local file.", flush=True)
+
+    async with _usage_lock:
+        all_usage = _read_json(USAGE_FILE)
+    prefix = f"{str_gid}:"
+    for key, bucket in all_usage.items():
+        if not key.startswith(prefix):
+            continue
+        for uid, info in (bucket or {}).items():
+            _add(uid, info)
+    return out
+
+
 # ── 로그 메시지 ↔ 보호 메시지 연결 ────────────────────────────────────
 #
 # 로그 채널에 올린 임베드의 [링크 사용 유저] 버튼이, 어느 보호 메시지의

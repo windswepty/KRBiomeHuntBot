@@ -109,6 +109,83 @@ def build_panel_embed(settings: dict, guild: discord.Guild) -> discord.Embed:
     return embed
 
 
+# 추적할 패널 개수 상한. 무한히 늘어나면 설정을 바꿀 때마다 그만큼
+# API 를 두드리게 됩니다.
+MAX_TRACKED_PANELS = 25
+
+
+async def refresh_all_panels(guild: discord.Guild) -> tuple[int, int]:
+    """올려둔 인증 패널을 **전부** 최신 설정으로 다시 그립니다.
+
+    패널은 여러 채널에 올릴 수 있고 전부 동시에 동작합니다(버튼 custom_id 가
+    고정이라 어느 패널에서 눌러도 같습니다). 그런데 임베드에는 **인증 자격
+    역할 목록**이 박혀 있어서, 자격을 바꾸면 이미 올라간 패널들이 옛 조건을
+    계속 보여줍니다. 유저는 안 되는 조건을 보고 문의하게 됩니다.
+
+    돌려주는 값: (갱신한 개수, 사라져서 목록에서 지운 개수)
+    """
+    settings = await get_verify_settings(guild.id)
+    tracked = list(settings.get("panel_messages") or [])
+    if not tracked:
+        return 0, 0
+
+    embed = build_panel_embed(settings, guild)
+    view = VerifyPanelView(button_label=settings.get("button_label", "인증하기"))
+
+    alive, updated, removed = [], 0, 0
+    for ref in tracked:
+        try:
+            cid, mid = int(ref.get("c", 0)), int(ref.get("m", 0))
+        except (TypeError, ValueError):
+            removed += 1
+            continue
+        channel = guild.get_channel(cid)
+        if channel is None:
+            removed += 1                     # 채널째 사라졌습니다
+            continue
+        try:
+            # 조회 없이 바로 고칩니다. fetch_message + edit 이면 패널 하나당
+            # API 를 2번 쓰는데, 여러 개를 한꺼번에 고치므로 그대로 두 배가 됩니다.
+            await channel.get_partial_message(mid).edit(embed=embed, view=view)
+            alive.append({"c": cid, "m": mid})
+            updated += 1
+        except discord.NotFound:
+            removed += 1                     # 메시지가 지워짐 — 목록에서 뺍니다
+        except discord.Forbidden:
+            # 권한이 잠시 빠진 것일 수 있으니 목록에는 남겨 둡니다.
+            # 여기서 지워 버리면 권한을 되돌려도 다시는 갱신되지 않습니다.
+            alive.append({"c": cid, "m": mid})
+            print(f"[Verify] 패널 갱신 권한 없음: 채널 {cid}", flush=True)
+        except discord.HTTPException as e:
+            alive.append({"c": cid, "m": mid})
+            print(f"[Verify] 패널 갱신 실패 (채널 {cid}): {e}", flush=True)
+
+    if removed:
+        await save_verify_settings(guild.id, {"panel_messages": alive})
+    return updated, removed
+
+
+async def save_panel_setting(guild: discord.Guild, patch: dict) -> str:
+    """패널 내용에 영향을 주는 설정을 저장하고 **올려둔 패널을 전부 갱신**합니다.
+
+    저장만 하고 끝내면 이미 올라간 패널들이 옛 조건을 계속 보여줍니다.
+    패널이 하나일 때는 지우고 다시 올리면 그만이었지만, 여러 채널에
+    올린 뒤에는 전부 찾아다녀야 합니다.
+
+    돌려주는 값: 결과를 사람에게 보여줄 한 줄 (없으면 빈 문자열)
+    """
+    await save_verify_settings(guild.id, patch)
+    updated, removed = await refresh_all_panels(guild)
+    if not updated and not removed:
+        return ""
+    parts = []
+    if updated:
+        parts.append(f"올려둔 인증 패널 **{updated}개**를 함께 갱신했습니다.")
+    if removed:
+        parts.append(f"사라진 패널 {removed}개는 목록에서 정리했습니다.")
+    return " ".join(parts)
+
+
 class VerifyPanelView(discord.ui.View):
     def __init__(self, button_label: str = "인증하기"):
         super().__init__(timeout=None)
@@ -316,15 +393,18 @@ class VerifyTextModal(discord.ui.Modal, title="📝 인증 패널 문구 설정"
         self.add_item(self.label_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await save_verify_settings(interaction.guild.id, {
+        # 저장만 하면 이미 올라간 패널들이 옛 문구를 계속 보여줍니다.
+        # 예전에는 "새로 전송하는 패널부터 적용됩니다" 라고 안내했는데,
+        # 여러 채널에 올린 뒤에는 전부 찾아다녀야 해서 현실적이지 않습니다.
+        note = await save_panel_setting(interaction.guild, {
             "title": self.title_input.value.strip(),
             "description": self.desc_input.value.strip(),
             "button_label": self.label_input.value.strip(),
         })
         embed = discord.Embed(
             title="✅ 인증 패널 문구 저장 완료",
-            description="변경된 문구는 **새로 전송하는 인증 패널**부터 적용됩니다.\n"
-                        "`/인증설정` → **인증 패널 전송**으로 다시 보내 주세요.",
+            description=(note or "아직 올려둔 인증 패널이 없습니다."
+                         " `/인증설정` → **인증 패널 전송** 으로 보내 주세요."),
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -350,7 +430,7 @@ class PanelChannelSelect(discord.ui.ChannelSelect):
         view = VerifyPanelView(button_label=settings.get("button_label", "인증하기"))
 
         try:
-            await channel.send(embed=embed, view=view)
+            msg = await channel.send(embed=embed, view=view)
         except discord.Forbidden:
             await interaction.response.send_message(
                 f"⚠️ {channel.mention} 채널에 메시지를 보낼 권한이 없습니다.",
@@ -358,9 +438,23 @@ class PanelChannelSelect(discord.ui.ChannelSelect):
             )
             return
 
-        await save_verify_settings(interaction.guild.id, {"panel_channel_id": channel.id})
+        # 어디에 올렸는지 기록해 둡니다. 나중에 자격 역할이나 문구를 바꾸면
+        # 이 목록을 보고 **전부 다시 그립니다.** 기록하지 않으면 옛 조건을
+        # 보여주는 패널이 곳곳에 남고, 유저는 안 되는 조건을 보고 문의합니다.
+        tracked = [r for r in (settings.get("panel_messages") or [])
+                   if int(r.get("m", 0)) != msg.id]
+        tracked.append({"c": channel.id, "m": msg.id})
+        tracked = tracked[-MAX_TRACKED_PANELS:]
+        await save_verify_settings(interaction.guild.id, {
+            # 링크 보호 안내가 가리킬 대표 채널 (가장 마지막에 올린 곳)
+            "panel_channel_id": channel.id,
+            "panel_messages": tracked,
+        })
         await interaction.response.send_message(
-            f"✅ {channel.mention} 채널에 인증 패널을 전송했습니다.",
+            f"✅ {channel.mention} 채널에 인증 패널을 전송했습니다."
+            + chr(10)
+            + f"-# 인증 패널 **{len(tracked)}개**가 살아 있습니다. "
+              "전부 동시에 동작하고, 설정을 바꾸면 함께 갱신됩니다.",
             ephemeral=True
         )
 
@@ -397,8 +491,12 @@ class RequiredRoleIdModal(discord.ui.Modal, title="🆔 인증 필요 역할 추
                 current.append(rid)
                 found.append(role)
 
+        panel_note = ""
         if found:
-            await save_verify_settings(guild.id, {"required_role_ids": current})
+            # 자격 목록은 패널 임베드에 그대로 박혀 있습니다. 저장만 하면
+            # 이미 올라간 패널들이 옛 조건을 계속 보여줍니다.
+            panel_note = await save_panel_setting(
+                guild, {"required_role_ids": current})
 
         embed = discord.Embed(
             title="🎫 인증 필요 역할 추가",
@@ -421,6 +519,9 @@ class RequiredRoleIdModal(discord.ui.Modal, title="🆔 인증 필요 역할 추
             embed.description = "입력에서 역할 ID를 찾지 못했습니다. 17~20자리 숫자를 넣어 주세요."
 
         embed.add_field(name="📋 현재 지정된 역할 수", value=f"**{len(current)}개**", inline=False)
+        if panel_note:
+            embed.add_field(name="📮 인증 패널", value=panel_note,
+                            inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -452,9 +553,11 @@ class RemoveRequiredRoleSelect(discord.ui.Select):
         settings = await get_verify_settings(guild.id)
         current = [int(r) for r in settings.get("required_role_ids", [])]
         rid = int(self.values[0])
+        panel_note = ""
         if rid in current:
             current.remove(rid)
-            await save_verify_settings(guild.id, {"required_role_ids": current})
+            panel_note = await save_panel_setting(
+                guild, {"required_role_ids": current})
         role = guild.get_role(rid)
         embed = discord.Embed(
             title="🎫 인증 필요 역할 해제",
@@ -467,6 +570,8 @@ class RemoveRequiredRoleSelect(discord.ui.Select):
                 name="⚠️ 주의",
                 value="지정된 역할이 하나도 없어, **누구나 인증할 수 있는 상태**가 되었습니다.",
                 inline=False)
+        if panel_note:
+            embed.add_field(name="📮 인증 패널", value=panel_note, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -636,7 +741,9 @@ class VerifySettingsSelect(discord.ui.Select):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
 
-            await save_verify_settings(guild.id, {"require_roblox": new_state})
+            # 패널에 "로블록스 연동 필수" 안내가 들어가고 빠집니다
+            panel_note = await save_panel_setting(
+                guild, {"require_roblox": new_state})
             embed = discord.Embed(
                 title="🎮 로블록스 연동 필수 설정 변경",
                 description=f"연동 필수가 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.",
@@ -662,7 +769,7 @@ class VerifySettingsSelect(discord.ui.Select):
                     name="⚠️ 주의",
                     value="• **이미 인증받은 멤버는 그대로 유지**됩니다 (소급 적용 없음)\n"
                           "• 로블록스 계정이 만 13세 미만이면 연동할 수 없습니다\n"
-                          "• 로블록스 앱 심사 전에는 **10명까지만** 연동 가능합니다",
+                          "• 로블록스 앱은 2026-09-05 에 승인되어 인원 제한이 없습니다",
                     inline=False
                 )
             else:
@@ -672,6 +779,9 @@ class VerifySettingsSelect(discord.ui.Select):
                           "(`/로블록스연동` 은 계속 사용 가능합니다)",
                     inline=False
                 )
+            if panel_note:
+                embed.add_field(name="📮 인증 패널", value=panel_note,
+                                inline=False)
             await refresh_settings_panel(interaction, embed)
 
         elif choice == "relinkalert":
@@ -715,7 +825,9 @@ class VerifySettingsSelect(discord.ui.Select):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
 
-            await save_verify_settings(guild.id, {"auto_revoke": new_state})
+            # 패널에 "자격을 모두 잃으면 자동 해제" 안내가 들어가고 빠집니다
+            panel_note = await save_panel_setting(
+                guild, {"auto_revoke": new_state})
             embed = discord.Embed(
                 title="♻️ 인증 자동 회수 설정 변경",
                 description=f"자동 회수가 **{'✅ 켜짐' if new_state else '❌ 꺼짐'}** 상태가 되었습니다.",
@@ -742,6 +854,9 @@ class VerifySettingsSelect(discord.ui.Select):
                     value="필요 역할을 잃어도 인증 역할은 **그대로 유지**됩니다.",
                     inline=False
                 )
+            if panel_note:
+                embed.add_field(name="📮 인증 패널", value=panel_note,
+                                inline=False)
             await refresh_settings_panel(interaction, embed)
 
         elif choice == "toggle":

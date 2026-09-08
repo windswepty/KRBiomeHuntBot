@@ -17,3 +17,9 @@ backups/
 *.ppk
 id_rsa*
 id_ed25519*
+
+# 검증 실행 산출물 — 매번 새로 만들어지므로 저장소에 둘 이유가 없습니다.
+.coverage
+.coverage.*
+htmlcov/
+.coveragerc

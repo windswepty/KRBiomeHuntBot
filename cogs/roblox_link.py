@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import io
 
 import discord
 from discord.ext import commands
@@ -46,6 +47,130 @@ def _login_embed_and_view(guild_id: int, user_id: int,
         style=discord.ButtonStyle.link, emoji="🎮"))
     return embed, view
 
+
+
+class RosterToolsView(discord.ui.View):
+    """`/연동명단` 결과에 붙는 도구.
+
+    ephemeral 메시지에 붙는 일회성 View 라 timeout 을 둡니다.
+    영구 View 가 아니므로 custom_id 를 고정할 필요가 없습니다.
+    """
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # 명단은 관리자 전용 정보입니다. ephemeral 이라 남이 볼 일은 없지만,
+        # 버튼 상호작용은 별개의 요청이므로 여기서도 다시 확인합니다.
+        if interaction.user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message(
+            "⚠️ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="미연동자 보기", style=discord.ButtonStyle.primary,
+                       emoji="🚫")
+    async def unlinked(self, interaction: discord.Interaction,
+                       button: discord.ui.Button):
+        """인증 자격은 있는데 아직 연동하지 않은 사람.
+
+        공지를 누구에게 해야 하는지가 이 목록입니다. 자격이 없는 멤버는
+        애초에 보호된 링크를 만날 일이 없으므로 대상이 아닙니다.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+
+        settings = await get_verify_settings(guild.id)
+        required = {int(r) for r in (settings.get("required_role_ids") or [])}
+        linked = {str(r.get("user_id"))
+                  for r in await list_roblox_links(guild.id)}
+
+        # guild.members 는 게이트웨이 캐시라 API 를 쓰지 않습니다.
+        # (여기서 REST 로 6천 명을 받아오면 이벤트 루프가 밀려 3초 제한에 걸립니다)
+        targets = [
+            m for m in guild.members
+            if not m.bot
+            and (not required or any(r.id in required for r in m.roles))
+            and str(m.id) not in linked
+        ]
+        targets.sort(key=lambda m: m.display_name.lower())
+
+        embed = discord.Embed(
+            title="🚫 아직 연동하지 않은 멤버",
+            color=discord.Color.orange() if targets else discord.Color.green())
+
+        if not required:
+            embed.description = (
+                f"인증 자격 역할이 지정되지 않아 **서버 전원**이 대상이 됩니다.\n"
+                f"현재 미연동 **{len(targets):,}명** / 전체 {len(guild.members):,}명\n"
+                "-# `/인증설정` → 인증 필요 역할 을 지정하면 실제 대상만 추려집니다.")
+        elif not targets:
+            embed.description = "자격 있는 멤버가 **전원 연동을 마쳤습니다.**"
+        else:
+            names = ", ".join(f"`{r.name}`" for r in
+                              [guild.get_role(i) for i in required] if r)
+            embed.description = (
+                f"인증 자격이 있는데 아직 연동하지 않은 사람 **{len(targets):,}명** 입니다.\n"
+                f"-# 자격 역할: {names}")
+
+        if targets:
+            shown, used = [], 0
+            for m in targets:
+                piece = m.mention
+                if used + len(piece) + 1 > 950:
+                    break
+                shown.append(piece)
+                used += len(piece) + 1
+            embed.add_field(
+                name=f"📢 공지 대상 ({len(shown)}명 표시)",
+                value=" ".join(shown), inline=False)
+            if len(targets) > len(shown):
+                embed.set_footer(
+                    text=f"…외 {len(targets) - len(shown):,}명. "
+                         "전체 목록은 아래 파일에 있습니다.")
+
+            # 임베드에는 다 담기지 않으므로 파일로도 줍니다.
+            body = "\n".join(
+                f"{m.id}\t{m.display_name}\t{m.name}" for m in targets)
+            head = ("# 인증 자격은 있으나 로블록스 연동을 하지 않은 멤버\n"
+                    f"# {len(targets)}명 · 디스코드ID / 서버표시이름 / 사용자명\n")
+            data = io.BytesIO((head + body).encode("utf-8"))
+            await interaction.followup.send(
+                embed=embed,
+                file=discord.File(data, filename="미연동자.txt"),
+                ephemeral=True)
+            return
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="파일로 받기", style=discord.ButtonStyle.secondary,
+                       emoji="📄")
+    async def download(self, interaction: discord.Interaction,
+                       button: discord.ui.Button):
+        """연동 명단 전체를 파일로. 임베드는 1,000자 제한이라 다 못 담습니다."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await list_roblox_links(interaction.guild.id)
+        if not rows:
+            await interaction.followup.send(
+                "아직 연동한 멤버가 없습니다.", ephemeral=True)
+            return
+
+        # 엑셀에서 바로 열리도록 CSV. 쉼표가 든 이름이 열을 밀지 않게 감쌉니다.
+        def cell(v):
+            v = str(v if v is not None else "")
+            return '"' + v.replace('"', '""') + '"'
+
+        lines = ["discord_id,roblox_id,roblox_name,linked_at"]
+        for r in rows:
+            lines.append(",".join(cell(r.get(k)) for k in
+                                  ("user_id", "roblox_id", "roblox_name", "linked_at")))
+        # 엑셀이 UTF-8 을 알아보도록 BOM 을 붙입니다 (없으면 한글이 깨집니다)
+        data = io.BytesIO(("﻿" + "\n".join(lines)).encode("utf-8"))
+        await interaction.followup.send(
+            f"📄 연동 명단 **{len(rows):,}명** 입니다.",
+            file=discord.File(data, filename="연동명단.csv"),
+            ephemeral=True)
 
 class RelinkConfirmView(discord.ui.View):
     """이미 연동된 상태에서 다시 연동할 때 한 번 더 확인받습니다.
@@ -265,7 +390,11 @@ class RobloxLink(commands.Cog):
             if len(rows) > len(lines):
                 embed.set_footer(text=f"…외 {len(rows) - len(lines)}명 더 있습니다")
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        # 임베드는 1,000자 제한이라 전원을 담을 수 없고, "누구에게 공지할지"는
+        # 여기 없는 정보입니다. 두 가지를 버튼으로 붙여 둡니다.
+        await interaction.followup.send(
+            embed=embed, view=RosterToolsView(interaction.guild.id),
+            ephemeral=True)
 
     @app_commands.command(
         name="연동조회",

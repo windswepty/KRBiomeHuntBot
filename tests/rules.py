@@ -10,6 +10,7 @@
   ④ 영구 View 의 버튼은 고정 custom_id
   ⑤ 포인트를 절대값으로 덮어쓰지 않기 ($inc 만)
   ⑥ 슬래시 명령어는 전부 guild_only (DM 에서 guild 가 None)
+  ⑦ 비밀이 담기는 파일이 .gitignore 에 잡히는가
 """
 import sys, os, ast, io, pathlib
 
@@ -289,12 +290,33 @@ def check_guild_only():
         print("     ", b)
 
 
+
+def check_secrets_ignored():
+    """비밀이 담기는 파일이 정말로 .gitignore 에 걸리는지 봅니다.
+
+    `.env` 만 적어 두면 `.env.bak.20260903` 같은 백업본은 **그대로 커밋
+    대상**입니다. 실제로 서버에 그런 파일(DISCORD_TOKEN·MONGO_URI 포함)이
+    남아 있었습니다. 한 번 올라가면 되돌릴 수 없습니다.
+    """
+    text = io.open(PROJ / ".gitignore", encoding="utf-8").read()
+    lines = {l.strip() for l in text.splitlines()}
+    need = [".env", ".env.*", "data/", "backups/",
+            "*.key", "*.pem", "*.ppk"]
+    missing = [n for n in need if n not in lines]
+    note(not missing, f".gitignore 에 비밀 파일 규칙이 있음 (빠짐 {len(missing)}건)",
+         ", ".join(missing))
+    # 예외로 남겨 두는 것 — 이게 빠지면 예제 파일이 사라집니다
+    note("!.env.example" in lines,
+         ".env.example 은 예외로 되살려 둠 (문서용이라 추적해야 합니다)")
+
+
 check_ephemeral()
 check_db_wrap()
 check_silent()
 check_custom_id()
 check_points()
 check_guild_only()
+check_secrets_ignored()
 
 print(f"\n  실패 {len(FAILS)}건 / 성공 {len(OKS)}건")
 for x in FAILS:

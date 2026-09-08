@@ -266,6 +266,64 @@ async def main():
     RO._request = orig_request
     RO.clear()
 
+    print("")
+    print("=== 13. 어느 링크를 대조할지 찾아내기 ===")
+    # 관리자가 손에 쥐는 것은 보통 **로그 임베드**입니다. 무엇을 복사해야
+    # 하는지 외우게 만들면 아무도 안 씁니다 — 셋 다 받아들여야 합니다.
+    # 디스코드 ID 는 17~19자리입니다. 짧은 숫자를 ID 로 오인하지 않도록
+    # 15자리 이상만 받으므로, 테스트도 실제 형태를 써야 합니다.
+    PROT, LOGM, USED = (154287140213725601,
+                        154287140213725602,
+                        154287140213725603)
+    await vdb.save_protected_link(GUILD.id, PROT,
+                                  ["https://www.roblox.com/share?code=a&type=Server"])
+    await vdb.save_log_reference(GUILD.id, LOGM, PROT, 111)
+    await vdb.record_link_usage(GUILD.id, USED, 41, "받은사람",
+                                issued_url="https://relay.test/j/zzz")
+
+    got, why = await RL.resolve_link_target(GUILD, str(PROT))
+    note(got == PROT, "보호 임베드 ID 를 그대로 받음", str(got))
+    got, why = await RL.resolve_link_target(GUILD, str(LOGM))
+    note(got == PROT, "로그 임베드 ID → 가리키는 보호 메시지로 바꿔 줌", str(got))
+    note("로그" in why, "무엇을 기준으로 잡았는지 알려줌", why)
+    got, _ = await RL.resolve_link_target(
+        GUILD, "https://discord.com/channels/1/222/" + str(LOGM))
+    note(got == PROT, "메시지 링크를 붙여넣어도 됨", str(got))
+    got, _ = await RL.resolve_link_target(GUILD, str(USED))
+    note(got == USED, "보호 기록(7일)이 지워져도 사용 기록(30일)으로 찾아냄")
+
+    got, why = await RL.resolve_link_target(GUILD, "999999999999999999")
+    note(got is None and "찾지 못했습니다" in why, "모르는 ID 는 거부")
+    got, why = await RL.resolve_link_target(GUILD, "이건 아이디가 아님")
+    note(got is None and "메시지 ID" in why, "숫자가 없으면 무엇을 넣을지 안내")
+
+    print("")
+    print("=== 14. 범위를 좁히면 판정이 달라져야 (이게 핵심) ===")
+    # A 는 이 링크를, B 는 *다른* 링크를 받았습니다. 전체로 보면 둘 다
+    # '받아 간 사람'이라 무단 입장자가 정상으로 보입니다.
+    await vdb.save_roblox_link(GUILD.id, 51, 2001, "이링크받음", method="oauth")
+    await vdb.save_roblox_link(GUILD.id, 52, 2002, "딴링크받음", method="oauth")
+    await vdb.record_link_usage(GUILD.id, 6001, 51, "이링크받음",
+                                issued_url="https://relay.test/j/aaa")
+    await vdb.record_link_usage(GUILD.id, 6002, 52, "딴링크받음",
+                                issued_url="https://relay.test/j/bbb")
+    fake_names.clear()
+
+    e14, _ = await RL.compare_players(GUILD, "이링크받음\n딴링크받음")
+    note("<@52>" in (find_field(e14, "✅")[1] or ""),
+         "전체 범위에서는 다른 링크를 받은 사람도 ✅ 로 보임 (무뎌짐)")
+
+    e15, _ = await RL.compare_players(GUILD, "이링크받음\n딴링크받음",
+                                      message_id=6001)
+    ok_val = find_field(e15, "✅ 이 링크를 받아 간 사람")[1] or ""
+    bad_val = find_field(e15, "⚠️ 연동했는데 이 링크를")[1] or ""
+    note("<@51>" in ok_val, "범위를 좁히면 이 링크를 받은 사람만 ✅", ok_val)
+    note("<@52>" in bad_val, "다른 링크만 받은 사람은 ⚠️ 로 드러남", bad_val)
+    note("서버 안에 있습니다" in bad_val, "무엇이 이상한지 말로 설명함")
+    note("링크 하나" in (e15.description or ""),
+         "어느 범위로 봤는지 화면에 남김", (e15.description or "")[:40])
+    note("모든 링크" in (e14.description or ""), "전체로 봤을 때도 범위를 밝힘")
+
 asyncio.run(main())
 print("\n  실패 " + str(len(F.FAILS)) + "건 / 성공 " + str(len(F.OKS)) + "건")
 for x in F.FAILS:

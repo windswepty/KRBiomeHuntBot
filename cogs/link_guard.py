@@ -33,6 +33,9 @@ from utils.verify_db import (
 PLINK_BUTTON_ID = "hbh_plink:open"
 # 로그 임베드 밑의 [링크 사용 유저] 버튼
 USAGE_BUTTON_ID = "hbh_usage:open"
+# 그 옆의 [게임 안 인원과 대조] — 이 로그가 가리키는 링크 하나로 범위가
+# 좁혀집니다. ID 를 복사해 옮겨 적게 만들면 아무도 안 씁니다.
+COMPARE_BUTTON_ID = "hbh_usage:compare"
 
 MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(\s*(https?://[^\s)]+)\s*\)')
 URL_RE = re.compile(r'https?://[^\s<>"\'`\]\)]+', re.IGNORECASE)
@@ -948,6 +951,29 @@ class UsageStatsView(discord.ui.View):
 
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎮 게임 안 인원과 대조",
+                       style=discord.ButtonStyle.primary,
+                       custom_id=COMPARE_BUTTON_ID)
+    async def compare_btn(self, interaction: discord.Interaction,
+                          button: discord.ui.Button):
+        """이 로그가 가리키는 **링크 하나**로 범위를 좁혀 대조합니다."""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ 이 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+        ref = await get_log_reference(interaction.guild.id,
+                                      interaction.message.id)
+        if not ref:
+            await interaction.response.send_message(
+                "⚠️ 이 로그와 연결된 보호 메시지를 찾을 수 없습니다.",
+                ephemeral=True)
+            return
+        # 같은 하위 시스템이지만 로드 순서에 기대지 않도록 여기서 가져옵니다
+        from cogs.roblox_link import ServerCompareModal
+        await interaction.response.send_modal(
+            ServerCompareModal(int(ref["protected_message_id"]),
+                               "대상: **이 로그가 가리키는 링크 하나**"))
 
     @discord.ui.button(label="👥 링크 사용 유저", style=discord.ButtonStyle.secondary,
                        custom_id=USAGE_BUTTON_ID)

@@ -25,6 +25,7 @@ from utils.verify_db import (
     get_roblox_link, find_roblox_owner, save_roblox_link,
     remove_roblox_link, list_roblox_links, search_roblox_links,
     get_verify_settings, get_linkguard_settings, get_usage_summary,
+    get_link_usage, get_protected_link, get_log_reference,
     KST,
 )
 
@@ -304,12 +305,35 @@ def _join_capped(items: list[str], limit: int = 900) -> str:
     return text
 
 
-async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.File | None]:
+async def received_map(guild, message_id) -> dict:
+    """'링크를 받아 간 사람' 집합.
+
+    `message_id` 를 주면 **그 링크 하나**만, 없으면 최근 30일 전체를 봅니다.
+    범위가 다르면 판정의 의미가 통째로 달라집니다 — 전체로 보면 *다른*
+    개인서버 링크를 받았던 사람도 '받아 간 사람'이 되어, 정작 이 서버에
+    무단으로 들어온 사람이 정상으로 보입니다.
+    """
+    if message_id is None:
+        return await get_usage_summary(guild.id)
+    rows = await get_link_usage(guild.id, int(message_id))
+    return {str(r["user_id"]): {"name": r.get("user_name", ""),
+                                "count": r.get("count", 1),
+                                "links": 1,
+                                "last": r.get("last", "")}
+            for r in rows}
+
+
+async def compare_players(guild, raw_text: str,
+                          message_id=None,
+                          scope_note: str = "") -> tuple:
     """게임 안 플레이어 목록을 연동 명단·수령 명단과 대조합니다.
 
     유출된 개인서버 주소에는 워터마크가 남지 않습니다(로블록스가 공유링크를
     펼치면서 프래그먼트를 버립니다). 그래서 **링크 쪽이 아니라 게임 쪽에서**
     확인합니다 — 받아 간 적이 없는데 들어와 있으면 누군가 넘긴 것입니다.
+
+    `message_id` 로 **링크 하나에 범위를 좁힐 수 있습니다.** 좁히지 않으면
+    "최근 30일에 아무 링크나 받은 적 있음"이 되어 판정이 무뎌집니다.
     """
     names = split_names(raw_text)
     if not names:
@@ -323,8 +347,9 @@ async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.
                          "붙여넣어 주세요."),
             color=discord.Color.red()), None
 
+    scoped = message_id is not None
     links = await list_roblox_links(guild.id)
-    usage = await get_usage_summary(guild.id)
+    usage = await received_map(guild, message_id)
 
     # 저장된 이름은 낡습니다(개명). 게임 목록은 표시이름을 보여주므로
     # 현재 이름을 물어봐야 대조가 맞습니다. 실패해도 계속 진행합니다.
@@ -371,25 +396,36 @@ async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.
                 report.append(f"[받은 기록 없음]\t{name}\t{uid}")
 
     suspicious = len(not_received) + len(unknown)
+    scope_line = (scope_note or
+                  (f"대상: 링크 하나 (메시지 `{message_id}`)" if scoped
+                   else "대상: **최근 30일 안의 모든 링크**"))
     embed = discord.Embed(
         title="🎮 개인서버 플레이어 대조",
-        description=(f"입력한 플레이어 **{len(names):,}명** · "
-                     f"연동 명단 **{len(links):,}명**\n"
+        description=(f"{scope_line}\n"
+                     f"입력한 플레이어 **{len(names):,}명** · "
+                     f"연동 명단 **{len(links):,}명** · "
+                     f"이 범위의 수령자 **{len(usage):,}명**\n"
                      + ("확인이 필요한 사람이 **없습니다.**" if not suspicious
                         else f"확인이 필요한 사람 **{suspicious:,}명** 입니다.")),
         color=discord.Color.green() if not suspicious else discord.Color.orange())
 
     if received:
         embed.add_field(
-            name=f"✅ 보호된 링크를 받아 간 사람 ({len(received)}명)",
+            name=(f"✅ 이 링크를 받아 간 사람 ({len(received)}명)" if scoped
+                  else f"✅ 보호된 링크를 받아 간 사람 ({len(received)}명)"),
             value=_join_capped(received), inline=False)
 
     if not_received:
         embed.add_field(
-            name=f"⚠️ 연동했는데 받은 기록이 없음 ({len(not_received)}명)",
-            value=("최근 30일 안에 **보호된 링크를 받은 적이 없습니다.**\n"
-                   "남에게 받았거나, 사람이 직접 공유하는 채널에서 받았을 수 "
-                   "있습니다.\n" + _join_capped(not_received, 700)),
+            name=(f"⚠️ 연동했는데 이 링크를 받은 적 없음 ({len(not_received)}명)"
+                  if scoped else
+                  f"⚠️ 연동했는데 받은 기록이 없음 ({len(not_received)}명)"),
+            value=(("**이 링크를 받아 간 적이 없는데 서버 안에 있습니다.**\n"
+                    "남에게 받았거나 다른 경로로 들어왔습니다.\n" if scoped else
+                    "최근 30일 안에 **보호된 링크를 받은 적이 없습니다.**\n"
+                    "남에게 받았거나, 사람이 직접 공유하는 채널에서 받았을 수 "
+                    "있습니다.\n")
+                   + _join_capped(not_received, 700)),
             inline=False)
 
     if unknown:
@@ -420,6 +456,7 @@ async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.
     attachment = None
     if len(report) > 12:
         head = ("# 개인서버 플레이어 대조 결과\n"
+                f"# {scope_line.replace('**', '')}\n"
                 f"# 입력 {len(names)}명 · 연동 명단 {len(links)}명\n"
                 "# 구분 / 게임 내 이름 / 디스코드ID / 비고\n")
         data = io.BytesIO((head + "\n".join(report)).encode("utf-8"))
@@ -432,6 +469,7 @@ class ServerCompareModal(discord.ui.Modal, title="🎮 개인서버 플레이어
     """게임 안 플레이어 목록을 붙여넣는 창.
 
     슬래시 명령어 옵션으로는 여러 줄을 붙여넣기가 어려워 모달을 씁니다.
+    `message_id` 를 주면 **그 링크 하나**에만 범위를 좁혀 대조합니다.
     """
 
     players = discord.ui.TextInput(
@@ -441,16 +479,58 @@ class ServerCompareModal(discord.ui.Modal, title="🎮 개인서버 플레이어
         max_length=4000,
         required=True)
 
+    def __init__(self, message_id=None, scope_note: str = ""):
+        super().__init__()
+        self.message_id = message_id
+        self.scope_note = scope_note
+
     async def on_submit(self, interaction: discord.Interaction):
         # 로블록스 이름 조회가 끼어 있어 3초를 넘길 수 있습니다.
         await interaction.response.defer(ephemeral=True, thinking=True)
         embed, attachment = await compare_players(
-            interaction.guild, str(self.players))
+            interaction.guild, str(self.players),
+            message_id=self.message_id, scope_note=self.scope_note)
         if attachment is not None:
             await interaction.followup.send(embed=embed, file=attachment,
                                             ephemeral=True)
             return
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+_MSG_ID_RE = re.compile(r"(\d{15,25})")
+
+
+async def resolve_link_target(guild, raw: str):
+    """붙여넣은 값에서 **대조할 링크 하나**를 찾아냅니다.
+
+    관리자가 손에 쥐고 있는 것은 보통 **로그 임베드**입니다. 그래서
+    로그 메시지 ID · 보호 메시지 ID · 메시지 링크를 **전부 받아들입니다.**
+    무엇을 복사해야 하는지 외우게 만들면 아무도 안 씁니다.
+
+    반환: `(message_id, 안내문)` / 못 찾으면 `(None, 사유)`
+    """
+    m = _MSG_ID_RE.search(raw or "")
+    if not m:
+        return None, ("메시지 ID 나 메시지 링크를 넣어 주세요.\n"
+                      "-# 메시지 우클릭 → **메시지 ID 복사** "
+                      "(개발자 모드가 켜져 있어야 보입니다)")
+    mid = int(m.group(1))
+
+    # ① 보호된 임베드 자체
+    if await get_protected_link(guild.id, mid):
+        return mid, f"대상: **링크 하나** (보호 메시지 `{mid}`)"
+
+    # ② 로그 임베드 — 관리자가 제일 자주 복사하는 것
+    ref = await get_log_reference(guild.id, mid)
+    if ref:
+        return int(ref["protected_message_id"]), "대상: **이 로그가 가리키는 링크 하나**"
+
+    # ③ 보호 기록(7일)은 지워졌지만 사용 기록(30일)은 남아 있는 경우
+    if await get_link_usage(guild.id, mid):
+        return mid, f"대상: **링크 하나** (메시지 `{mid}`)"
+
+    return None, ("그 메시지에 연결된 링크를 찾지 못했습니다.\n"
+                  "-# 보호된 임베드 또는 **로그 임베드**의 메시지 ID 를 "
+                  "넣어 주세요. 사용 기록은 30일간 보관됩니다.")
 
 
 class RobloxLink(commands.Cog):
@@ -691,16 +771,33 @@ class RobloxLink(commands.Cog):
         name="개인서버대조",
         description="[관리자 전용] 게임 안 플레이어 목록을 연동·수령 명단과 대조합니다."
     )
+    @app_commands.describe(
+        링크="대조할 링크의 메시지 ID (로그 임베드의 ID 도 됩니다). 비우면 최근 30일 전체"
+    )
     # DM 에서는 interaction.guild 가 None 이라 길드를 쓰는 순간 죽습니다.
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
-    async def compare_server(self, interaction: discord.Interaction):
+    async def compare_server(self, interaction: discord.Interaction,
+                             링크: str = None):
         """유출된 링크에는 워터마크가 남지 않으므로, 게임 쪽에서 확인합니다.
 
         받아 간 적이 없는데 개인서버에 들어와 있으면 누군가 넘긴 것입니다.
+
+        **범위를 좁히지 않으면 판정이 무뎌집니다.** 전체로 보면 *다른*
+        개인서버 링크를 받았던 사람도 '받아 간 사람'이 되어, 정작 이 서버에
+        무단으로 들어온 사람이 정상으로 보입니다.
         """
-        await interaction.response.send_modal(ServerCompareModal())
+        if not 링크:
+            await interaction.response.send_modal(ServerCompareModal())
+            return
+        target, note_text = await resolve_link_target(interaction.guild, 링크)
+        if target is None:
+            await interaction.response.send_message("⚠️ " + note_text,
+                                                    ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            ServerCompareModal(target, note_text))
 
     @app_commands.command(
         name="연동점검",

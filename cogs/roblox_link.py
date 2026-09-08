@@ -12,7 +12,9 @@
 
 import asyncio
 import io
+import os
 import re
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands
@@ -23,6 +25,7 @@ from utils.verify_db import (
     get_roblox_link, find_roblox_owner, save_roblox_link,
     remove_roblox_link, list_roblox_links, search_roblox_links,
     get_verify_settings, get_linkguard_settings, get_usage_summary,
+    KST,
 )
 
 
@@ -38,6 +41,14 @@ def _login_embed_and_view(guild_id: int, user_id: int,
         name="🔒 요청하는 권한",
         value="로블록스 **아이디와 유저명만** 확인합니다.\n"
               "비밀번호 · 로벅스 · 인벤토리에는 접근하지 않습니다.",
+        inline=False)
+    # 이 화면에서 막히는 사람이 실제로 나옵니다. 여기에 적어 두지
+    # 않으면 운영진에게 문의가 오고, 운영진은 앱 설정을 건드립니다.
+    embed.add_field(
+        name="⚠️ 로그인 화면에서 오류가 뜨면",
+        value=("① 이 메시지 말고 **`/로블록스연동` 을 새로 실행**해 주세요.\n"
+               "　 예전에 받은 버튼에는 그때의 주소가 박혀 있습니다.\n"
+               "② 그래도 뜨면 버튼을 **꾹 눌러 주소를 복사**해 크롬·사파리에서  열어 보세요."),
         inline=False)
     embed.set_footer(text="이 링크는 10분 뒤 만료됩니다")
 
@@ -690,6 +701,100 @@ class RobloxLink(commands.Cog):
         받아 간 적이 없는데 개인서버에 들어와 있으면 누군가 넘긴 것입니다.
         """
         await interaction.response.send_modal(ServerCompareModal())
+
+    @app_commands.command(
+        name="연동점검",
+        description="[관리자 전용] 로블록스 연동이 지금 되는 상태인지 확인합니다."
+    )
+    # DM 에서는 interaction.guild 가 None 이라 길드를 쓰는 순간 죽습니다.
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def link_check(self, interaction: discord.Interaction):
+        """"Redirect URI is invalid" 같은 제보를 받았을 때 제일 먼저 볼 화면.
+
+        **전체가 고장 난 것인지, 그 사람만 그런 것인지**를 가릅니다.
+        이 구분이 없으면 운영진이 멀쩡한 앱 설정을 건드리다 진짜로 망가뜨립니다.
+        SSH 로만 볼 수 있으면 관리자가 자리를 비운 동안 아무도 못 봅니다.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        now = datetime.now(KST)
+        def ago(hours=0, days=0):
+            return (now - timedelta(hours=hours, days=days)).strftime(
+                "%Y-%m-%d %H:%M:%S")
+
+        rows = await list_roblox_links(interaction.guild.id)
+        stamps = sorted((r.get("linked_at") or "") for r in rows)
+        last = stamps[-1] if stamps else ""
+        h1, d1, d7 = ago(hours=1), ago(days=1), ago(days=7)
+        n_1h = sum(1 for s in stamps if s >= h1)
+        n_1d = sum(1 for s in stamps if s >= d1)
+        n_7d = sum(1 for s in stamps if s >= d7)
+
+        base = (os.getenv("PUBLIC_BASE_URL") or "").strip()
+        enabled = roblox_oauth.enabled()
+
+        # 판정 — 무엇을 해야 하는지까지 말해 줍니다.
+        if not enabled:
+            color, verdict = discord.Color.red(), (
+                "🔴 **OAuth 가 꺼져 있습니다.**\n"
+                "서버 `.env` 의 `ROBLOX_CLIENT_ID` · `ROBLOX_CLIENT_SECRET` 을 "
+                "확인해야 합니다. 지금은 아무도 연동할 수 없습니다.")
+        elif not base:
+            color, verdict = discord.Color.red(), (
+                "🔴 **공개 주소(`PUBLIC_BASE_URL`)가 없습니다.**\n"
+                "돌아올 주소가 만들어지지 않아 전원이 실패합니다.")
+        elif last >= h1:
+            color, verdict = discord.Color.green(), (
+                "🟢 **지금 정상입니다** — 한 시간 안에도 성공한 사람이 있습니다.\n"
+                "전체 장애가 아니라 **그 사람 쪽 문제**일 가능성이 큽니다. "
+                "아래 안내를 전달해 주세요.")
+        elif last >= d1:
+            color, verdict = discord.Color.green(), (
+                "🟢 **최근 24시간 안에 성공한 기록이 있습니다.**\n"
+                "설정이 깨졌다고 보기는 어렵습니다. 아래 안내를 먼저 전달해 "
+                "보시고, 여러 명이 같이 실패하면 다시 확인하세요.")
+        elif stamps:
+            color, verdict = discord.Color.orange(), (
+                "🟠 **24시간 넘게 성공 기록이 없습니다.**\n"
+                f"마지막 성공은 `{last}` 입니다. 사람이 안 해서일 수도 있지만, "
+                "여러 명이 실패를 호소한다면 아래 **Redirect URL** 을 "
+                "Creator Hub 와 대조해 주세요.")
+        else:
+            color, verdict = discord.Color.orange(), (
+                "🟠 **연동 성공 기록이 아직 없습니다.**\n"
+                "아래 Redirect URL 이 Creator Hub 에 등록돼 있는지 확인하세요.")
+
+        embed = discord.Embed(title="🔎 로블록스 연동 점검",
+                              description=verdict, color=color)
+        embed.add_field(
+            name="⚙️ 설정",
+            value=(f"OAuth: {'✅ 켜짐' if enabled else '❌ 꺼짐'}\n"
+                   f"Client ID: `{roblox_oauth.client_id() or '(없음)'}`"),
+            inline=False)
+        embed.add_field(
+            name="🔗 봇이 로블록스에 보내는 주소",
+            value=(f"```{roblox_oauth.redirect_uri()}```"
+                   "Creator Hub → 앱 → **Redirect URLs** 에 이 값이 "
+                   "**한 글자도 다르지 않게** 있어야 합니다."),
+            inline=False)
+        embed.add_field(
+            name="📈 연동 성공",
+            value=(f"최근 1시간 **{n_1h}명** · 24시간 **{n_1d}명** · "
+                   f"7일 **{n_7d}명**\n"
+                   f"전체 **{len(rows)}명** · 마지막 `{last or '없음'}`"),
+            inline=False)
+        embed.add_field(
+            name="🧾 안 된다는 사람에게 전달할 안내",
+            value=("① `/로블록스연동` 을 **새로 실행**해서 새 버튼을 누르세요.\n"
+                   "　 (예전에 받은 버튼은 그때 주소가 박혀 있어 실패합니다)\n"
+                   "② 그래도 안 되면 버튼을 **꾹 눌러 주소를 복사**해 "
+                   "크롬·사파리에서 열어 보세요.\n"
+                   "③ 로블록스에 **먼저 로그인**해 둔 상태에서 다시 시도하세요."),
+            inline=False)
+        embed.set_footer(text="이 화면은 본인에게만 보입니다")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="연동해제",

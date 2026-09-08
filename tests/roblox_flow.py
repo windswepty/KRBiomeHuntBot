@@ -209,12 +209,87 @@ def test_disabled():
          "redirect_uri 조립", ro.redirect_uri())
 
 
+async def test_link_check():
+    """`/연동점검` — "Redirect URI is invalid" 제보를 받았을 때 첫 화면.
+
+    **전체 장애인지 그 사람만인지**를 가려 주지 못하면, 운영진이 멀쩡한
+    앱 설정을 건드리다 진짜로 망가뜨립니다. 그래서 판정 문구를 검사합니다.
+    """
+    print("")
+    print("=== 연동 점검 (제보를 받았을 때 첫 화면) ===")
+    from datetime import datetime, timedelta
+    from utils.verify_db import KST
+
+    cog = RL.RobloxLink(type("B", (), {"user": None})())
+    original = RL.list_roblox_links
+
+    def at(**kw):
+        return (datetime.now(KST) - timedelta(**kw)).strftime(
+            "%Y-%m-%d %H:%M:%S")
+
+    async def run(stamps):
+        async def _stub(gid, limit=1000):
+            return [{"user_id": str(i), "roblox_id": i, "roblox_name": "n",
+                     "linked_at": s} for i, s in enumerate(stamps, start=1)]
+        RL.list_roblox_links = _stub
+        it = F.Inter()
+        it.guild = F.GUILD
+        await cog.link_check.callback(cog, it)
+        await drain()
+        sent = it.followup.sent[-1] if it.followup.sent else {}
+        return sent, sent.get("embed")
+
+    sent, e = await run([at(days=3), at(minutes=10)])
+    body = str(e.to_dict())
+    note(e.color == discord.Color.green(), "최근 성공이 있으면 초록",
+         str(e.color))
+    note("그 사람 쪽 문제" in (e.description or ""),
+         "전체 장애가 아님을 분명히 말함", (e.description or "")[:40])
+    note(sent.get("ephemeral") is True, "ephemeral=True")
+    note("https://example.test/roblox/callback" in body,
+         "Creator Hub 와 대조할 주소를 그대로 보여줌")
+    note("Redirect URLs" in body, "어디에 등록해야 하는지도 알려줌")
+    note("`1234567890`" in body, "Client ID 를 보여줌 (앱 구분용)")
+    note("새로 실행" in body, "안 되는 사람에게 줄 안내가 들어 있음")
+
+    sent, e = await run([at(hours=5)])
+    note(e.color == discord.Color.green(), "24시간 안이면 초록")
+    note("24시간" in (e.description or ""), "언제까지 됐는지 말해 줌")
+
+    sent, e = await run([at(days=3)])
+    note(e.color == discord.Color.orange(), "하루 넘게 없으면 주황",
+         str(e.color))
+    note("Creator Hub" in (e.description or ""),
+         "그때는 앱 설정을 보라고 안내")
+
+    sent, e = await run([])
+    note(e.color == discord.Color.orange(), "기록이 없으면 주황")
+    note("아직 없습니다" in (e.description or ""), "기록 없음을 구분해 말함")
+
+    print("")
+    print("--- 설정 자체가 깨진 경우는 빨간불이어야 ---")
+    cid = os.environ.pop("ROBLOX_CLIENT_ID")
+    sent, e = await run([at(minutes=1)])
+    note(e.color == discord.Color.red(), "OAuth 꺼짐 → 빨강")
+    note(".env" in (e.description or ""), "어디를 봐야 하는지 말해 줌")
+    os.environ["ROBLOX_CLIENT_ID"] = cid
+
+    base = os.environ.pop("PUBLIC_BASE_URL")
+    sent, e = await run([at(minutes=1)])
+    note(e.color == discord.Color.red(), "공개 주소 없음 → 빨강")
+    note("PUBLIC_BASE_URL" in (e.description or ""), "빠진 값을 이름으로 지목")
+    os.environ["PUBLIC_BASE_URL"] = base
+
+    RL.list_roblox_links = original
+
+
 async def main():
     test_pending()
     test_exchange()
     test_save_link()
     await test_duplicate_account()
     await test_revoke()
+    await test_link_check()
     test_disabled()
 
 asyncio.run(main())

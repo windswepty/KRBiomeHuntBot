@@ -804,6 +804,55 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
     return rows
 
 
+async def find_issued_to(guild_id: int, needle: str) -> dict | None:
+    """발급 주소(또는 그 안의 토큰)로 **누구에게 준 링크인지** 되찾습니다.
+
+    중계 주소는 90초면 죽지만 발급 기록은 `link_usage` 에 30일 남습니다.
+    그래서 토큰이 만료된 뒤에 그 주소가 게시돼도 소유자를 특정할 수 있습니다.
+    워터마크와 달리 로블록스를 거치지 않으므로 **표식이 사라질 일이 없고**,
+    누구 것인지가 추측이 아니라 발급 기록으로 나옵니다.
+
+    문서를 훑지만, 중계 주소가 서버에 게시되는 일 자체가 드물고
+    보호 메시지 1개당 문서 1개(30일 TTL)라 부담이 없습니다.
+    """
+    if not needle:
+        return None
+    str_gid = str(guild_id)
+
+    def _hit(uid, info: dict, message_id) -> dict:
+        return {
+            "user_id": str(uid),
+            "user_name": info.get("name", "?"),
+            "message_id": str(message_id),
+            "last": info.get("last", ""),
+            "watermark": info.get("wm", ""),
+        }
+
+    if usage_col is not None:
+        try:
+            def _scan():
+                for doc in usage_col.find({"guild_id": str_gid},
+                                          {"users": 1, "message_id": 1}):
+                    for uid, info in (doc.get("users") or {}).items():
+                        if needle in (info.get("link") or ""):
+                            return _hit(uid, info, doc.get("message_id", ""))
+                return None
+            return await _db(_scan)
+        except Exception as e:
+            print(f"MongoDB find_issued_to error: {e}, using local file.", flush=True)
+
+    async with _usage_lock:
+        all_usage = _read_json(USAGE_FILE)
+    prefix = f"{str_gid}:"
+    for key, bucket in all_usage.items():
+        if not key.startswith(prefix):
+            continue
+        for uid, info in (bucket or {}).items():
+            if needle in (info.get("link") or ""):
+                return _hit(uid, info, key[len(prefix):])
+    return None
+
+
 # ── 로그 메시지 ↔ 보호 메시지 연결 ────────────────────────────────────
 #
 # 로그 채널에 올린 임베드의 [링크 사용 유저] 버튼이, 어느 보호 메시지의

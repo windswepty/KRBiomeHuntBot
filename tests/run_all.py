@@ -36,7 +36,7 @@ ORDER = [
     "fingerprint", "version_sync", "backoff", "restart_brake", "health_only",
     "healthendpoint", "errhandler", "ttl_fields", "legal_pages",
     "cmds", "events", "ui_all", "modals",
-    "mongo_path", "linkflow", "linkguard_debounce",
+    "mongo_path", "linkflow", "linkguard_debounce", "relay_leak",
     "report_flow", "report_decor", "ticket_guard",
     "adminonly", "goal_adminonly", "backup_roundtrip",
     "roblox_flow", "panels_roster",

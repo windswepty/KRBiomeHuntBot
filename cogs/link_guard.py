@@ -23,7 +23,7 @@ from utils.verify_db import (
     get_verify_settings, peek_verify_settings, add_click_log, get_click_logs,
     make_watermark_code, save_watermark, get_watermark,
     register_guarded_keys, get_guarded_keys,
-    record_link_usage, get_link_usage,
+    record_link_usage, get_link_usage, find_issued_to,
     save_log_reference, get_log_reference, get_log_reference_by_protected,
     get_roblox_names,
 )
@@ -186,6 +186,44 @@ def apply_watermark(url: str, code: str) -> str:
 
 
 WATERMARK_RE = re.compile(r'#hbh-([0-9a-f]{8})', re.IGNORECASE)
+
+
+# 중계 주소(/j/<토큰>)는 **한 사람에게만 발급된 개인 주소**입니다.
+# 정상 경로로는 디스코드에 다시 나타날 이유가 없어서, 그대로 게시되면
+# 유출로 봅니다. 워터마크와 달리 로블록스를 거치지 않으므로 표식이
+# 사라지지 않고, 누구 것인지가 발급 기록으로 정확히 나옵니다.
+#
+# (로블록스가 공유링크를 펼치면서 프래그먼트를 버리기 때문에, 펼쳐진
+#  개인서버 주소에는 워터마크가 남지 않습니다. 그쪽은 추적할 수 없습니다.)
+RELAY_PATH_RE = re.compile(r'^/j/([A-Za-z0-9_\-]{16,})')
+
+
+def relay_tokens_in(text: str) -> list[str]:
+    """본문에서 **이 봇의** 중계 주소만 골라 토큰을 뽑습니다.
+
+    공개 주소가 없으면(중계를 쓰지 않는 상태) 아무것도 잡지 않습니다.
+    호스트를 정확히 맞춰야 합니다 — 접두사만 보면
+    `krbiomehunt.duckdns.org.example.com` 같은 남의 주소도 걸립니다.
+    """
+    base = link_tokens.public_base_url()
+    if not base:
+        return []
+    host = base.split("://", 1)[-1].rstrip("/").lower()
+    if not host:
+        return []
+
+    found: list[str] = []
+    for raw in URL_RE.findall(text or ""):
+        after = clean_url(raw).split("://", 1)[-1]
+        if not after.lower().startswith(host):
+            continue
+        rest = after[len(host):]
+        if not rest.startswith("/"):
+            continue
+        m = RELAY_PATH_RE.match(rest)
+        if m and m.group(1) not in found:
+            found.append(m.group(1))
+    return found
 
 
 def describe_roblox_link(url: str) -> str:
@@ -2082,6 +2120,13 @@ class LinkGuard(commands.Cog):
         if not settings.get("enabled", True):
             return
 
+        # 중계 주소는 판정 근거가 달라(발급 기록으로 소유자가 특정됩니다)
+        # 별도 경로로 처리합니다.
+        relay = relay_tokens_in(content)
+        if relay:
+            await self._report_relay_leak(message, settings, relay[0])
+            return
+
         guarded = await get_guarded_keys(guild.id)
         found_urls = [clean_url(u) for u in URL_RE.findall(content)]
 
@@ -2155,6 +2200,94 @@ class LinkGuard(commands.Cog):
                   else "⚠️ 메시지를 삭제하지 못했습니다 (권한 확인 필요)",
             inline=False
         )
+        embed.timestamp = discord.utils.utcnow()
+        await send_guard_log(guild, settings, embed)
+
+    async def _report_relay_leak(self, message: discord.Message,
+                                 settings: dict, token: str) -> None:
+        """중계 주소가 그대로 게시된 경우를 기록합니다.
+
+        **게시자와 발급 대상을 구분합니다.** 남의 주소를 올렸으면 유출이
+        분명하지만, 자기 주소를 올린 것은 "이거 눌러도 안 돼요" 하고
+        문의하다 붙여넣은 것일 수 있습니다. 둘을 같은 제목·같은 색으로
+        올리면 관리자가 문의한 사람을 유출자로 오해합니다.
+        """
+        guild = message.guild
+
+        owner_id = ""
+        owner_name = ""
+        # 아직 살아있는 토큰이면 메모리에서 바로 나옵니다(소비하지 않습니다).
+        alive = link_tokens.peek_owner(token)
+        if alive and alive[0] == guild.id:
+            owner_id = str(alive[1])
+        if not owner_id:
+            # 토큰은 90초면 죽지만 발급 기록은 30일 남습니다.
+            found = await find_issued_to(guild.id, token)
+            if found:
+                owner_id = found.get("user_id") or ""
+                owner_name = found.get("user_name") or ""
+
+        by_owner = bool(owner_id) and str(message.author.id) == owner_id
+
+        if not owner_id:
+            verdict = ("발급 기록을 찾지 못했습니다 — 30일이 지났거나 "
+                       "이 서버에서 발급한 주소가 아닙니다.")
+        elif by_owner:
+            verdict = ("**본인에게 발급된 주소**입니다.\n"
+                       "남에게 넘기려던 것일 수도, 안 열린다고 문의하다 "
+                       "붙여넣은 것일 수도 있습니다. 확인해 주세요.")
+        else:
+            who = f"<@{owner_id}>"
+            if owner_name:
+                who += f" (**{owner_name}**)"
+            verdict = (f"**다른 사람에게 발급된 주소**입니다 — {who}.\n"
+                       "게시자가 그 사람에게 받았거나, 그 사람이 넘긴 것입니다.")
+
+        deleted = False
+        if settings.get("auto_delete_leak", True):
+            try:
+                await message.delete()
+                deleted = True
+            except Exception:
+                pass
+
+        # 토큰 전체를 로그에 남기지 않습니다. 아직 살아 있을 수 있고,
+        # 남겨 봐야 소유자는 이미 위에서 특정했습니다.
+        await add_click_log(
+            guild.id, message.author.id, message.author.display_name,
+            f"(중계 주소) /j/{token[:8]}…",
+            event_type="leak",
+            detail=(f"#{message.channel} 채널에 중계 주소 게시 / "
+                    + ("본인 주소" if by_owner
+                       else f"발급 대상 {owner_id}" if owner_id
+                       else "발급 기록 없음")),
+        )
+
+        embed = discord.Embed(
+            title="⚠️ 개인 전용 주소가 공개됨" if by_owner else "🚨 중계 주소 유출",
+            description=(f"{message.author.mention} 님이 "
+                         f"**{message.channel.mention}** 채널에 "
+                         "중계 주소를 그대로 게시했습니다."),
+            color=discord.Color.orange() if by_owner else discord.Color.red()
+        )
+        embed.add_field(
+            name="🙋 게시한 유저",
+            value=f"**{message.author.display_name}**\n`{message.author.id}`",
+            inline=True
+        )
+        embed.add_field(
+            name="🎫 발급 대상",
+            value=(f"<@{owner_id}>\n`{owner_id}`" if owner_id else "기록 없음"),
+            inline=True
+        )
+        embed.add_field(name="🧭 판정", value=verdict, inline=False)
+        embed.add_field(
+            name="🧹 조치",
+            value="✅ 메시지를 자동 삭제했습니다" if deleted
+                  else "⚠️ 메시지를 삭제하지 못했습니다 (권한 확인 필요)",
+            inline=False
+        )
+        embed.set_footer(text="이 주소는 1회용이라 이미 만료됐을 수 있습니다.")
         embed.timestamp = discord.utils.utcnow()
         await send_guard_log(guild, settings, embed)
 

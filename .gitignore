@@ -28,3 +28,6 @@ id_ed25519*
 .coverage.*
 htmlcov/
 .coveragerc
+
+# 사람마다 다른 로컬 설정 (권한 허용 목록 등). 공유할 것이 아닙니다.
+.claude/settings.local.json

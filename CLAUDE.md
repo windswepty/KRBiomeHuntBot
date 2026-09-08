@@ -406,7 +406,7 @@ raw 개인서버 주소는 버튼을 눌러 본 사람만 볼 수 있으므로, 
   익숙해져서 진짜 경고를 놓칩니다. 그래서 크래시 루프 판정에 커밋 해시를 씁니다
   (재배포는 커밋이 매번 바뀌므로 걸리지 않습니다).
 - **분모 없는 개수는 쓸모가 없습니다.** `기능 11개` 로는 원래 12개였는지 알 수
-  없습니다. `cogs/` 파일 수를 분모로 써서 `11/11` 로 보여줍니다.
+  없습니다. `cogs/` 파일 수를 분모로 써서 `12/12` 로 보여줍니다.
 
 ### 호스팅이 봇을 꺼 버리는 경우
 
@@ -738,8 +738,9 @@ Mongo 경로는 한 줄도 실행되지 않습니다. 컬렉션을 가짜로 갈
 
 **Oracle Cloud** 의 `krbiomehuntbot` 인스턴스에서 systemd 서비스로 돕니다
 (`/etc/systemd/system/krbiomehuntbot.service`, 사용자 `ubuntu`,
-작업 폴더 `/home/ubuntu/bots/KRBiomeHuntBot`). `render.yaml` 은 Render 시절
-잔재이며 지금은 쓰이지 않습니다.
+작업 폴더 `/home/ubuntu/bots/KRBiomeHuntBot`).
+Render 시절 잔재였던 `render.yaml` 은 2026-09-08 에 지웠습니다 —
+쓰이지 않는 배포 설정이 남아 있으면 다음 사람이 그걸 보고 배포 경로를 찾습니다.
 
 `keep_alive.py` 가 Flask 를 데몬 스레드로 띄워 `PORT`(기본 8080)에 바인딩하고,
 그 앞에 **Caddy** 가 붙어 `https://krbiomehunt.duckdns.org` 로 TLS 를 처리합니다.

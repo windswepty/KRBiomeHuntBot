@@ -706,7 +706,7 @@ Flask 는 멀쩡히 200 을 돌려줍니다. 외부 감시 서비스는 정상�
 ```
 GET /health
 {"status":"ok","connected":true,"ready":true,"guilds":1,
- "latency_ms":80.4,"storage":"mongo","extensions":"11/11","commands":24}
+ "latency_ms":80.4,"storage":"mongo","extensions":"12/12","commands":28}
 ```
 
 | 상태 | 응답 | 이어지는 동작 |
@@ -743,7 +743,7 @@ GET /health
 💽 포인트 저장  ⏱️ 연속 가동  📶 응답 속도
 ✅ MongoDB      3일 5시간     80 ms
 ⚙️ 기능         🔌 연결       📋 명령어
-11/11개         ✅ 정상       24개
+12/12개         ✅ 정상       28개
 🔁 누적 재시작   💾 마지막 전체 백업   🕒 최근 기동 (최근 5회)
 6회 · `a1b2c3`  2026-08-29 05:00
 
@@ -759,13 +759,13 @@ GET /health
 | 🟡 | 재연결 중 |
 | 🔴 | 포인트 저장 이상 · 기능 누락 · 크래시 루프 |
 
-**`기능 11/11`** — 분모는 `cogs/` 폴더의 파일 수입니다. 하드코딩이 아니라 기능을
-추가하면 저절로 늘어납니다. 하나라도 실패하면 `10/11 🚨` 와 함께 **빠진 기능 이름**이
+**`기능 12/12`** — 분모는 `cogs/` 폴더의 파일 수입니다. 하드코딩이 아니라 기능을
+추가하면 저절로 늘어납니다. 하나라도 실패하면 `11/12 🚨` 와 함께 **빠진 기능 이름**이
 그대로 표시됩니다.
 
 **크래시 루프 판정** — 최근 60분 안에 **같은 커밋**으로 3번 이상 켜졌을 때만 경고합니다.
 재배포는 커밋이 매번 바뀌므로 걸리지 않습니다. 둘은 대응이 정반대라 반드시 구분해야 합니다.
-(`RENDER_GIT_COMMIT` 사용)
+(커밋 해시는 `.git` 에서 직접 읽습니다 — Oracle 에는 호스팅이 넣어주는 변수가 없어, 예전에 이 경보가 통째로 무력했던 적이 있습니다)
 
 #### 📡 외부 감시 (UptimeRobot)
 
@@ -785,6 +785,12 @@ GET /health
 | 자동 재시작 성공 | 다시 갱신 | **Up 알림** |
 
 > `Up events` 를 꼭 켜세요. 복구 알림이 없으면 "아직도 죽어 있나"를 알 수 없습니다.
+>
+> **다만 지금은 알림을 쓰지 않기로 했습니다**(2026-09-08). 봇이 멈추면
+> 서버 사람들이 곧바로 알려주기 때문입니다. 조치는 GitHub Actions 에서
+> 재부팅을 실행하는 것으로 하고, 절차는 `RUNBOOK.md` 에 있습니다.
+> 모니터 자체는 등록해 두었으니, 연락받을 수 없는 기간이 오면
+> 이메일만 추가하면 바로 동작합니다.
 
 #### 🗄️ 백업 3중화
 
@@ -863,7 +869,7 @@ DB에서 지워진 값을 캐시가 계속 돌려주거나 캐시가 무한히 �
 - **Language**: Python 3.10+
 - **Library**: `discord.py` 2.x (Cogs · Slash Commands · Views · Modals)
 - **Database**: MongoDB Atlas (`pymongo`) + 로컬 JSON 폴백
-- **Hosting / Deployment**: Render (`render.yaml`), `keep_alive` Flask 서버
+- **Hosting / Deployment**: Oracle Cloud (systemd · 상시 가동) · Caddy(HTTPS) · `keep_alive` Flask 서버
 
 ---
 
@@ -873,8 +879,10 @@ DB에서 지워진 값을 캐시가 계속 돌려주거나 캐시가 무한히 �
 한바헌봇/
 ├── main.py              # 봇 진입점 · Cog 자동 로드 · 감시 루프 · 저장소 가드
 ├── keep_alive.py        # Flask — /health(생존 확인) · 링크 중계 · OAuth 콜백
-├── render.yaml          # Render 배포 설정
 ├── requirements.txt
+├── RUNBOOK.md           # 비상 대응 절차 (개발을 모르는 스태프용)
+├── tests/               # 검증 (실 DB 를 건드리지 않음)
+├── .github/workflows/   # 인스턴스 자동 재시작 (3시간마다)
 ├── tools/               # 운영 도구 (봇과 별개로 PC 에서 실행)
 │   ├── full_backup.py     # DB 전체 백업 · 검증 · 복원
 │   ├── migrate_cluster.py # 클러스터 이전 (옛 Atlas -> 새 Atlas)
@@ -931,8 +939,10 @@ SECRET_KEY=쿠키 서명용 임의 문자열 (직접 생성)
 ROBLOX_CLIENT_ID=로블록스 OAuth 클라이언트 ID
 ROBLOX_CLIENT_SECRET=로블록스 OAuth 시크릿
 
-# ── 중계 주소 (Render 는 자동 주입되므로 보통 불필요) ──
-PUBLIC_BASE_URL=https://내서비스.onrender.com
+# ── 중계 주소 (Oracle 에서는 반드시 필요) ──
+#    없으면 링크 중계가 조용히 꺼지고,
+#    버튼에 로블록스 주소가 그대로 박혀 우클릭 한 번에 샙니다.
+PUBLIC_BASE_URL=https://krbiomehunt.duckdns.org
 ```
 
 **리다이렉트 URI** — 각 개발자 포털에 아래를 **정확히** 등록해야 합니다.

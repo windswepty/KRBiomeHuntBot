@@ -29,7 +29,21 @@ on:
     # 3시간마다. 분을 17로 흩어 정각 혼잡을 피합니다.
     # 월 약 240회 × 1.5분 = 360분 (비공개 저장소 무료 2,000분 중 18%)
     - cron: "17 */3 * * *"
-  workflow_dispatch:        # 수동 실행 (Actions 탭에서 버튼)
+  workflow_dispatch:
+    # 폰에서 GitHub 앱으로 눌러 쓰라고 만든 입구입니다.
+    # 오라클 콘솔은 모바일에서 다루기 번거로운데, 여기는 버튼 두 번이면 됩니다.
+    inputs:
+      force:
+        description: "check=상태만 확인 / reboot=강제 재부팅 (봇 약 2분 중단)"
+        type: choice
+        required: true
+        default: check
+        options: [check, reboot]
+      target:
+        description: "재부팅할 인스턴스 이름"
+        type: string
+        required: false
+        default: krbiomehuntbot
 
 permissions:
   contents: write           # 60일 비활성 방지용 빈 커밋
@@ -117,6 +131,8 @@ jobs:
       - name: 인스턴스 전부 확인 · 꺼져 있으면 켜기
         env:
           TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          FORCE: ${{ inputs.force }}
+          TARGET: ${{ inputs.target }}
           # 이름을 쉼표로 나열하면 그 인스턴스는 건드리지 않습니다.
           # (일부러 꺼 둔 것을 워크플로가 다시 켜지 않게 하는 탈출구)
           SKIP: ${{ vars.KEEPALIVE_SKIP }}
@@ -150,6 +166,27 @@ jobs:
             case ",$SKIP," in
               *",$name,"*) echo "  $name : 건너뜀 (KEEPALIVE_SKIP)"; continue ;;
             esac
+            # 폰에서 '재부팅'을 골라 실행한 경우. 켜져 있어도 강제로 다시 띄웁니다.
+            # 봇이 살아는 있는데 이상할 때(응답 없음 등) 쓰는 탈출구입니다.
+            if [ "${FORCE:-check}" = "reboot" ] && [ "$name" = "${TARGET:-krbiomehuntbot}" ]; then
+              if [ "$state" = "RUNNING" ]; then
+                echo "::warning::$name 강제 재부팅 (수동 요청)"
+                act=SOFTRESET
+              else
+                echo "::warning::$name 이 $state 상태 — 켭니다 (수동 요청)"
+                act=START
+              fi
+              if oci compute instance action --instance-id "$id" --action "$act"                    --wait-for-state RUNNING --max-wait-seconds 900 > /dev/null 2>/tmp/f_err; then
+                echo "  $name : $act 완료 — 봇은 부팅과 함께 자동으로 뜹니다"
+                restarted="$restarted $name"
+              else
+                echo "::error::$name $act 실패"
+                head -20 /tmp/f_err
+                fail=1
+              fi
+              continue
+            fi
+
             case "$state" in
               RUNNING)
                 echo "  $name : RUNNING — 할 일 없음" ;;

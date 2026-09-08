@@ -49,6 +49,14 @@ def fields_of(embed):
     return {f["name"]: f["value"] for f in embed.to_dict().get("fields", [])}
 
 
+def field_value(embed, prefix):
+    """필드 이름에 인원수가 붙으므로 접두사로 찾습니다."""
+    for name, value in fields_of(embed).items():
+        if name.startswith(prefix):
+            return value
+    return None
+
+
 async def main():
     import utils.verify_db as vdb
     import utils.link_tokens as LT
@@ -107,8 +115,8 @@ async def main():
     note(d.get("title") == "🚨 중계 주소 유출", "제목", str(d.get("title")))
     note(d.get("color") == discord.Color.red().value, "빨간색")
     ff = fields_of(e)
-    note(str(owner.id) in ff.get("🎫 발급 대상", ""),
-         "발급 대상을 특정", ff.get("🎫 발급 대상", ""))
+    note(str(owner.id) in (field_value(e, "🎫 발급 대상") or ""),
+         "발급 대상을 특정", str(field_value(e, "🎫 발급 대상")))
     note(str(other.id) in ff.get("🙋 게시한 유저", ""), "게시자도 표시")
     note("다른 사람에게 발급된 주소" in ff.get("🧭 판정", ""),
          "판정이 '남의 주소'", ff.get("🧭 판정", "")[:40])
@@ -143,8 +151,8 @@ async def main():
     await lg._detect_leak(m3)
     await drain()
     f3 = fields_of(last_embed())
-    note("43" in f3.get("🎫 발급 대상", ""), "발급 기록이 없어도 특정",
-         f3.get("🎫 발급 대상", ""))
+    note("43" in (field_value(last_embed(), "🎫 발급 대상") or ""),
+         "발급 기록이 없어도 특정", str(field_value(last_embed(), "🎫 발급 대상")))
     note(LT.peek_owner(live) is not None, "확인만 하고 토큰을 소비하지 않음")
 
     print("")
@@ -155,8 +163,9 @@ async def main():
     await lg._detect_leak(m4)
     await drain()
     f4 = fields_of(last_embed())
-    note(f4.get("🎫 발급 대상") == "기록 없음", "발급 대상은 '기록 없음'",
-         str(f4.get("🎫 발급 대상")))
+    note(field_value(last_embed(), "🎫 발급 대상") == "기록 없음",
+         "발급 대상은 '기록 없음'",
+         str(field_value(last_embed(), "🎫 발급 대상")))
     note("찾지 못했습니다" in f4.get("🧭 판정", ""), "이유를 설명함")
     note(m4.deleted is True, "그래도 삭제함")
 
@@ -214,6 +223,77 @@ async def main():
     note(await vdb.find_issued_to(GUILD.id, "") is None, "빈 값은 None")
     note(await vdb.find_issued_to(GUILD.id + 999, TOKEN) is None,
          "다른 길드의 기록은 보이지 않음")
+
+    print("")
+    print("=== 10. 우회 시도 (감사에서 나온 것들) ===")
+    ev = [
+        ("대문자로 적기", "HTTPS://RELAY.TEST/j/" + TOKEN, True),
+        ("포트를 붙이기", "https://relay.test:443/j/" + TOKEN, True),
+        ("주소 뒤 물음표", "https://relay.test/j/" + TOKEN + "?v=1", True),
+        ("꺾쇠로 감싸기", "<https://relay.test/j/" + TOKEN + ">", True),
+        ("마크다운 뒤에 숨기기", "[click](https://relay.test/j/" + TOKEN + ")", True),
+        ("하위 도메인 흉내", "https://evil.relay.test/j/" + TOKEN, False),
+        ("뒤에 붙인 가짜 도메인", "https://relay.test.evil.com/j/" + TOKEN, False),
+        ("경로로 흉내", "https://evil.com/relay.test/j/" + TOKEN, False),
+    ]
+    for label, text, want in ev:
+        note(bool(LGM.relay_tokens_in(text)) is want, label,
+             "잡힘" if LGM.relay_tokens_in(text) else "안 잡힘")
+
+    print("")
+    print("=== 11. 남의 주소를 모아 뿌리면 전부 짚어야 ===")
+    LT.clear()
+    LOG.sent.clear()
+    toks = []
+    for n in range(7):
+        t = f"MultiToken{n}Padding0000"
+        toks.append(t)
+        await vdb.record_link_usage(GUILD.id, 7200 + n, 60 + n, f"피해자{n}",
+                                    issued_url="https://relay.test/j/" + t)
+    collector = Member(70, "수집가", False, guild=GUILD)
+    m7 = post(collector,
+              chr(10).join("https://relay.test/j/" + t for t in toks), 7300)
+    await lg._detect_leak(m7)
+    await drain()
+    e7 = last_embed()
+    target = field_value(e7, "🎫 발급 대상") or ""
+    note(e7.to_dict().get("title") == "🚨 중계 주소 유출", "유출로 판정")
+    note(sum(f"<@{60 + n}>" in target for n in range(7)) == LGM.MAX_RELAY_TOKENS,
+         f"상한 {LGM.MAX_RELAY_TOKENS}명까지 특정 (무한 조회 방지)", target[:60])
+    note(field_value(e7, "🔗 게시된 주소 수") == "**7개**",
+         "몇 개를 뿌렸는지 그대로 알림", str(field_value(e7, "🔗 게시된 주소 수")))
+    note("명분을 모아" in (field_value(e7, "🧭 판정") or ""),
+         "'모아서 뿌렸다'를 앞세움")
+
+    print("")
+    print("=== 12. 보낸 뒤 고쳐서 끼워 넣는 회피 ===")
+    LOG.sent.clear()
+    clean = post(collector, "안녕하세요", 7400)
+    await lg.on_message(clean)
+    note(not LOG.sent, "깨끗한 글은 그냥 지나감")
+    edited = post(collector, "https://relay.test/j/" + TOKEN, 7400)
+    await lg.on_message_edit(clean, edited)
+    await drain()
+    note(bool(LOG.sent), "수정본도 검사함")
+    note(edited.deleted is True, "수정본을 삭제함")
+
+    before_count = len(LOG.sent)
+    again = post(collector, "https://relay.test/j/" + TOKEN, 7400)
+    await lg.on_message_edit(edited, again)
+    await drain()
+    note(len(LOG.sent) == before_count,
+         "같은 메시지를 또 고쳐도 다시 알리지 않음 (도배 방지)",
+         f"{before_count} -> {len(LOG.sent)}")
+
+    print("")
+    print("=== 13. 소유자 조회는 '정확히' 맞아야 ===")
+    note(await vdb.find_issued_to(GUILD.id, "relay.test") is None,
+         "모든 주소에 든 문자열로는 아무도 짚히지 않음")
+    note(await vdb.find_issued_to(GUILD.id, TOKEN[:8]) is None,
+         "토큰 앞부분만으로는 짚히지 않음")
+    full = await vdb.find_issued_to(GUILD.id, "https://relay.test/j/" + TOKEN)
+    note(full is not None and full["user_id"] == str(owner.id),
+         "주소 전체를 넣어도 찾아짐", str(full))
 
 asyncio.run(main())
 print("\n  실패 " + str(len(F.FAILS)) + "건 / 성공 " + str(len(F.OKS)) + "건")

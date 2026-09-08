@@ -301,6 +301,17 @@ async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.
     확인합니다 — 받아 간 적이 없는데 들어와 있으면 누군가 넘긴 것입니다.
     """
     names = split_names(raw_text)
+    if not names:
+        # `required=True` 만으로는 공백을 막지 못합니다 — 디스코드는
+        # 공백 문자를 '입력됨'으로 봅니다. 여기서 걸러 내지 않으면
+        # **아무것도 대조하지 않고 초록색 '문제 없음'** 이 뜹니다.
+        return discord.Embed(
+            title="🎮 개인서버 플레이어 대조",
+            description=("이름을 하나도 읽지 못했습니다.\n"
+                         "게임 안 플레이어 목록을 **줄바꿈이나 쉼표로 구분해** "
+                         "붙여넣어 주세요."),
+            color=discord.Color.red()), None
+
     links = await list_roblox_links(guild.id)
     usage = await get_usage_summary(guild.id)
 
@@ -378,11 +389,17 @@ async def compare_players(guild, raw_text: str) -> tuple[discord.Embed, discord.
                    + _join_capped([f"`{n}`" for n in unknown], 700)),
             inline=False)
 
-    if links and not fresh:
+    # 일부만 실패해도 알려야 합니다. 전부 실패했을 때만 알리면,
+    # 절반이 낡은 이름으로 대조된 결과를 관리자가 그대로 믿습니다.
+    unresolved = len(links) - len(fresh)
+    if links and unresolved > 0:
         embed.add_field(
-            name="⚠️ 로블록스 이름 조회 실패",
-            value=("저장된 이름으로만 대조했습니다. 개명했거나 표시이름이 "
-                   "다른 사람은 '명단에 없음'으로 잘못 나올 수 있습니다."),
+            name=("⚠️ 로블록스 이름 조회 실패" if not fresh
+                  else f"⚠️ 이름을 못 받은 사람 {unresolved}명"),
+            value=("그 사람들은 **저장된 이름으로만** 대조했습니다. "
+                   "개명했거나 표시이름이 다르면 '명단에 없음'으로 잘못 "
+                   "나올 수 있습니다.\n"
+                   "-# 잠시 뒤 다시 실행하면 조회될 수 있습니다."),
             inline=False)
 
     embed.set_footer(

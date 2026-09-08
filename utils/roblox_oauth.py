@@ -188,6 +188,12 @@ USERS_BATCH = "https://users.roblox.com/v1/users"
 # 한 번에 물어볼 수 있는 최대 인원
 NAMES_BATCH_SIZE = 100
 
+# 조사하는 동안 같은 명령을 몇 번씩 쓰게 되므로 짧게 캐시합니다.
+NAMES_CACHE_TTL = 600
+NAMES_CACHE_MAX = 5000
+_name_cache: dict[int, tuple[float, dict]] = {}
+_name_lock = threading.Lock()
+
 
 def fetch_names(roblox_ids: list) -> dict:
     """로블록스 아이디 → `{"name": 사용자명, "display": 표시이름}`.
@@ -198,12 +204,15 @@ def fetch_names(roblox_ids: list) -> dict:
         사용자명만 가지고 맞춰 보면 대부분 안 맞습니다.
 
     OAuth 설정과 무관하게 동작합니다(로그인이 필요 없는 공개 API).
-    실패하면 **빈 dict** 를 돌려줍니다 — 호출부는 저장된 이름으로 대조를
-    계속하고 그 사실을 화면에 알립니다. 조용히 틀린 결과를 주는 것보다
-    낫습니다.
+    실패한 사람은 **결과에서 빠집니다** — 호출부는 저장된 이름으로 대조를
+    계속하고 몇 명을 못 받았는지 화면에 알립니다. 조용히 틀린 결과를
+    주는 것보다 낫습니다.
+
+    조사하는 동안 같은 명령을 몇 번씩 쓰게 되므로 짧게 캐시합니다.
+    캐시가 없으면 실행할 때마다 인원수만큼 왕복하면서 스레드를 붙잡습니다.
+    **실패는 캐시하지 않습니다.**
     """
-    out: dict[int, dict] = {}
-    ids = []
+    ids: list[int] = []
     for value in roblox_ids or []:
         try:
             num = int(value)
@@ -212,8 +221,19 @@ def fetch_names(roblox_ids: list) -> dict:
         if num > 0 and num not in ids:
             ids.append(num)
 
-    for start_at in range(0, len(ids), NAMES_BATCH_SIZE):
-        chunk = ids[start_at:start_at + NAMES_BATCH_SIZE]
+    out: dict[int, dict] = {}
+    now = time.time()
+    missing: list[int] = []
+    with _name_lock:
+        for num in ids:
+            cached = _name_cache.get(num)
+            if cached and now - cached[0] < NAMES_CACHE_TTL:
+                out[num] = dict(cached[1])
+            else:
+                missing.append(num)
+
+    for start_at in range(0, len(missing), NAMES_BATCH_SIZE):
+        chunk = missing[start_at:start_at + NAMES_BATCH_SIZE]
         try:
             body = json.dumps({"userIds": chunk,
                                "excludeBannedUsers": False}).encode()
@@ -226,19 +246,30 @@ def fetch_names(roblox_ids: list) -> dict:
                 rid = row.get("id")
                 if rid is None:
                     continue
-                out[int(rid)] = {"name": row.get("name") or "",
-                                 "display": row.get("displayName") or ""}
+                entry = {"name": row.get("name") or "",
+                         "display": row.get("displayName") or ""}
+                out[int(rid)] = entry
+                with _name_lock:
+                    _name_cache[int(rid)] = (now, entry)
         except urllib.error.HTTPError as e:
             print(f"[RobloxOAuth] 이름 조회 실패 HTTP {e.code}", flush=True)
         except (OSError, http.client.HTTPException,
                 ValueError, KeyError, TypeError, AttributeError) as e:
             # 응답을 읽는 중에 나는 예외는 URLError 로 감싸이지 않습니다.
             print(f"[RobloxOAuth] 이름 조회 실패: {type(e).__name__}: {e}", flush=True)
+
+    with _name_lock:
+        if len(_name_cache) > NAMES_CACHE_MAX:
+            # dict 는 삽입 순서를 유지하므로 앞쪽이 가장 오래된 항목입니다
+            for key in list(_name_cache)[:len(_name_cache) - NAMES_CACHE_MAX // 2]:
+                _name_cache.pop(key, None)
     return out
 
 
 def clear() -> None:
     """테스트용."""
+    with _name_lock:
+        _name_cache.clear()
     with _lock:
         _pending.clear()
 

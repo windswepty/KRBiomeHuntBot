@@ -35,7 +35,7 @@ PLINK_BUTTON_ID = "hbh_plink:open"
 USAGE_BUTTON_ID = "hbh_usage:open"
 
 MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(\s*(https?://[^\s)]+)\s*\)')
-URL_RE = re.compile(r'https?://[^\s<>"\'`\]\)]+')
+URL_RE = re.compile(r'https?://[^\s<>"\'`\]\)]+', re.IGNORECASE)
 
 # 디스코드 링크 버튼이 허용하는 URL 최대 길이
 MAX_URL_LENGTH = 512
@@ -197,33 +197,64 @@ WATERMARK_RE = re.compile(r'#hbh-([0-9a-f]{8})', re.IGNORECASE)
 #  개인서버 주소에는 워터마크가 남지 않습니다. 그쪽은 추적할 수 없습니다.)
 RELAY_PATH_RE = re.compile(r'^/j/([A-Za-z0-9_\-]{16,})')
 
+# 한 메시지에서 소유자를 찾아볼 주소 개수. 여러 개를 뿌리는 쪽이 더
+# 위험하지만, 수백 개를 붙여넣어 조회를 유발하게 두면 안 됩니다.
+MAX_RELAY_TOKENS = 5
+
 
 def relay_tokens_in(text: str) -> list[str]:
     """본문에서 **이 봇의** 중계 주소만 골라 토큰을 뽑습니다.
 
     공개 주소가 없으면(중계를 쓰지 않는 상태) 아무것도 잡지 않습니다.
-    호스트를 정확히 맞춰야 합니다 — 접두사만 보면
-    `krbiomehunt.duckdns.org.example.com` 같은 남의 주소도 걸립니다.
+
+    **호스트는 정확히 같아야 합니다.** 앞부분만 비교하면
+    `krbiomehunt.duckdns.org.evil.com` 이 걸리고, 뒷부분만 비교하면
+    `evil.krbiomehunt.duckdns.org` 가 걸립니다.
+
+    포트(`:443`)는 떼고 비교합니다. 붙여 두면 주소는 그대로 열리는데
+    감지만 피해 가므로, 한 글자로 우회가 됩니다.
     """
     base = link_tokens.public_base_url()
     if not base:
         return []
-    host = base.split("://", 1)[-1].rstrip("/").lower()
-    if not host:
+
+    base_after = base.split("://", 1)[-1].rstrip("/")
+    cut = base_after.find("/")
+    base_host = (base_after[:cut] if cut >= 0 else base_after).split(":", 1)[0].lower()
+    base_path = base_after[cut:] if cut >= 0 else ""
+    if not base_host:
         return []
 
     found: list[str] = []
     for raw in URL_RE.findall(text or ""):
         after = clean_url(raw).split("://", 1)[-1]
-        if not after.lower().startswith(host):
+        cut = after.find("/")
+        host = (after[:cut] if cut >= 0 else after).split(":", 1)[0].lower()
+        rest = after[cut:] if cut >= 0 else ""
+        if host != base_host or not rest.startswith(base_path):
             continue
-        rest = after[len(host):]
-        if not rest.startswith("/"):
-            continue
-        m = RELAY_PATH_RE.match(rest)
+        m = RELAY_PATH_RE.match(rest[len(base_path):])
         if m and m.group(1) not in found:
             found.append(m.group(1))
     return found
+
+
+# 같은 메시지를 수정할 때마다 다시 알리지 않도록 최근 처리분을 기억합니다.
+# (자동 삭제가 꺼져 있으면 메시지가 남아 몇 번이든 고쳐질 수 있습니다)
+LEAK_MEMO_SECONDS = 600
+_leak_reported: dict[int, float] = {}
+
+
+def _already_reported(message_id: int) -> bool:
+    """이미 알린 메시지인지 확인하고, 아니면 알린 것으로 표시합니다."""
+    now = time.monotonic()
+    for mid, at in list(_leak_reported.items()):
+        if now - at > LEAK_MEMO_SECONDS:
+            _leak_reported.pop(mid, None)
+    if message_id in _leak_reported:
+        return True
+    _leak_reported[message_id] = now
+    return False
 
 
 def describe_roblox_link(url: str) -> str:
@@ -2124,7 +2155,8 @@ class LinkGuard(commands.Cog):
         # 별도 경로로 처리합니다.
         relay = relay_tokens_in(content)
         if relay:
-            await self._report_relay_leak(message, settings, relay[0])
+            if not _already_reported(message.id):
+                await self._report_relay_leak(message, settings, relay)
             return
 
         guarded = await get_guarded_keys(guild.id)
@@ -2146,6 +2178,9 @@ class LinkGuard(commands.Cog):
 
         mark_only = not leaked and not bare_code and WATERMARK_RE.search(content)
         if not leaked and not bare_code and not mark_only:
+            return
+        # 수정할 때마다 같은 유출을 다시 알리지 않습니다
+        if _already_reported(message.id):
             return
 
         if leaked:
@@ -2204,32 +2239,47 @@ class LinkGuard(commands.Cog):
         await send_guard_log(guild, settings, embed)
 
     async def _report_relay_leak(self, message: discord.Message,
-                                 settings: dict, token: str) -> None:
+                                 settings: dict, tokens: list) -> None:
         """중계 주소가 그대로 게시된 경우를 기록합니다.
 
         **게시자와 발급 대상을 구분합니다.** 남의 주소를 올렸으면 유출이
         분명하지만, 자기 주소를 올린 것은 "이거 눌러도 안 돼요" 하고
         문의하다 붙여넣은 것일 수 있습니다. 둘을 같은 제목·같은 색으로
         올리면 관리자가 문의한 사람을 유출자로 오해합니다.
+
+        **여러 개를 한꺼번에 뿌리는 쪽이 더 위험합니다** — 남의 주소를
+        모아 둔 사람이니까요. 첫 번째만 보고 넘어가면 그 사실이 묻힙니다.
         """
         guild = message.guild
+        poster = str(message.author.id)
 
-        owner_id = ""
-        owner_name = ""
-        # 아직 살아있는 토큰이면 메모리에서 바로 나옵니다(소비하지 않습니다).
-        alive = link_tokens.peek_owner(token)
-        if alive and alive[0] == guild.id:
-            owner_id = str(alive[1])
-        if not owner_id:
-            # 토큰은 90초면 죽지만 발급 기록은 30일 남습니다.
-            found = await find_issued_to(guild.id, token)
-            if found:
-                owner_id = found.get("user_id") or ""
-                owner_name = found.get("user_name") or ""
+        owners: list[str] = []                 # 발급 대상 (중복 없이, 순서 유지)
+        owner_names: dict[str, str] = {}
+        unknown = 0
 
-        by_owner = bool(owner_id) and str(message.author.id) == owner_id
+        for token in tokens[:MAX_RELAY_TOKENS]:
+            owner_id = ""
+            # 아직 살아있는 토큰이면 메모리에서 바로 나옵니다(소비하지 않습니다).
+            alive = link_tokens.peek_owner(token)
+            if alive and alive[0] == guild.id:
+                owner_id = str(alive[1])
+            if not owner_id:
+                # 토큰은 90초면 죽지만 발급 기록은 30일 남습니다.
+                found = await find_issued_to(guild.id, token)
+                if found:
+                    owner_id = str(found.get("user_id") or "")
+                    if owner_id and found.get("user_name"):
+                        owner_names[owner_id] = found["user_name"]
+            if not owner_id:
+                unknown += 1
+                continue
+            if owner_id not in owners:
+                owners.append(owner_id)
 
-        if not owner_id:
+        others = [o for o in owners if o != poster]
+        by_owner = bool(owners) and not others
+
+        if not owners:
             verdict = ("발급 기록을 찾지 못했습니다 — 30일이 지났거나 "
                        "이 서버에서 발급한 주소가 아닙니다.")
         elif by_owner:
@@ -2237,11 +2287,13 @@ class LinkGuard(commands.Cog):
                        "남에게 넘기려던 것일 수도, 안 열린다고 문의하다 "
                        "붙여넣은 것일 수도 있습니다. 확인해 주세요.")
         else:
-            who = f"<@{owner_id}>"
-            if owner_name:
-                who += f" (**{owner_name}**)"
+            who = ", ".join(
+                f"<@{o}>" + (f" (**{owner_names[o]}**)" if owner_names.get(o) else "")
+                for o in others)
             verdict = (f"**다른 사람에게 발급된 주소**입니다 — {who}.\n"
                        "게시자가 그 사람에게 받았거나, 그 사람이 넘긴 것입니다.")
+            if len(others) > 1:
+                verdict = (f"🚨 **{len(others)}명분을 모아** 뿌렸습니다.\n" + verdict)
 
         deleted = False
         if settings.get("auto_delete_leak", True):
@@ -2255,11 +2307,11 @@ class LinkGuard(commands.Cog):
         # 남겨 봐야 소유자는 이미 위에서 특정했습니다.
         await add_click_log(
             guild.id, message.author.id, message.author.display_name,
-            f"(중계 주소) /j/{token[:8]}…",
+            f"(중계 주소 {len(tokens)}개) /j/{tokens[0][:8]}…",
             event_type="leak",
             detail=(f"#{message.channel} 채널에 중계 주소 게시 / "
                     + ("본인 주소" if by_owner
-                       else f"발급 대상 {owner_id}" if owner_id
+                       else f"발급 대상 {len(others)}명" if others
                        else "발급 기록 없음")),
         )
 
@@ -2275,11 +2327,17 @@ class LinkGuard(commands.Cog):
             value=f"**{message.author.display_name}**\n`{message.author.id}`",
             inline=True
         )
-        embed.add_field(
-            name="🎫 발급 대상",
-            value=(f"<@{owner_id}>\n`{owner_id}`" if owner_id else "기록 없음"),
-            inline=True
-        )
+        if owners:
+            listed = " ".join(f"<@{o}>" for o in owners[:10])
+            if unknown:
+                listed += f"\n-# 기록을 못 찾은 주소 {unknown}개"
+            embed.add_field(name=f"🎫 발급 대상 ({len(owners)}명)",
+                            value=listed, inline=True)
+        else:
+            embed.add_field(name="🎫 발급 대상", value="기록 없음", inline=True)
+        if len(tokens) > 1:
+            embed.add_field(name="🔗 게시된 주소 수",
+                            value=f"**{len(tokens)}개**", inline=True)
         embed.add_field(name="🧭 판정", value=verdict, inline=False)
         embed.add_field(
             name="🧹 조치",
@@ -2305,12 +2363,19 @@ class LinkGuard(commands.Cog):
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         # 임베드가 전송 직후가 아니라 나중에 붙는 경우를 대비합니다
-        if before.embeds or not after.embeds:
-            return
+        if not before.embeds and after.embeds:
+            try:
+                await self._guard_message(after)
+            except Exception as e:
+                print(f"[LinkGuard] on_message_edit 처리 오류: {e}", flush=True)
+
+        # **보낸 뒤 고쳐서 링크를 끼워 넣는 회피를 막습니다.**
+        # 깨끗한 글을 올리면 on_message 는 그냥 지나가고, 그 뒤 수정해도
+        # 다시 불리지 않습니다. 수정본도 같은 눈으로 봐야 합니다.
         try:
-            await self._guard_message(after)
+            await self._detect_leak(after)
         except Exception as e:
-            print(f"[LinkGuard] on_message_edit 처리 오류: {e}", flush=True)
+            print(f"[LinkGuard] 유출 감지(수정) 오류: {e}", flush=True)
 
     @app_commands.command(name="링크보호설정", description="[관리자 전용] 웹훅 임베드의 링크를 인증 유저 전용으로 보호합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.

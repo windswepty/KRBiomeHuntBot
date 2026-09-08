@@ -8,6 +8,7 @@
 
 import os
 import json
+import re
 import time
 import asyncio
 import hashlib
@@ -804,6 +805,15 @@ async def get_link_usage(guild_id: int, message_id: int) -> list[dict]:
     return rows
 
 
+_ISSUED_TOKEN_RE = re.compile(r"/j/([A-Za-z0-9_\-]+)")
+
+
+def _issued_token(value: str) -> str:
+    """발급 주소에서 토큰만 뽑습니다. 토큰만 들어오면 그대로 씁니다."""
+    m = _ISSUED_TOKEN_RE.search(value or "")
+    return m.group(1) if m else ""
+
+
 async def find_issued_to(guild_id: int, needle: str) -> dict | None:
     """발급 주소(또는 그 안의 토큰)로 **누구에게 준 링크인지** 되찾습니다.
 
@@ -818,6 +828,10 @@ async def find_issued_to(guild_id: int, needle: str) -> dict | None:
     if not needle:
         return None
     str_gid = str(guild_id)
+    # **부분 문자열로 맞추면 안 됩니다.** 모든 주소에 들어 있는 조각
+    # (예: 도메인)을 넘기면 아무나 짚혀서, 엉뚱한 사람이 유출자로
+    # 지목됩니다. 양쪽에서 토큰만 뽑아 정확히 비교합니다.
+    wanted = _issued_token(needle) or needle
 
     def _hit(uid, info: dict, message_id) -> dict:
         return {
@@ -834,7 +848,7 @@ async def find_issued_to(guild_id: int, needle: str) -> dict | None:
                 for doc in usage_col.find({"guild_id": str_gid},
                                           {"users": 1, "message_id": 1}):
                     for uid, info in (doc.get("users") or {}).items():
-                        if needle in (info.get("link") or ""):
+                        if _issued_token(info.get("link")) == wanted:
                             return _hit(uid, info, doc.get("message_id", ""))
                 return None
             return await _db(_scan)
@@ -848,7 +862,7 @@ async def find_issued_to(guild_id: int, needle: str) -> dict | None:
         if not key.startswith(prefix):
             continue
         for uid, info in (bucket or {}).items():
-            if needle in (info.get("link") or ""):
+            if _issued_token(info.get("link")) == wanted:
                 return _hit(uid, info, key[len(prefix):])
     return None
 

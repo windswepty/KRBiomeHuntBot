@@ -483,6 +483,10 @@ class Shop(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="상점", description="포인트로 다양한 상품이나 혜택, 역할을 구매합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def point_shop(self, interaction: discord.Interaction):
         settings = await get_shop_settings(interaction.guild.id)
         is_enabled = settings.get("enabled", True)
@@ -538,6 +542,10 @@ class Shop(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 이름, 상품, 가격, 재고, 역할을 관리합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def shop_settings(self, interaction: discord.Interaction):

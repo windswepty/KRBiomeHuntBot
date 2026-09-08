@@ -9,6 +9,7 @@
   ③ 조용한 실패 금지 (except: pass)
   ④ 영구 View 의 버튼은 고정 custom_id
   ⑤ 포인트를 절대값으로 덮어쓰지 않기 ($inc 만)
+  ⑥ 슬래시 명령어는 전부 guild_only (DM 에서 guild 가 None)
 """
 import sys, os, ast, io, pathlib
 
@@ -257,11 +258,43 @@ def check_points():
         print("     ", b)
 
 
+# ── ⑥ 슬래시 명령어는 전부 guild_only ──────────────────────────────
+def check_guild_only():
+    print("")
+    print("=== ⑥ 모든 슬래시 명령어는 guild_only ===")
+    print("    (DM 에서는 interaction.guild 가 None 이라 그냥 죽습니다)")
+    bad = []
+    for p in FILES:
+        if p.parts[-2] != "cogs":
+            continue
+        tree, _ = parse(p)
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.AsyncFunctionDef):
+                continue
+            decs = [ast.unparse(d) for d in n.decorator_list]
+            if not any("app_commands.command" in d for d in decs):
+                continue
+            if any("guild_only" in d for d in decs):
+                continue
+            name = n.name
+            for d in n.decorator_list:
+                if (isinstance(d, ast.Call)
+                        and "app_commands.command" in ast.unparse(d.func)):
+                    for kw in d.keywords:
+                        if kw.arg == "name":
+                            name = kw.value.value
+            bad.append(f"{rel(p)}:{n.lineno}  /{name}")
+    note(not bad, f"guild_only 없는 명령어 {len(bad)}건")
+    for b in bad[:10]:
+        print("     ", b)
+
+
 check_ephemeral()
 check_db_wrap()
 check_silent()
 check_custom_id()
 check_points()
+check_guild_only()
 
 print(f"\n  실패 {len(FAILS)}건 / 성공 {len(OKS)}건")
 for x in FAILS:

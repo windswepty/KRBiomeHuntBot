@@ -1050,6 +1050,10 @@ class Verify(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="인증시스템", description="[관리자 전용] 인증 및 링크 보호 시스템을 즉시 켜거나 끕니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def system_power(self, interaction: discord.Interaction):
@@ -1061,6 +1065,10 @@ class Verify(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="인증설정", description="[관리자 전용] 서버 인증 역할, 인증 패널 및 문구를 관리합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def verify_settings(self, interaction: discord.Interaction):

@@ -258,6 +258,10 @@ class RobloxLink(commands.Cog):
         name="로블록스연동",
         description="내 로블록스 계정을 연동합니다 (개인서버 이용 기록에 함께 남습니다)."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def roblox_link(self, interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
@@ -329,6 +333,10 @@ class RobloxLink(commands.Cog):
         name="내연동정보",
         description="내 로블록스 연동 상태를 확인합니다."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def my_link(self, interaction: discord.Interaction):
         link = await get_roblox_link(interaction.guild.id, interaction.user.id)
         if not link:
@@ -357,6 +365,10 @@ class RobloxLink(commands.Cog):
         name="연동명단",
         description="[관리자 전용] 로블록스 연동 명단을 봅니다 (게임 내 대조용)."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def roster(self, interaction: discord.Interaction):
@@ -400,6 +412,10 @@ class RobloxLink(commands.Cog):
         name="연동조회",
         description="[관리자 전용] 연동 명단을 검색합니다 (디스코드 / 로블록스 양방향)."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.describe(
         검색어="디스코드 ID·멘션, 로블록스 유저명, 또는 로블록스 숫자 ID"
     )
@@ -470,6 +486,10 @@ class RobloxLink(commands.Cog):
         name="연동해제",
         description="[관리자 전용] 특정 멤버의 로블록스 연동을 해제합니다."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.describe(member="연동을 해제할 멤버")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)

@@ -294,6 +294,10 @@ class CheckIn(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="출석", description="하루에 한 번 출석체크를 하고 포인트를 획득합니다. (연속할수록 더 많이)")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def check_in(self, interaction: discord.Interaction):
         # 블랙리스트 유저 확인
         if await is_user_blacklisted(interaction.guild.id, interaction.user.id):
@@ -387,6 +391,10 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트확인", description="현재 내가 보유한 총 포인트를 확인합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def view_points(self, interaction: discord.Interaction):
         total_points = await get_user_points(interaction.guild.id, interaction.user.id)
         embed = discord.Embed(
@@ -397,6 +405,10 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트랭킹", description="서버의 포인트 보유 순위 TOP 10을 확인합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def point_ranking(self, interaction: discord.Interaction):
         top_users = await get_top_users(interaction.guild.id, limit=10)
         my_rank, my_points = await get_user_rank(interaction.guild.id, interaction.user.id)
@@ -456,6 +468,10 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트얻는법", description="포인트를 획득하는 다양한 방법과 도움말을 확인합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def point_guide(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="💡 한바헌 포인트 획득 방법 가이드",
@@ -466,6 +482,10 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="포인트지급", description="[관리자 전용] 특정 유저에게 포인트를 지급합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.rename(member="멤버", amount="포인트")
     @app_commands.describe(member="포인트를 지급할 유저", amount="지급할 포인트 수량")
     @app_commands.default_permissions(administrator=True)
@@ -490,6 +510,10 @@ class CheckIn(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트회수", description="[관리자 전용] 특정 유저의 포인트를 회수(차감)합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.rename(member="멤버", amount="포인트")
     @app_commands.describe(member="포인트를 회수할 유저", amount="회수할 포인트 수량")
     @app_commands.default_permissions(administrator=True)
@@ -531,6 +555,10 @@ class CheckIn(commands.Cog):
         name="출석설정",
         description="[관리자 전용] 연속 출석 보상을 설정합니다."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def checkin_settings(self, interaction: discord.Interaction):

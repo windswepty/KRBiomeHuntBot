@@ -1568,6 +1568,10 @@ class Quest(commands.Cog):
         name="퀘스트",
         description="오늘의 퀘스트와 진행 상황을 확인하고 보상을 받습니다."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def quest(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
@@ -1805,6 +1809,10 @@ class Quest(commands.Cog):
         name="퀘스트설정",
         description="[관리자 전용] 퀘스트 보상 · 목표치 · 공동 목표를 관리합니다."
     )
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def quest_settings(self, interaction: discord.Interaction):

@@ -948,6 +948,10 @@ class Report(commands.Cog):
     @app_commands.command(
         name="제보",
         description="희귀 바이옴 제보 안내를 확인하고 제보 티켓을 생성합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     async def report_biome(self, interaction: discord.Interaction):
         settings = await get_report_settings(interaction.guild.id)
         is_enabled = settings.get("enabled", True)
@@ -971,6 +975,10 @@ class Report(commands.Cog):
     @app_commands.command(
         name="제보설정",
         description="[관리자 전용] 바이옴 제보 시스템의 설정을 관리합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def report_settings(self, interaction: discord.Interaction):

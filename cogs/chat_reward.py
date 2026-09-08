@@ -441,6 +441,10 @@ class ChatReward(commands.Cog):
             print(f"[Quest] 채팅 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
 
     @app_commands.command(name="채널부스트", description="[관리자 전용] 게릴라 채널 부스트 설정, 배율, 기간 및 해제를 관리합니다.")
+    # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
+    # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
+    # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
+    @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def channel_boost_settings(self, interaction: discord.Interaction):

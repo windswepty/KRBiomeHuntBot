@@ -575,6 +575,40 @@ class RemoveRequiredRoleSelect(discord.ui.Select):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class LinkedRoleModal(discord.ui.Modal, title="🎮 기본 연동 완료 역할 설정"):
+    def __init__(self, settings_interaction: discord.Interaction):
+        super().__init__()
+        self.settings_interaction = settings_interaction
+
+    role_input = discord.ui.TextInput(
+        label="역할 ID를 입력하세요",
+        placeholder="예: 1329788098187624500",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=50
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        raw = self.role_input.value.strip()
+        match = re.search(r"([0-9]{17,20})", raw)
+        
+        if not match:
+            await interaction.response.send_message("⚠️ 잘못된 ID 형식입니다. 17~20자리 숫자를 입력해 주세요.", ephemeral=True)
+            return
+            
+        rid = int(match.group(1))
+        role = guild.get_role(rid)
+        
+        if not role:
+            await interaction.response.send_message(f"⚠️ 서버에서 `{rid}` 역할을 찾을 수 없습니다.\n-# 역할 우클릭 → ID 복사 로 올바른 ID를 가져와 주세요.", ephemeral=True)
+            return
+
+        await save_verify_settings(guild.id, {"linked_role_id": rid})
+        await interaction.response.send_message(f"✅ 기본 연동 완료 역할을 {role.mention} (으)로 설정했습니다.", ephemeral=True)
+        await refresh_settings_panel(self.settings_interaction, discord.Embed(title="✅ 설정 완료", color=discord.Color.green()))
+
+
 class RequiredRoleView(discord.ui.View):
     def __init__(self, role_ids: list[int], guild: discord.Guild):
         super().__init__(timeout=180)
@@ -638,6 +672,12 @@ class VerifySettingsSelect(discord.ui.Select):
                 value="toggle",
                 description=enabled_desc,
                 emoji="⚡"
+            ),
+            discord.SelectOption(
+                label="기본 연동 완료 역할 설정",
+                value="linkedrole",
+                description=("현재: " + (f"@{guild.get_role(int(current['linked_role_id'])).name}" if current.get("linked_role_id") and guild.get_role(int(current["linked_role_id"])) else "미설정") + " — 연동 즉시 자동 부여")[:95],
+                emoji="🎮"
             ),
             discord.SelectOption(
                 label="인증 역할 설정",
@@ -726,6 +766,41 @@ class VerifySettingsSelect(discord.ui.Select):
             embed.set_footer(text="역할 우클릭 → ID 복사 로 ID를 얻을 수 있습니다")
             await interaction.response.send_message(
                 embed=embed, view=RequiredRoleView(required, guild), ephemeral=True)
+
+        elif choice == "linkedrole":
+            linked_role_id = settings.get("linked_role_id")
+            role = guild.get_role(int(linked_role_id)) if linked_role_id else None
+            embed = discord.Embed(
+                title="🎮 기본 연동 완료 역할 설정",
+                description=("이 역할은 유저가 **로블록스 연동을 마치는 즉시 봇이 자동으로 부여**합니다.\n"
+                             "이 역할에 채널 보기 권한을 주고 everyone에게서 뺏으면, **서버 입장 후 연동을 강제**할 수 있습니다.\n\n"
+                             "역할을 해제하려면 **해제** 버튼을, 새로 지정하려면 **설정** 버튼을 누르세요."),
+                color=discord.Color.blurple()
+            )
+            embed.add_field(
+                name="현재 설정된 역할",
+                value=f"{role.mention} (`{linked_role_id}`)" if role else "⚠️ 아직 설정되지 않았습니다."
+            )
+            
+            view = discord.ui.View(timeout=180)
+            
+            async def _on_clear(i: discord.Interaction):
+                await save_verify_settings(guild.id, {"linked_role_id": None})
+                await i.response.send_message("기본 연동 완료 역할이 해제되었습니다.", ephemeral=True)
+                await refresh_settings_panel(interaction, discord.Embed(title="✅ 해제 완료", color=discord.Color.green()))
+                
+            async def _on_set(i: discord.Interaction):
+                await i.response.send_modal(LinkedRoleModal(interaction))
+                
+            clear_btn = discord.ui.Button(label="역할 해제", style=discord.ButtonStyle.danger, disabled=not role)
+            clear_btn.callback = _on_clear
+            set_btn = discord.ui.Button(label="역할 ID로 설정", style=discord.ButtonStyle.success)
+            set_btn.callback = _on_set
+            
+            view.add_item(set_btn)
+            view.add_item(clear_btn)
+            
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
         elif choice == "reqroblox":
             new_state = not settings.get("require_roblox", False)

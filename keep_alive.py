@@ -11,6 +11,11 @@ from utils import oauth_gate, roblox_oauth
 from utils import health
 
 app = Flask(__name__)
+_bot = None
+
+def set_bot(b):
+    global _bot
+    _bot = b
 
 # Suppress flask default logs to keep console clean
 log = logging.getLogger('werkzeug')
@@ -674,6 +679,15 @@ def roblox_callback():
 
     print(f"[RobloxOAuth] 연동 성공: discord={pending['user_id']} "
           f"roblox={info['roblox_id']}({info['roblox_name']})", flush=True)
+
+    if _bot is not None:
+        try:
+            _bot.loop.call_soon_threadsafe(
+                _bot.dispatch, "roblox_linked", pending["guild_id"], pending["user_id"]
+            )
+        except Exception as e:
+            print(f"[RobloxOAuth] 봇 이벤트 발송 실패: {e}", flush=True)
+
     return _page("rbx_ok", status=200)
 
 

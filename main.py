@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from keep_alive import keep_alive
+import keep_alive as ka
 from utils import health
 
 # Load environment variables
@@ -415,7 +415,8 @@ def _run_with_429_retry():
     # 응답해야 Render 가 프로세스를 강제 종료하지 않습니다.
     check_single_home_or_die()
     check_storage_or_die()
-    keep_alive()
+    ka.set_bot(bot)
+    ka.keep_alive()
 
     for attempt in range(1, MAX_429_RETRIES + 1):
         try:

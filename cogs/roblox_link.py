@@ -599,6 +599,29 @@ class RobloxLink(commands.Cog):
 
     # ── 멤버용 ────────────────────────────────────────────────────────
 
+    @commands.Cog.listener()
+    async def on_roblox_linked(self, guild_id: int, user_id: int):
+        """로블록스 연동이 성공하면 발생하는 이벤트를 처리합니다."""
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        
+        member = guild.get_member(user_id)
+        if not member:
+            return
+            
+        settings = await get_verify_settings(guild_id)
+        linked_role_id = settings.get("linked_role_id")
+        
+        if linked_role_id:
+            role = guild.get_role(int(linked_role_id))
+            if role and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="로블록스 계정 자동 연동 완료")
+                    print(f"[RobloxLink] {member} 에게 연동 완료 역할({role.name})을 부여했습니다.", flush=True)
+                except Exception as e:
+                    print(f"[RobloxLink] 역할 부여 실패: {e}", flush=True)
+
     @app_commands.command(
         name="로블록스연동",
         description="내 로블록스 계정을 연동합니다 (개인서버 이용 기록에 함께 남습니다)."

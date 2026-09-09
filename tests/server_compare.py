@@ -289,6 +289,9 @@ async def main():
     got, _ = await RL.resolve_link_target(
         GUILD, "https://discord.com/channels/1/222/" + str(LOGM))
     note(got == PROT, "메시지 링크를 붙여넣어도 됨", str(got))
+    real_url = f"https://discord.com/channels/1325960789462618182/1329788098187624500/{LOGM}"
+    got, _ = await RL.resolve_link_target(GUILD, real_url)
+    note(got == PROT, "실제 18자리 서버/채널 ID가 포함된 메시지 링크도 인식", str(got))
     got, _ = await RL.resolve_link_target(GUILD, str(USED))
     note(got == USED, "보호 기록(7일)이 지워져도 사용 기록(30일)으로 찾아냄")
 

@@ -295,6 +295,24 @@ async def main():
     note(full is not None and full["user_id"] == str(owner.id),
          "주소 전체를 넣어도 찾아짐", str(full))
 
+    print("")
+    print("=== 14. 개인서버 코드 직접 게시(bare code) 및 대문자 주소 감지 ===")
+    bare_ps_code = "c26ae66df0241bba12345678"
+    await vdb.register_guarded_keys(GUILD.id, [f"ps:{bare_ps_code}"])
+    LOG.sent.clear()
+    bare_msg = post(other, f"야 서버 코드 {bare_ps_code} 이거 복사해서 들어와", 7500)
+    await lg._detect_leak(bare_msg)
+    await drain()
+    note(bare_msg.deleted is True, "URL 없는 개인서버 코드 단독 게시도 삭제함")
+    note(bool(LOG.sent), "코드 단독 게시도 로그 알림을 전송함")
+
+    LOG.sent.clear()
+    upper_msg = post(other, f"HTTPS://WWW.ROBLOX.COM/GAMES/SHARE?CODE={bare_ps_code}&TYPE=SERVER", 7501)
+    await lg._detect_leak(upper_msg)
+    await drain()
+    note(upper_msg.deleted is True, "대문자 HTTPS URL 도 삭제함")
+    note(bool(LOG.sent), "대문자 URL 도 로그 알림을 전송함")
+
 asyncio.run(main())
 print("\n  실패 " + str(len(F.FAILS)) + "건 / 성공 " + str(len(F.OKS)) + "건")
 for x in F.FAILS:

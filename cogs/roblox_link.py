@@ -377,6 +377,8 @@ async def compare_players(guild, raw_text: str,
     not_received: list[str] = []
     unknown: list[str] = []
     report: list[str] = []
+    seen_received_uids: set[str] = set()
+    seen_not_received_uids: set[str] = set()
 
     for name in names:
         rows = index.get(normalize_name(name)) or []
@@ -388,11 +390,15 @@ async def compare_players(guild, raw_text: str,
             uid = str(row.get("user_id"))
             got = usage.get(uid)
             if got:
-                received.append(f"<@{uid}>")
+                if uid not in seen_received_uids:
+                    seen_received_uids.add(uid)
+                    received.append(f"<@{uid}>")
                 report.append(f"[받아 감]\t{name}\t{uid}\t"
                               f"링크 {got['links']}개\t{got.get('last', '')}")
             else:
-                not_received.append(f"<@{uid}>")
+                if uid not in seen_not_received_uids:
+                    seen_not_received_uids.add(uid)
+                    not_received.append(f"<@{uid}>")
                 report.append(f"[받은 기록 없음]\t{name}\t{uid}")
 
     suspicious = len(not_received) + len(unknown)
@@ -508,12 +514,12 @@ async def resolve_link_target(guild, raw: str):
 
     반환: `(message_id, 안내문)` / 못 찾으면 `(None, 사유)`
     """
-    m = _MSG_ID_RE.search(raw or "")
-    if not m:
+    matches = _MSG_ID_RE.findall(raw or "")
+    if not matches:
         return None, ("메시지 ID 나 메시지 링크를 넣어 주세요.\n"
                       "-# 메시지 우클릭 → **메시지 ID 복사** "
                       "(개발자 모드가 켜져 있어야 보입니다)")
-    mid = int(m.group(1))
+    mid = int(matches[-1])
 
     # ① 보호된 임베드 자체
     if await get_protected_link(guild.id, mid):
@@ -895,32 +901,34 @@ class RobloxLink(commands.Cog):
 
     @app_commands.command(
         name="연동해제",
-        description="[관리자 전용] 특정 멤버의 로블록스 연동을 해제합니다."
+        description="[관리자 전용] 특정 유저의 로블록스 연동을 해제합니다."
     )
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
     # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
-    @app_commands.describe(member="연동을 해제할 멤버")
+    @app_commands.describe(user="연동을 해제할 유저")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
-    async def unlink(self, interaction: discord.Interaction, member: discord.Member):
-        removed = await remove_roblox_link(interaction.guild.id, member.id)
+    async def unlink(self, interaction: discord.Interaction, user: discord.User):
+        removed = await remove_roblox_link(interaction.guild.id, user.id)
         embed = discord.Embed(
             title="🔗 연동 해제" if removed else "ℹ️ 연동 정보 없음",
-            description=(f"{member.mention} 님의 로블록스 연동을 해제했습니다.\n"
+            description=(f"{user.mention} 님의 로블록스 연동을 해제했습니다.\n"
                          "본인이 `/로블록스연동` 으로 다시 등록할 수 있습니다."
                          if removed else
-                         f"{member.mention} 님은 연동된 계정이 없습니다."),
+                         f"{user.mention} 님은 연동된 계정이 없습니다."),
             color=discord.Color.orange() if removed else discord.Color.greyple())
 
         # 연동을 필수로 걸어둔 서버에서 연동만 지우고 인증 역할을 남겨두면,
         # '링크를 받아간 사람은 전원 연동돼 있다'는 전제가 깨집니다.
         # 그래서 인증 역할도 함께 회수합니다.
         if removed:
-            note = await self._revoke_verify_if_required(interaction.guild, member)
-            if note:
-                embed.add_field(name="♻️ 인증 역할", value=note, inline=False)
+            member = interaction.guild.get_member(user.id)
+            if member:
+                note = await self._revoke_verify_if_required(interaction.guild, member)
+                if note:
+                    embed.add_field(name="♻️ 인증 역할", value=note, inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

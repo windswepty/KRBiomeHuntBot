@@ -2170,7 +2170,7 @@ class LinkGuard(commands.Cog):
             return
 
         content = message.content or ""
-        if "http" not in content and "#hbh-" not in content:
+        if not content:
             return
 
         settings = await get_linkguard_settings(guild.id)
@@ -2185,7 +2185,24 @@ class LinkGuard(commands.Cog):
                 await self._report_relay_leak(message, settings, relay)
             return
 
+        # 빠른 탈출: URL도 없고 워터마크도 없으면, 보호된 개인서버 코드(bare code)가
+        # 본문에 포함되어 있는지 확인합니다. 셋 다 없으면 즉시 종료합니다.
+        lowered = content.lower()
+        has_url = "http://" in lowered or "https://" in lowered
+        has_mark = "#hbh-" in lowered or "hbh-" in lowered
+
         guarded = await get_guarded_keys(guild.id)
+
+        bare_code = None
+        if not has_url and not has_mark:
+            for key in guarded:
+                code = key.split(":", 1)[-1]
+                if len(code) >= 8 and code in lowered:
+                    bare_code = code
+                    break
+            if not bare_code:
+                return
+
         found_urls = [clean_url(u) for u in URL_RE.findall(content)]
 
         leaked = [u for u in found_urls if link_key(u) in guarded]
@@ -2193,9 +2210,7 @@ class LinkGuard(commands.Cog):
         # URL 형태가 아니어도 잡습니다.
         #  · 개인서버 코드만 복사해 전달한 경우 (예: "코드 c26ae66d… 이거 써")
         #  · 워터마크 코드만 남은 경우
-        bare_code = None
-        if not leaked:
-            lowered = content.lower()
+        if not leaked and not bare_code:
             for key in guarded:
                 code = key.split(":", 1)[-1]
                 if len(code) >= 8 and code in lowered:

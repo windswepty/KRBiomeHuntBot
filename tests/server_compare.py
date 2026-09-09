@@ -264,6 +264,7 @@ async def main():
     note(RO.fetch_names([None, "x", -1, 0]) == {},
          "이상한 값은 걸러 냄 (예외 없이)")
     RO._request = orig_request
+    RO.fetch_names = fetch
     RO.clear()
 
     print("")
@@ -326,6 +327,45 @@ async def main():
     note("링크 하나" in (e15.description or ""),
          "어느 범위로 봤는지 화면에 남김", (e15.description or "")[:40])
     note("모든 링크" in (e14.description or ""), "전체로 봤을 때도 범위를 밝힘")
+
+    print("")
+    print("=== 15. 부계정(알트) 교차대조 ===")
+    # 시나리오: 유저 61 이 링크를 받아 "AliceMain"(연동 계정)으로 접속 안 하고
+    # 부계정 "AliceAlt"로 접속함 → AliceAlt 은 연동 명단에 없어 🚨,
+    # 유저 61 은 링크를 받았지만 게임 안에 연동 닉이 없어 🔍 에 뜸
+    await vdb.save_roblox_link(GUILD.id, 61, 3001, "AliceMain", method="oauth")
+    await vdb.save_roblox_link(GUILD.id, 62, 3002, "BobMain", method="oauth")
+    fake_names.clear()
+    fake_names[3001] = {"name": "AliceMain", "display": "AliceMain"}
+    fake_names[3002] = {"name": "BobMain", "display": "BobMain"}
+    # 61, 62 모두 같은 링크를 받아 감
+    await vdb.record_link_usage(GUILD.id, 7001, 61, "AliceMain",
+                                issued_url="https://relay.test/j/alt1")
+    await vdb.record_link_usage(GUILD.id, 7001, 62, "BobMain",
+                                issued_url="https://relay.test/j/alt2")
+
+    # 게임 안 명단: BobMain(정상) + AliceAlt(미확인) → AliceMain 은 안 보임
+    e16, _ = await RL.compare_players(
+        GUILD, "BobMain\nAliceAlt", message_id=7001)
+    alt_name, alt_val = find_field(e16, "🔍 부계정 의심")
+    note(alt_name is not None, "미확인 플레이어가 있으면 교차대조 필드가 뜸",
+         str(alt_name))
+    if alt_val:
+        note("<@61>" in alt_val, "AliceMain 의 주인(61)이 용의자로 표시됨", alt_val)
+        note("AliceMain" in alt_val, "연동 닉네임도 함께 표시됨", alt_val)
+    note("<@62>" not in (alt_val or ""),
+         "BobMain 은 게임 안에 있으므로 용의자에서 제외됨")
+
+    # 미확인 플레이어가 없으면 교차대조 필드가 안 뜸
+    e17, _ = await RL.compare_players(
+        GUILD, "BobMain\nAliceMain", message_id=7001)
+    note(find_field(e17, "🔍 부계정 의심")[0] is None,
+         "미확인 플레이어가 없으면 교차대조를 보여주지 않음")
+
+    # 전체 범위에서도 작동
+    e18, _ = await RL.compare_players(GUILD, "BobMain\nAliceAlt")
+    alt_name18, alt_val18 = find_field(e18, "🔍 부계정 의심")
+    note(alt_name18 is not None, "전체 범위에서도 교차대조 작동")
 
 asyncio.run(main())
 print("\n  실패 " + str(len(F.FAILS)) + "건 / 성공 " + str(len(F.OKS)) + "건")

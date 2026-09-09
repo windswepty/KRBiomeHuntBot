@@ -442,6 +442,60 @@ async def compare_players(guild, raw_text: str,
                    + _join_capped([f"`{n}`" for n in unknown], 700)),
             inline=False)
 
+    # ── 부계정(알트) 교차대조 ──────────────────────────────────────────
+    # 미확인 플레이어가 있으면, "링크를 받았는데 게임 안에 연동 닉이 없는
+    # 사람"을 추려 용의자로 보여줍니다. 그 사람이 부계정으로 접속한 것일
+    # 수 있기 때문입니다. 미확인 인원이 없으면 보여줄 이유가 없습니다.
+    if unknown and usage:
+        name_pool = {normalize_name(n) for n in names}
+        absent: list[str] = []      # 받았지만 게임 안에 이름이 없는 사람
+        for uid, info in usage.items():
+            # 이미 게임 안에서 확인된(received) 유저는 제외
+            if uid in seen_received_uids:
+                continue
+            # 이 유저의 연동 이름이 게임 안에 있는지 확인
+            found_in_game = False
+            for row in links:
+                if str(row.get("user_id")) != uid:
+                    continue
+                rid = 0
+                try:
+                    rid = int(row.get("roblox_id") or 0)
+                except (TypeError, ValueError):
+                    pass
+                cur = fresh.get(rid) or {}
+                for candidate in (row.get("roblox_name"),
+                                  cur.get("name"), cur.get("display")):
+                    if normalize_name(candidate or "") in name_pool:
+                        found_in_game = True
+                        break
+                if found_in_game:
+                    break
+            if not found_in_game:
+                roblox_name = ""
+                for row in links:
+                    if str(row.get("user_id")) == uid:
+                        rid = 0
+                        try:
+                            rid = int(row.get("roblox_id") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                        cur = fresh.get(rid) or {}
+                        roblox_name = (cur.get("name")
+                                       or row.get("roblox_name") or "?")
+                        break
+                if roblox_name:
+                    absent.append(f"<@{uid}> (연동: `{roblox_name}`)")
+                else:
+                    absent.append(f"<@{uid}>")
+        if absent:
+            embed.add_field(
+                name=f"🔍 부계정 의심 — 교차대조 ({len(absent)}명)",
+                value=("링크를 받았지만 **연동 닉네임이 게임 안에 없는** 사람입니다.\n"
+                       "부계정(알트)으로 접속했을 가능성이 있습니다.\n"
+                       + _join_capped(absent, 700)),
+                inline=False)
+
     # 일부만 실패해도 알려야 합니다. 전부 실패했을 때만 알리면,
     # 절반이 낡은 이름으로 대조된 결과를 관리자가 그대로 믿습니다.
     unresolved = len(links) - len(fresh)

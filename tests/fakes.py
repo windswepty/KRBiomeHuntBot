@@ -28,6 +28,9 @@ class Role:
         self.id, self.name, self.position = rid, name, position
         self.mention = f"<@&{rid}>"
         self.managed = False
+        # 실제 디스코드 역할에는 이 값이 있습니다. 대부분의 알림 역할은
+        # False 이고, 그러면 봇이 핑을 울리려면 별도 권한이 필요합니다.
+        self.mentionable = False
 
     def __repr__(self):
         return f"<Role {self.name}>"

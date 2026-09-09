@@ -262,6 +262,64 @@ async def main():
          "원본 URL 그대로 리다이렉트")
 
     await bot.close()
+    print("")
+    print("=== 원본이 울리던 역할 멘션이 재게시본에도 살아야 ===")
+    # 매크로가 희귀 바이옴을 **역할 멘션으로** 알리는 채널이 있습니다.
+    # 본문이 `<@&역할>` + 링크 한 줄인 형태라, 재게시하면서 이게 빠지면
+    # 사람들은 바이옴이 뜬 것을 아예 모릅니다.
+    await vdb.save_linkguard_settings(GUILD.id, {
+        "enabled": True, "channel_ids": [ch.id], "category_ids": [],
+        "roblox_only": True, "exception_channel_ids": []})
+
+    biome = Role(1442029067535646773, "Starfall", 5)
+    ch.sent.clear()
+    mm = Msg(6100, ch, Member(9, "웹훅", False, guild=GUILD))
+    mm.content = f"{biome.mention}\n{ROBLOX}"
+    mm.role_mentions = [biome]
+    mm.webhook_id, mm.guild = 12345, GUILD
+    await lg.on_message(mm)
+    await drain()
+
+    sent = ch.sent[-1] if ch.sent else {}
+    note(biome.mention in (sent.get("content") or ""),
+         "멘션 글자가 재게시본에 남음", (sent.get("content") or "")[:40])
+    note("roblox.com" not in (sent.get("content") or ""),
+         "링크는 여전히 가려짐 (멘션만 살리는 것)")
+
+    am = sent.get("allowed_mentions")
+    note(am is not None,
+         "allowed_mentions 를 명시함 (라이브러리 기본값에 기대지 않음)")
+    note(am is not None and [r.id for r in (am.roles or [])] == [biome.id],
+         "그 역할만 울리도록 지정", str(am and am.roles))
+    note(am is not None and am.everyone is False,
+         "원본에 @everyone 이 없었으니 울리지 않음")
+    note(am is not None and am.users is False,
+         "유저 멘션은 다시 울리지 않음 (같은 사람에게 두 번 가면 이상합니다)")
+
+    print("")
+    print("--- @everyone 이 있던 원본이면 그것도 살려야 ---")
+    ch.sent.clear()
+    me2 = Msg(6101, ch, Member(9, "웹훅", False, guild=GUILD))
+    me2.content = f"@everyone\n{ROBLOX}"
+    me2.mention_everyone = True
+    me2.webhook_id, me2.guild = 12345, GUILD
+    await lg.on_message(me2)
+    await drain()
+    am2 = (ch.sent[-1] if ch.sent else {}).get("allowed_mentions")
+    note(am2 is not None and am2.everyone is True, "@everyone 을 그대로 울림")
+
+    print("")
+    print("--- 멘션이 없던 원본은 아무것도 울리지 않아야 ---")
+    ch.sent.clear()
+    m0 = Msg(6102, ch, Member(9, "웹훅", False, guild=GUILD))
+    m0.content = ROBLOX
+    m0.webhook_id, m0.guild = 12345, GUILD
+    await lg.on_message(m0)
+    await drain()
+    am3 = (ch.sent[-1] if ch.sent else {}).get("allowed_mentions")
+    note(am3 is not None and am3.everyone is False and not am3.roles,
+         "울릴 것이 없으면 빈 채로 보냄")
+
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
     for x in F.FAILS:
         print("   -", x)

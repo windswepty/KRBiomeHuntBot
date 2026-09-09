@@ -2272,11 +2272,40 @@ class LinkGuard(commands.Cog):
 
         view = ProtectedLinkView(button_label=settings.get("button_label", "🎮 개인서버 입장하기"))
 
+        # 원본이 울리던 알림을 그대로 살립니다.
+        # **매크로가 희귀 바이옴을 역할 멘션으로 알리는 채널이 있습니다**
+        # (본문이 `<@&역할>` + 링크 한 줄인 형태). 재게시하면서 이게 빠지면
+        # 사람들은 바이옴이 뜬 걸 아예 모릅니다.
+        #
+        # 라이브러리 기본값에 맡기지 않고 **명시**합니다. 지금은 기본값이
+        # 멘션을 허용하지만, 나중에 누가 Bot(allowed_mentions=...) 를 주는
+        # 순간 이 알림이 조용히 죽습니다.
+        allowed = discord.AllowedMentions(
+            everyone=message.mention_everyone,
+            roles=list(message.role_mentions) or False,
+            # 유저 멘션까지 다시 울릴 이유는 없습니다. 원본은 이미 지워졌고,
+            # 같은 사람에게 두 번 알림이 가는 것이 더 이상합니다.
+            users=False,
+            replied_user=False,
+        )
+
+        # 멘션이 있는데 울릴 권한이 없으면 **글자만 남고 알림은 안 갑니다.**
+        # 조용히 지나가면 "왜 알림이 안 오지?" 를 아무도 못 풉니다.
+        needs_perm = message.mention_everyone or any(
+            not r.mentionable for r in message.role_mentions)
+        if needs_perm and perms is not None and not perms.mention_everyone:
+            print(
+                f"[LinkGuard] #{message.channel} 원본의 멘션을 다시 울릴 수 "
+                "없습니다 — 봇에게 '@everyone, @here, 모든 역할 멘션' 권한을 "
+                "주세요. 지금은 멘션 글자만 남고 알림은 가지 않습니다.",
+                flush=True)
+
         try:
             sent = await message.channel.send(
                 content=clean_content or None,
                 embeds=sanitized_embeds,
-                view=view
+                view=view,
+                allowed_mentions=allowed,
             )
         except Exception as e:
             print(f"[LinkGuard] 보호 메시지 재전송 중 오류: {e}", flush=True)

@@ -779,6 +779,26 @@ class RobloxLink(commands.Cog):
                 description=f"`{query[:80]}` 로 연동된 기록을 찾지 못했습니다.",
                 color=discord.Color.orange()
             )
+            
+            # 연동 기록은 없지만, 디스코드 이름(별명, 유저명)이 비슷한 사람이 서버에 있는지 확인합니다.
+            query_lower = query.lower()
+            similar_members = []
+            for m in guild.members:
+                if query_lower in m.display_name.lower() or query_lower in m.name.lower():
+                    similar_members.append(m)
+                    if len(similar_members) >= 5:  # 너무 많이 나오면 자름
+                        break
+                        
+            if similar_members:
+                mentions = []
+                for m in similar_members:
+                    mentions.append(f"• {m.mention} (`{m.display_name}` / `{m.name}`)")
+                embed.add_field(
+                    name="💡 혹시 이 분인가요? (미연동 상태)",
+                    value="현재 서버에 검색어와 이름이 일치하는 멤버가 있습니다.\n" + "\n".join(mentions) + "\n-# 위 사람이라면 아직 로블록스 연동을 하지 않은 것입니다.",
+                    inline=False
+                )
+
             # 게임에서 본 이름이 안 나온다는 것 자체가 중요한 신호입니다.
             embed.add_field(
                 name="⚠️ 게임 안에서 본 이름인가요?",

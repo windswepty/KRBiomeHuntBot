@@ -2314,19 +2314,23 @@ class LinkGuard(commands.Cog):
         if not settings.get("enabled", True):
             return
 
-        base = resolve_base_channel(message.channel)
-        if base:
-            exc_ids = settings.get("exception_channel_ids", [])
-            if base.id in exc_ids or (getattr(base, "category_id", None) in exc_ids):
-                return
-
         # 중계 주소는 판정 근거가 달라(발급 기록으로 소유자가 특정됩니다)
         # 별도 경로로 처리합니다.
+        # **예외 채널에서도 이것만은 봅니다.** `/j/` 는 한 사람에게만
+        # 발급된 개인 주소라 어느 채널에서든 올라올 정당한 이유가 없습니다.
+        # 여기까지 면제하면 그 채널이 그대로 유출 통로가 됩니다.
         relay = relay_tokens_in(content)
         if relay:
             if not _already_reported(message.id):
                 await self._report_relay_leak(message, settings, relay)
             return
+
+        # 사람이 자기 개인서버를 정상적으로 공유하는 채널은 여기서 빠집니다.
+        base = resolve_base_channel(message.channel)
+        if base:
+            exc_ids = settings.get("exception_channel_ids", [])
+            if base.id in exc_ids or (getattr(base, "category_id", None) in exc_ids):
+                return
 
         # 빠른 탈출: URL도 없고 워터마크도 없으면, 보호된 개인서버 코드(bare code)가
         # 본문에 포함되어 있는지 확인합니다. 셋 다 없으면 즉시 종료합니다.

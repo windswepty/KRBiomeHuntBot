@@ -283,6 +283,90 @@ async def test_link_check():
     RL.list_roblox_links = original
 
 
+async def test_linked_role():
+    """연동 완료 역할 자동 부여 — **실패하면 그 사람은 빈 서버를 봅니다.**
+
+    이 역할로만 채널을 여는 구조라, 부여가 조용히 실패하면 연동을 마친
+    사람이 아무것도 못 보고 운영진은 원인을 알 수 없습니다.
+    """
+    print("")
+    print("=== 연동 완료 역할 자동 부여 ===")
+    from utils.verify_db import save_verify_settings
+    import cogs.verify as V
+
+    guild = F.GUILD
+
+    class Bot:
+        def get_guild(self, gid):
+            return guild if gid == guild.id else None
+
+    cog = RL.RobloxLink(Bot())
+    role = guild.get_role(901)
+    newbie = F.Member(77, "연동자", False, guild=guild)
+    guild.members.append(newbie)
+
+    await save_verify_settings(guild.id, {"linked_role_id": role.id})
+    await cog.on_roblox_linked(guild.id, newbie.id)
+    note(role in newbie.roles, "연동을 마치면 역할이 붙음")
+
+    before = len(newbie.roles)
+    await cog.on_roblox_linked(guild.id, newbie.id)
+    note(len(newbie.roles) == before, "이미 있으면 다시 주지 않음")
+
+    print("--- 부여에 실패해도 예외가 밖으로 나가면 안 됩니다 ---")
+    victim = F.Member(78, "권한없음", False, guild=guild)
+    guild.members.append(victim)
+
+    async def boom(*a, **k):
+        raise discord.Forbidden(
+            type("R", (), {"status": 403, "reason": ""})(), "no perm")
+    victim.add_roles = boom
+    try:
+        await cog.on_roblox_linked(guild.id, victim.id)
+        note(True, "권한이 없어도 예외가 전파되지 않음")
+    except Exception as e:
+        note(False, "예외가 밖으로 나감", f"{type(e).__name__}: {e}")
+
+    print("--- 건드리면 안 되는 경우 ---")
+    await save_verify_settings(guild.id, {"linked_role_id": None})
+    quiet = F.Member(79, "미설정", False, guild=guild)
+    guild.members.append(quiet)
+    await cog.on_roblox_linked(guild.id, quiet.id)
+    note(not quiet.roles, "역할이 미설정이면 아무것도 부여하지 않음")
+
+    await cog.on_roblox_linked(999999, 77)
+    note(True, "모르는 길드는 조용히 반환 (예외 없음)")
+    await cog.on_roblox_linked(guild.id, 987654321)
+    note(True, "서버에 없는 사람도 조용히 반환 (예외 없음)")
+
+    print("--- 줄 수 없는 역할을 지정하면 설정 화면이 알려야 ---")
+    # 봇 역할보다 위에 있는 역할을 고르면, 저장은 되지만 부여는 실패합니다.
+    # 그때 초록불 '설정 완료'만 뜨면 운영진은 며칠 뒤에야 알게 됩니다.
+    # 디스코드 역할 ID 는 17~19자리입니다. 모달이 그 형식만 받으므로
+    # 테스트도 실제 형태를 써야 합니다.
+    high = F.Role(154287140213725950, "봇보다위", 999)
+    guild.roles.append(high)
+    guild._roles[high.id] = high
+    it = F.Inter()
+    it.guild = guild
+    modal = V.LinkedRoleModal(F.Inter())
+    modal.role_input._value = str(high.id)
+    await modal.on_submit(it)
+    sent = (it.response.sent or [{}])[-1]
+    body = str(sent.get("embed").to_dict()) if sent.get("embed") else str(sent)
+    note("위에 있습니다" in body or "위로" in body,
+         "봇보다 위에 있는 역할이면 경고함", body[:70])
+    note("orange" in str(sent.get("embed").colour).lower()
+         or sent.get("embed").colour == discord.Color.orange(),
+         "초록불로 안심시키지 않음", str(sent.get("embed").colour))
+
+    guild.roles.remove(high)
+    guild._roles.pop(high.id, None)
+    for m in (newbie, victim, quiet):
+        if m in guild.members:
+            guild.members.remove(m)
+
+
 async def main():
     test_pending()
     test_exchange()
@@ -290,6 +374,7 @@ async def main():
     await test_duplicate_account()
     await test_revoke()
     await test_link_check()
+    await test_linked_role()
     test_disabled()
 
 asyncio.run(main())

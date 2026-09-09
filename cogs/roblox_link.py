@@ -492,7 +492,9 @@ async def compare_players(guild, raw_text: str,
             embed.add_field(
                 name=f"🔍 부계정 의심 — 교차대조 ({len(absent)}명)",
                 value=("링크를 받았지만 **연동 닉네임이 게임 안에 없는** 사람입니다.\n"
-                       "부계정(알트)으로 접속했을 가능성이 있습니다.\n"
+                       "부계정(알트)으로 접속했을 수도 있지만, **버튼만 누르고 "
+                       "안 들어갔거나 이미 나간 경우가 훨씬 흔합니다.**\n"
+                       "이것만으로 처벌하지 마세요 — 확인의 출발점일 뿐입니다.\n"
                        + _join_capped(absent, 700)),
                 inline=False)
 
@@ -607,8 +609,16 @@ class RobloxLink(commands.Cog):
             return
         
         member = guild.get_member(user_id)
-        if not member:
-            return
+        if member is None:
+            # 게이트웨이 캐시에 없을 수 있습니다(방금 들어온 사람 등).
+            # **한 명만** 가져오는 것이라, 6,500명을 REST 로 훑는 것과
+            # 전혀 다릅니다.
+            try:
+                member = await guild.fetch_member(user_id)
+            except Exception as e:
+                print(f"[RobloxLink] 역할 부여 대상 조회 실패: {user_id} ({e})",
+                      flush=True)
+                return
             
         settings = await get_verify_settings(guild_id)
         linked_role_id = settings.get("linked_role_id")
@@ -619,8 +629,17 @@ class RobloxLink(commands.Cog):
                 try:
                     await member.add_roles(role, reason="로블록스 계정 자동 연동 완료")
                     print(f"[RobloxLink] {member} 에게 연동 완료 역할({role.name})을 부여했습니다.", flush=True)
+                except discord.Forbidden:
+                    # 조용히 넘기면 연동을 마친 사람이 빈 서버를 보게 되고,
+                    # 운영진은 원인을 알 수 없습니다. 무엇을 고쳐야 하는지
+                    # 로그에 그대로 적습니다.
+                    print(f"[RobloxLink] 역할 부여 실패(권한/계층): "
+                          f"{member} → {role.name} — 봇 역할을 이 역할보다 "
+                          f"위로 올리거나 '역할 관리' 권한을 주세요.",
+                          flush=True)
                 except Exception as e:
-                    print(f"[RobloxLink] 역할 부여 실패: {e}", flush=True)
+                    print(f"[RobloxLink] 역할 부여 실패: {member} → "
+                          f"{role.name} ({type(e).__name__}: {e})", flush=True)
 
     @app_commands.command(
         name="로블록스연동",

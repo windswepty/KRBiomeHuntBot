@@ -605,7 +605,25 @@ class LinkedRoleModal(discord.ui.Modal, title="🎮 기본 연동 완료 역할 
             return
 
         await save_verify_settings(guild.id, {"linked_role_id": rid})
-        await interaction.response.send_message(f"✅ 기본 연동 완료 역할을 {role.mention} (으)로 설정했습니다.", ephemeral=True)
+
+        # **줄 수 없는 역할을 지정하면 그 사람은 아무것도 못 보게 됩니다.**
+        # 이 역할로 채널을 여는 구조라, 부여가 조용히 실패하면 연동을
+        # 마친 사람이 빈 서버를 보고 문의합니다. 지금 검사해서 알립니다.
+        warn = ""
+        me = guild.me
+        if me and not me.guild_permissions.manage_roles:
+            warn = ("\n\n⚠️ **봇에게 '역할 관리' 권한이 없습니다.**\n"
+                    "이 상태로는 연동을 마쳐도 역할이 부여되지 않습니다.")
+        elif me and role >= me.top_role:
+            warn = ("\n\n⚠️ **이 역할이 봇 역할보다 위에 있습니다.**\n"
+                    "서버 설정 → 역할에서 **봇 역할을 이 역할보다 위로** 올려 주세요.\n"
+                    "그러지 않으면 연동을 마쳐도 역할이 부여되지 않습니다.")
+
+        embed = discord.Embed(
+            title="✅ 기본 연동 완료 역할 설정" if not warn else "⚠️ 설정했지만 동작하지 않습니다",
+            description=f"연동을 마치면 {role.mention} 역할이 자동으로 부여됩니다.{warn}",
+            color=discord.Color.green() if not warn else discord.Color.orange())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         await refresh_settings_panel(self.settings_interaction, discord.Embed(title="✅ 설정 완료", color=discord.Color.green()))
 
 
@@ -992,6 +1010,14 @@ class VerifySettingsSelect(discord.ui.Select):
                 if role:
                     mark2 = "✅" if role < me.top_role else "❌"
                     perm_lines.append(f"{mark2} 봇 역할이 인증 역할보다 위에 있음")
+                # 연동 완료 역할도 같이 봅니다. 이게 실패하면 연동을 마친
+                # 사람이 채널을 하나도 못 보는데, 그 사실이 어디에도 안 뜹니다.
+                linked_id = settings.get("linked_role_id")
+                linked_role = guild.get_role(int(linked_id)) if linked_id else None
+                if linked_role:
+                    mark3 = "✅" if linked_role < me.top_role else "❌"
+                    perm_lines.append(
+                        f"{mark3} 봇 역할이 연동 완료 역할보다 위에 있음")
             embed.add_field(
                 name="🔑 봇 권한 점검",
                 value="\n".join(perm_lines) if perm_lines else "확인 불가",

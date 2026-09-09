@@ -313,6 +313,43 @@ async def main():
     note(upper_msg.deleted is True, "대문자 HTTPS URL 도 삭제함")
     note(bool(LOG.sent), "대문자 URL 도 로그 알림을 전송함")
 
+    print("")
+    print("=== 16. 예외 채널이라도 중계 주소는 잡아야 ===")
+    # 사람이 자기 개인서버를 정상적으로 공유하는 채널을 예외로 둡니다.
+    # 하지만 `/j/` 는 한 사람에게만 발급된 개인 주소라 어느 채널에서든
+    # 올라올 이유가 없습니다. 여기까지 면제하면 **그 채널이 그대로
+    # 유출 통로가 됩니다.**
+    await vdb.save_linkguard_settings(GUILD.id, {"exception_channel_ids": [CH.id]})
+    LOG.sent.clear()
+    m16 = post(other, "https://relay.test/j/" + TOKEN, 7600)
+    await lg._detect_leak(m16)
+    await drain()
+    note(bool(LOG.sent), "예외 채널에서도 중계 주소 유출은 잡힘")
+    note(m16.deleted is True, "삭제도 그대로 함")
+
+    print("")
+    print("=== 17. 예외 채널의 '보통' 보호 링크는 면제돼야 ===")
+    await vdb.register_guarded_keys(GUILD.id, ["ps:exceptioncode123"])
+    LOG.sent.clear()
+    m17 = post(other,
+               "https://www.roblox.com/games/1/x?privateServerLinkCode=exceptioncode123",
+               7601)
+    await lg._detect_leak(m17)
+    await drain()
+    note(not LOG.sent and m17.deleted is False,
+         "예외 채널에서는 일반 보호 링크를 건드리지 않음")
+
+    # 예외를 풀면 같은 링크가 다시 잡혀야 합니다 (예외가 진짜 원인이었는지 확인)
+    await vdb.save_linkguard_settings(GUILD.id, {"exception_channel_ids": []})
+    LOG.sent.clear()
+    m18 = post(other,
+               "https://www.roblox.com/games/1/x?privateServerLinkCode=exceptioncode123",
+               7602)
+    await lg._detect_leak(m18)
+    await drain()
+    note(bool(LOG.sent) and m18.deleted is True,
+         "예외를 풀면 같은 링크가 다시 잡힘 (예외가 원인이 맞음)")
+
 asyncio.run(main())
 print("\n  실패 " + str(len(F.FAILS)) + "건 / 성공 " + str(len(F.OKS)) + "건")
 for x in F.FAILS:

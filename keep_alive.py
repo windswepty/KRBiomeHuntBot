@@ -1,4 +1,5 @@
 import os
+import html as _html
 import logging
 from threading import Thread
 
@@ -183,12 +184,66 @@ def _redirect_uri() -> str:
     return f"{base.rstrip('/')}/auth/callback"
 
 
+_MOBILE_KW = ("android", "iphone", "ipad", "ipod", "mobile")
+
+
+def _is_mobile(ua: str) -> bool:
+    """User-Agent 로 모바일 기기를 판별합니다."""
+    low = (ua or "").lower()
+    return any(kw in low for kw in _MOBILE_KW)
+
+
+def _mobile_bridge(roblox_url: str) -> Response:
+    """모바일에서 로블록스 앱을 안정적으로 여는 브릿지 페이지.
+
+    디스코드 모바일 인앱 브라우저는 302 리다이렉트로 외부 앱을 호출하는 것이
+    종종 실패합니다. HTML 페이지를 먼저 렌더한 뒤 meta refresh 또는 터치 버튼으로
+    로블록스 앱을 호출하면, 브라우저가 정상적으로 앱 전환을 수행합니다.
+    """
+    safe = _html.escape(roblox_url, quote=True)
+    page = f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>개인서버 입장</title>
+<meta http-equiv="refresh" content="1;url={safe}">
+<style>
+  body{{margin:0;min-height:100vh;display:flex;align-items:center;
+  justify-content:center;background:#0f1115;color:#e6e6e6;
+  font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}}
+  .card{{max-width:420px;padding:40px 32px;text-align:center;
+  background:#171a21;border:1px solid #262b36;border-radius:16px}}
+  h1{{font-size:20px;margin:0 0 12px}}
+  p{{font-size:14px;line-height:1.7;color:#9aa3b2;margin:0 0 20px}}
+  .icon{{font-size:48px;margin-bottom:16px}}
+  .btn{{display:inline-block;padding:14px 32px;background:#00b06f;color:#fff;
+  text-decoration:none;border-radius:12px;font-size:16px;font-weight:600}}
+  .btn:active{{background:#009960}}
+  .sub{{font-size:12px;color:#6b7280;margin-top:16px}}
+</style></head>
+<body><div class="card">
+  <div class="icon">🎮</div>
+  <h1>개인서버로 이동합니다</h1>
+  <p>잠시만 기다려 주세요…<br>자동으로 열리지 않으면 아래 버튼을 눌러 주세요.</p>
+  <a class="btn" href="{safe}">로블록스에서 열기</a>
+  <p class="sub">이 페이지는 1회용이며 곧 만료됩니다.</p>
+</div></body></html>"""
+    return Response(page, status=200, mimetype="text/html; charset=utf-8")
+
+
 def _deliver(token: str) -> Response:
     """토큰을 실제로 소비해 로블록스로 넘깁니다."""
     url, reason = redeem(token)
     if url is None:
         return _page(reason)
-    return redirect(url, code=302)
+    # 워터마크 프래그먼트(#hbh-...)를 제거합니다. 모바일 로블록스 앱은
+    # 프래그먼트를 쿼리 파라미터의 일부로 인식해 "유효하지 않은 링크"를
+    # 표시합니다. 중계 토큰이 이미 유저를 특정하므로 추적에 지장 없습니다.
+    clean = url.split("#", 1)[0]
+    # 모바일 환경에서는 브릿지 페이지를 거쳐 앱 전환이 안정적으로 작동합니다.
+    ua = request.headers.get("User-Agent", "")
+    if _is_mobile(ua):
+        return _mobile_bridge(clean)
+    return redirect(clean, code=302)
 
 
 @app.route('/j/<token>')

@@ -223,6 +223,44 @@ async def main():
         r = c.get(path)
         note(r.status_code == 200, f"GET {path}", str(r.status_code))
 
+    WATERMARKED = ROBLOX + "#hbh-c26ae66d"
+
+    print("\n=== 12. 모바일 브릿지 페이지 · 워터마크 프래그먼트 제거 ===")
+    t_m1 = LT.issue(WATERMARKED, 61, GUILD.id)
+    r = c.get(f"/j/{t_m1}", follow_redirects=False,
+              headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"})
+    note(r.status_code == 200, "모바일 UA → 200 브릿지 페이지", str(r.status_code))
+    body = r.data.decode()
+    note("#hbh-" not in body, "브릿지 페이지에서 워터마크 프래그먼트 제거됨")
+    note("privateServerLinkCode=abcdef123456" in body,
+         "로블록스 링크 코드는 유지됨")
+    note("로블록스에서 열기" in body, "터치 버튼 존재")
+    note('meta http-equiv="refresh"' in body, "meta refresh 자동 이동 존재")
+
+    t_m2 = LT.issue(WATERMARKED, 61, GUILD.id)
+    r = c.get(f"/j/{t_m2}", follow_redirects=False,
+              headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8)"})
+    note(r.status_code == 200, "Android UA → 200 브릿지 페이지", str(r.status_code))
+    note("#hbh-" not in r.data.decode(), "Android 에서도 프래그먼트 제거됨")
+
+    print("\n  PC 에서는 302 리다이렉트, 프래그먼트 제거")
+    t_p = LT.issue(WATERMARKED, 61, GUILD.id)
+    r = c.get(f"/j/{t_p}", follow_redirects=False,
+              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    note(r.status_code == 302, "PC UA → 302 리다이렉트", str(r.status_code))
+    loc = r.headers.get("Location", "")
+    note("#hbh-" not in loc, "리다이렉트 Location 에서 프래그먼트 제거됨")
+    note("privateServerLinkCode=abcdef123456" in loc,
+         "리다이렉트 URL 에 링크 코드 유지됨")
+
+    print("\n  프래그먼트 없는 URL 도 정상 동작")
+    t_clean = LT.issue(ROBLOX, 61, GUILD.id)
+    r = c.get(f"/j/{t_clean}", follow_redirects=False,
+              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    note(r.status_code == 302, "프래그먼트 없는 URL → 302", str(r.status_code))
+    note(ROBLOX in r.headers.get("Location", ""),
+         "원본 URL 그대로 리다이렉트")
+
     await bot.close()
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
     for x in F.FAILS:
@@ -238,3 +276,4 @@ class _null:
 
 
 asyncio.run(main())
+

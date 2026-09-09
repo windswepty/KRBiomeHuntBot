@@ -1196,7 +1196,7 @@ class RemoveGuardChannelView(discord.ui.View):
 class AddExceptionChannelSelect(discord.ui.ChannelSelect):
     def __init__(self):
         super().__init__(
-            placeholder="유출 예외 채널로 지정할 채널을 선택하세요...",
+            placeholder="유출 예외로 지정할 채널이나 카테고리를 선택하세요...",
             channel_types=[discord.ChannelType.text, discord.ChannelType.category],
             max_values=5
         )
@@ -1219,7 +1219,10 @@ class AddExceptionChannelSelect(discord.ui.ChannelSelect):
             if channel is None:
                 lines.append(f"• <#{cid}> ⚠️ 채널을 찾을 수 없음")
             else:
-                lines.append(f"• ✅ {channel.mention}")
+                if isinstance(channel, discord.CategoryChannel):
+                    lines.append(f"• ✅ 🗂️ **{channel.name}** (카테고리)")
+                else:
+                    lines.append(f"• ✅ {channel.mention}")
 
         embed = discord.Embed(
             title="✅ 유출 예외 채널 추가 완료",
@@ -1770,15 +1773,15 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="❌"
             ),
             discord.SelectOption(
-                label="유출 감지 예외 채널 추가",
+                label="유출 감지 예외 채널/카테고리 추가",
                 value="addexc",
-                description="특정 채널에서는 보호된 링크를 올려도 삭제하지 않습니다.",
+                description="특정 채널/카테고리에서는 보호된 링크를 올려도 삭제하지 않습니다.",
                 emoji="🛡️"
             ),
             discord.SelectOption(
-                label="유출 예외 채널 해제",
+                label="유출 예외 채널/카테고리 해제",
                 value="removeexc",
-                description=f"지정된 {exc_count}개 예외 채널 중 선택 해제",
+                description=f"지정된 {exc_count}개 예외 채널/카테고리 중 선택 해제",
                 emoji="➖"
             ),
             discord.SelectOption(
@@ -1908,7 +1911,7 @@ class GuardSettingsSelect(discord.ui.Select):
 
         elif choice == "addexc":
             await interaction.response.send_message(
-                "🛡️ **유출 감지에서 제외할 예외 채널을 선택하세요.**",
+                "🛡️ **유출 감지에서 제외할 예외 채널(또는 카테고리)을 선택하세요.**",
                 view=AddExceptionChannelView(),
                 ephemeral=True
             )
@@ -1917,12 +1920,12 @@ class GuardSettingsSelect(discord.ui.Select):
             exc_ids = settings.get("exception_channel_ids", [])
             if not exc_ids:
                 await interaction.response.send_message(
-                    "ℹ️ 현재 예외로 지정된 채널이 없습니다.",
+                    "ℹ️ 현재 예외로 지정된 채널/카테고리가 없습니다.",
                     ephemeral=True
                 )
                 return
             await interaction.response.send_message(
-                "➖ **예외 지정에서 해제할 채널을 선택하세요.**",
+                "➖ **예외 지정에서 해제할 채널/카테고리를 선택하세요.**",
                 view=RemoveExceptionChannelView(exc_ids, guild),
                 ephemeral=True
             )
@@ -2111,18 +2114,21 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
             inline=False
         )
 
-    # 유출 감지 예외 채널
+    # 유출 감지 예외 채널/카테고리
     exc_ids = settings.get("exception_channel_ids", [])
     if exc_ids:
         lines = []
-        for cid in exc_ids[:10]:
+        for cid in exc_ids[:15]:
             channel = guild.get_channel(cid)
             if channel is None:
-                lines.append(f"• ⚠️ <#{cid}> 채널을 찾을 수 없음")
+                lines.append(f"• ⚠️ <#{cid}> 채널/카테고리를 찾을 수 없음")
                 continue
-            lines.append(f"• 🛡️ {channel.mention}")
+            if isinstance(channel, discord.CategoryChannel):
+                lines.append(f"• 🛡️ 🗂️ **{channel.name}** (카테고리 전체 예외)")
+            else:
+                lines.append(f"• 🛡️ {channel.mention}")
         embed.add_field(
-            name=f"🛡️ 유출 감지 예외 채널 ({len(exc_ids)}개)",
+            name=f"🛡️ 유출 감지 예외 ({len(exc_ids)}개)",
             value="\n".join(lines)[:1024],
             inline=False
         )

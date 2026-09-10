@@ -320,6 +320,46 @@ async def main():
     note(am3 is not None and am3.everyone is False and not am3.roles,
          "울릴 것이 없으면 빈 채로 보냄")
 
+    print("")
+    print("=== 같은 링크를 다시 보호할 때 TTL 갱신을 아껴야 ===")
+    # 매크로는 같은 개인서버 링크를 상태 갱신마다 다시 올립니다.
+    # 실측: 보호 21,227건에 고유 링크 146개 — 하나당 평균 145번.
+    # 그때마다 쓰면 의미 없는 쓰기가 쌓입니다. TTL 이 30일이라 넉넉합니다.
+    gk = vcols["guardkey_col"]
+    vdb._guardkey_written.clear()
+    KEY = "sh:throttletest0001"
+
+    n0 = gk.op_counts.get("update_one", 0)
+    await vdb.register_guarded_keys(GUILD.id, [KEY])
+    n1 = gk.op_counts.get("update_one", 0)
+    note(n1 == n0 + 1, "처음 보는 링크는 바로 씀", f"{n0} → {n1}")
+
+    for _ in range(20):
+        await vdb.register_guarded_keys(GUILD.id, [KEY])
+    n2 = gk.op_counts.get("update_one", 0)
+    note(n2 == n1, "같은 링크를 20번 더 보호해도 쓰기는 0회", f"{n1} → {n2}")
+
+    # **메모리 색인은 건너뛰면 안 됩니다** — 유출 감지가 이걸 봅니다.
+    keys_now = await vdb.get_guarded_keys(GUILD.id)
+    note(KEY in keys_now, "쓰기를 건너뛰어도 유출 감지 색인에는 들어 있음")
+
+    # 갱신 주기가 지나면 다시 써야 TTL 이 살아 있습니다
+    vdb._guardkey_written[f"{GUILD.id}:{KEY}"] -= vdb.GUARDKEY_REFRESH_SECONDS + 1
+    await vdb.register_guarded_keys(GUILD.id, [KEY])
+    n3 = gk.op_counts.get("update_one", 0)
+    note(n3 == n2 + 1, "갱신 주기가 지나면 다시 씀 (TTL 이 만료되지 않게)",
+         f"{n2} → {n3}")
+
+    # 한 번에 여러 개가 와도 새 것만 씁니다
+    n4 = gk.op_counts.get("update_one", 0)
+    await vdb.register_guarded_keys(GUILD.id, [KEY, "sh:throttletest0002"])
+    n5 = gk.op_counts.get("update_one", 0)
+    note(n5 == n4 + 1, "이미 쓴 것은 빼고 새 것만 씀", f"{n4} → {n5}")
+
+    note(len(vdb._guardkey_written) < vdb.GUARDKEY_MEMO_MAX,
+         "기억이 무한히 늘지 않도록 상한이 있음",
+         f"{len(vdb._guardkey_written)} / {vdb.GUARDKEY_MEMO_MAX}")
+
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
     for x in F.FAILS:
         print("   -", x)

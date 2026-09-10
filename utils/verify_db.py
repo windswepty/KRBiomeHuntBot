@@ -661,17 +661,45 @@ _guarded_keys_cache: dict[str, set[str]] = {}
 _usage_cache = _TTLCache(ttl_seconds=3600, max_items=2000)
 
 
+# 매크로는 **같은 개인서버 링크를 상태 갱신마다 다시 올립니다.**
+# 실측(2026-09-10): 보호 21,227건에 고유 링크는 146개 — 하나당 평균 145번,
+# 최근 1시간 중복률 83%. 그때마다 TTL 갱신을 쓰면 의미 없는 쓰기가 쌓입니다.
+# TTL 이 30일이므로 **1시간에 한 번만 갱신해도 넉넉합니다.**
+#
+# 재시작하면 이 기억이 비어 다시 쓰지만, 그건 한 번뿐이라 문제가 없습니다.
+GUARDKEY_REFRESH_SECONDS = 3600
+GUARDKEY_MEMO_MAX = 5000
+_guardkey_written: dict[str, float] = {}
+
+
 async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
     """이 길드에서 보호 중인 링크 식별자(개인서버 코드 등)를 색인에 추가합니다."""
     str_gid = str(guild_id)
     bucket = _guarded_keys_cache.setdefault(str_gid, set())
+    # **메모리 색인은 항상 갱신합니다.** 유출 감지가 이걸 보기 때문에,
+    # 쓰기를 건너뛴다고 여기까지 건너뛰면 방금 보호한 링크를 못 알아봅니다.
     bucket.update(keys)
+
+    now_mono = time.monotonic()
+    fresh = [k for k in keys
+             if now_mono - _guardkey_written.get(f"{str_gid}:{k}", -1e9)
+             >= GUARDKEY_REFRESH_SECONDS]
+    if not fresh:
+        return              # 최근에 갱신했습니다 — 다시 쓸 이유가 없습니다
+
+    def _memo():
+        for k in fresh:
+            _guardkey_written[f"{str_gid}:{k}"] = now_mono
+        if len(_guardkey_written) > GUARDKEY_MEMO_MAX:
+            # dict 는 삽입 순서를 유지하므로 앞쪽이 가장 오래된 항목입니다
+            for old_key in list(_guardkey_written)[:GUARDKEY_MEMO_MAX // 2]:
+                _guardkey_written.pop(old_key, None)
 
     if guardkey_col is not None:
         try:
             def _write():
                 now = datetime.now(timezone.utc)
-                for key in keys:
+                for key in fresh:
                     guardkey_col.update_one(
                         {"_id": f"{guild_id}:{key}"},
                         # updated 가 있어야 TTL 인덱스가 동작합니다.
@@ -681,6 +709,7 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
                         upsert=True
                     )
             await _db(_write)
+            _memo()         # 쓰기에 성공했을 때만 기억합니다
             return
         except Exception as e:
             print(f"MongoDB register_guarded_keys error: {e}, using local file.", flush=True)
@@ -691,6 +720,7 @@ async def register_guarded_keys(guild_id: int, keys: list[str]) -> None:
         existing.update(keys)
         all_keys[str_gid] = sorted(existing)
         _write_json(GUARDKEY_FILE, all_keys)
+    _memo()
 
 
 async def record_link_usage(guild_id: int, message_id: int,

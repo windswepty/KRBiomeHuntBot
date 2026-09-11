@@ -353,7 +353,57 @@ DEFAULT_LINKGUARD_SETTINGS = {
     # 유출된 링크를 무효화하지만, 봇의 웹 서버가 죽으면 아무도 입장할 수 없게 되는
     # 단일 장애점이 생깁니다. 그래서 기본값은 꺼둔 상태입니다.
     "relay_links": False,
+
+    # ── 재게시할 때 봇이 직접 붙이는 알림 멘션 ──────────────────────
+    # 매크로 임베드에는 멘션이 **아예 없는** 경우가 많습니다(MultiScope 가
+    # 그렇습니다: 임베드 + 링크 버튼뿐). 원본에 없으면 살릴 것도 없으므로,
+    # 사람들이 바이옴이 뜬 것을 알게 하려면 봇이 붙여야 합니다.
+    #
+    #   {"channel_ids": [...], "category_ids": [...],
+    #    "biomes": ["DREAMSPACE", ...],
+    #    "mention": "everyone" | "here" | "roles", "role_ids": [...]}
+    #
+    # · channel_ids/category_ids 가 비어 있으면 **모든 감시 채널**에 적용됩니다.
+    # · biomes 가 비어 있으면 **모든 바이옴**에 적용됩니다.
+    # · 먼저 있는 규칙이 먼저 적용됩니다(처음 맞는 것 하나만).
+    "notify_rules": [],
+
+    # 같은 링크가 다시 보호될 때 멘션을 생략할 시간(분).
+    # 매크로는 **같은 링크를 상태 갱신마다 다시 올립니다** — 실측으로 하나당
+    # 평균 145번입니다. 이걸 0 으로 두면 6000명이 같은 바이옴 알림을 수백 번
+    # 받습니다. 끄려면 0.
+    "notify_cooldown_minutes": 30,
+
+    # 원본 **임베드 안**에 적혀 있던 역할 멘션을 본문으로 끌어올립니다.
+    # 임베드 안의 `<@&역할>` 은 글자로만 보이고 알림이 가지 않습니다.
+    "carry_embed_mentions": True,
 }
+
+
+def _normalize_notify_rules(rules) -> list:
+    """저장된 알림 규칙의 ID 를 전부 int 로 맞춥니다.
+
+    JSON 폴백을 거치면 숫자가 문자열이 되어 돌아옵니다. 그대로 두면
+    `base.id in cids` 가 조용히 False 가 되어 **규칙이 있는데 안 울립니다.**
+    """
+    out = []
+    for rule in rules or []:
+        if not isinstance(rule, dict):
+            continue
+        clean = dict(rule)
+        for key in ("channel_ids", "category_ids", "role_ids"):
+            ids = []
+            for v in clean.get(key) or []:
+                try:
+                    ids.append(int(v))
+                except (TypeError, ValueError):
+                    continue
+            clean[key] = ids
+        clean["biomes"] = [str(b) for b in (clean.get("biomes") or []) if str(b).strip()]
+        if clean.get("mention") not in ("everyone", "here", "roles"):
+            clean["mention"] = "roles"
+        out.append(clean)
+    return out
 
 
 _linkguard_cache: dict[str, dict] = {}
@@ -375,6 +425,7 @@ async def get_linkguard_settings(guild_id: int) -> dict:
                 result.update({k: v for k, v in doc.items() if k != "_id"})
             result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
             result["category_ids"] = [int(c) for c in result.get("category_ids", [])]
+            result["notify_rules"] = _normalize_notify_rules(result.get("notify_rules"))
             _linkguard_cache[str_gid] = dict(result)
             return dict(result)
         except Exception as e:
@@ -386,6 +437,7 @@ async def get_linkguard_settings(guild_id: int) -> dict:
         result.update(all_settings[str_gid])
     result["channel_ids"] = [int(c) for c in result.get("channel_ids", [])]
     result["category_ids"] = [int(c) for c in result.get("category_ids", [])]
+    result["notify_rules"] = _normalize_notify_rules(result.get("notify_rules"))
     _linkguard_cache[str_gid] = dict(result)
     return dict(result)
 
@@ -397,6 +449,7 @@ async def save_linkguard_settings(guild_id: int, settings: dict) -> None:
     current.update(settings)
     current["channel_ids"] = [int(c) for c in current.get("channel_ids", [])]
     current["category_ids"] = [int(c) for c in current.get("category_ids", [])]
+    current["notify_rules"] = _normalize_notify_rules(current.get("notify_rules"))
     _linkguard_cache[str_gid] = current
 
     if linkguard_col is not None:

@@ -364,6 +364,275 @@ def sanitize_embed(embed: discord.Embed, locked_text: str,
     return discord.Embed.from_dict(data), unique_links
 
 
+# ── 알림 멘션 ─────────────────────────────────────────────────────────
+#
+# 매크로 채널의 원본(MultiScope)은 **멘션이 아예 없습니다** — 임베드와
+# 링크 버튼뿐입니다. 원본에 없으면 살릴 것도 없으므로, 사람들이 바이옴이
+# 뜬 것을 알게 하려면 재게시할 때 봇이 직접 붙여야 합니다.
+#
+# 세 갈래가 합쳐집니다.
+#   ① 원본 **본문**의 멘션      → clean_content 에 그대로 남습니다 (기존 동작)
+#   ② 원본 **임베드 안**의 멘션 → 본문으로 끌어올려야 실제로 울립니다
+#   ③ 설정한 규칙               → 채널·바이옴별로 봇이 붙입니다
+
+ROLE_MENTION_RE = re.compile(r'<@&(\d+)>')
+EVERYONE_RE = re.compile(r'@everyone(?![A-Za-z0-9_])', re.IGNORECASE)
+HERE_RE = re.compile(r'@here(?![A-Za-z0-9_])', re.IGNORECASE)
+
+
+def embed_texts(embed) -> list[str]:
+    """임베드에서 사람이 읽는 텍스트를 전부 모읍니다 (이미지·URL 은 제외)."""
+    try:
+        data = embed.to_dict()
+    except Exception:
+        return []
+
+    out: list[str] = []
+    for key in ("title", "description"):
+        value = data.get(key)
+        if value:
+            out.append(str(value))
+
+    for key in ("author", "footer"):
+        part = data.get(key)
+        if isinstance(part, dict):
+            for sub in ("name", "text"):
+                if part.get(sub):
+                    out.append(str(part[sub]))
+
+    for field in data.get("fields") or []:
+        if not isinstance(field, dict):
+            continue
+        for sub in ("name", "value"):
+            if field.get(sub):
+                out.append(str(field[sub]))
+
+    return out
+
+
+def extract_embed_mentions(message) -> tuple[list[int], bool, bool]:
+    """임베드 **안**에 적혀 있는 멘션을 찾아냅니다.
+
+    임베드 안의 `<@&역할>` 은 역할 이름으로 예쁘게 보이지만 **알림이 가지
+    않습니다.** 디스코드는 본문(content)에 있는 멘션만 울립니다. 그래서
+    임베드에 적힌 것을 본문으로 끌어올려야 실제로 사람에게 닿습니다.
+    """
+    role_ids: list[int] = []
+    everyone = here = False
+
+    for embed in getattr(message, "embeds", None) or []:
+        for text in embed_texts(embed):
+            for raw in ROLE_MENTION_RE.findall(text):
+                try:
+                    rid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if rid not in role_ids:
+                    role_ids.append(rid)
+            if EVERYONE_RE.search(text):
+                everyone = True
+            if HERE_RE.search(text):
+                here = True
+
+    return role_ids, everyone, here
+
+
+def biome_haystack(message) -> str:
+    """바이옴 이름을 찾아볼 텍스트를 모읍니다 — **임베드 안만** 봅니다.
+
+    ⚠️ **본문(content)은 절대 보지 않습니다.** 누군가 채팅에 "DREAMSPACE"
+    라고 치는 것만으로 @everyone 이 울리면 그건 되돌릴 수 없는 사고입니다.
+    매크로가 만든 임베드에만 바이옴 이름이 들어 있으므로 그것만 봅니다.
+
+    (호출하는 쪽인 `_guard_message` 는 이미 **웹훅이 보낸 메시지**만 다루지만,
+     그 검사 하나에 전원 호출을 걸어 두지 않습니다. 안전장치는 겹쳐야
+     하나가 무너져도 버팁니다.)
+
+    바이옴 이름이 임베드 어디에 적힐지는 매크로마다 다릅니다. MultiScope 는
+    제목("Biome Started - DREAMSPACE")에 넣지만 필드에 넣는 것도 있어
+    임베드 안은 전부 훑습니다.
+    """
+    parts: list[str] = []
+    for embed in getattr(message, "embeds", None) or []:
+        parts.extend(embed_texts(embed))
+    return " ".join(parts)
+
+
+def _norm_biome(text: str) -> str:
+    """대소문자·공백·기호를 지워 비교할 수 있는 형태로 만듭니다.
+
+    매크로마다 `DREAMSPACE` `Dream Space` `dream_space` 로 제각각이라
+    글자 그대로 비교하면 **설정해 둔 바이옴이 조용히 안 걸립니다.**
+    """
+    return re.sub(r'[^0-9A-Z가-힣]+', '', (text or "").upper())
+
+
+def biome_matches(biomes, haystack: str) -> str | None:
+    """설정된 바이옴 중 이 메시지에 들어있는 첫 번째를 돌려줍니다.
+
+    빈 목록이면 None 이 아니라 호출한 쪽에서 '전부 해당'으로 다룹니다.
+    """
+    norm = _norm_biome(haystack)
+    if not norm:
+        return None
+    for name in biomes or []:
+        key = _norm_biome(name)
+        if key and key in norm:
+            return name
+    return None
+
+
+def rule_covers_channel(rule: dict, channel) -> bool:
+    """이 규칙이 이 채널에 적용되는지 봅니다.
+
+    채널·카테고리를 하나도 지정하지 않은 규칙은 **모든 감시 채널**에
+    적용됩니다 (채널 하나뿐인 서버에서 매번 채널을 고르게 만들지 않으려는 것).
+    """
+    base = resolve_base_channel(channel)
+    if base is None:
+        return False
+
+    channel_ids = rule.get("channel_ids") or []
+    category_ids = rule.get("category_ids") or []
+    if not channel_ids and not category_ids:
+        return True
+
+    if base.id in channel_ids:
+        return True
+
+    category_id = getattr(base, "category_id", None)
+    return category_id is not None and category_id in category_ids
+
+
+def match_notify_rule(settings: dict, channel, haystack: str) -> tuple[dict | None, str | None]:
+    """이 채널·이 메시지에 적용할 알림 규칙을 찾습니다.
+
+    **처음 맞는 규칙 하나만** 씁니다. 여러 규칙을 합치면 좁은 규칙(특정
+    바이옴에만 @everyone)이 넓은 규칙에 먹혀 의도치 않게 전원 호출이
+    나가는데, 그건 되돌릴 수 없는 사고입니다.
+    """
+    for rule in settings.get("notify_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+
+        # @everyone 은 **채널을 지정한 규칙에서만** 허용합니다.
+        # 범위를 안 적은 @everyone 규칙 하나가 남아 있으면 감시 중인 모든
+        # 채널에서 6,500명을 부르게 됩니다. UI 가 그런 규칙을 만들지 못하게
+        # 막고 있지만, 손으로 고친 설정이 들어올 수 있으므로 여기서도 막습니다.
+        # (안전장치는 겹쳐야 하나가 무너져도 버팁니다)
+        if (rule.get("mention") == "everyone"
+                and not (rule.get("channel_ids") or rule.get("category_ids"))):
+            continue
+
+        if not rule_covers_channel(rule, channel):
+            continue
+
+        biomes = rule.get("biomes") or []
+        if not biomes:
+            return rule, None
+
+        # haystack 은 **임베드에서만** 모은 것입니다(biome_haystack 참고).
+        # 채팅 본문으로는 절대 걸리지 않습니다.
+        hit = biome_matches(biomes, haystack)
+        if hit is not None:
+            return rule, hit
+
+    return None, None
+
+
+# 같은 링크를 다시 보호할 때 멘션을 또 울리지 않도록 기억합니다.
+# 매크로는 **같은 개인서버 링크를 상태 갱신마다 다시 올립니다** — 실측으로
+# 고유 링크 하나당 평균 145번입니다. 이 기억이 없으면 6000명이 같은 바이옴
+# 알림을 수백 번 받습니다.
+_notified_at: dict[str, float] = {}
+_NOTIFY_MEMO_MAX = 2000
+
+
+def _notify_memo_keys(guild_id: int, links: list[str]) -> list[str]:
+    keys = []
+    for url in links:
+        key = link_key(url)
+        if key:
+            keys.append(f"{guild_id}:{key}")
+    return keys
+
+
+def notify_on_cooldown(guild_id: int, links: list[str], minutes) -> bool:
+    """이 링크로 최근에 이미 알렸는지 봅니다 (알림만 건너뛰고 보호는 그대로)."""
+    try:
+        window = float(minutes or 0) * 60
+    except (TypeError, ValueError):
+        window = 0
+    if window <= 0:
+        return False
+
+    now = time.monotonic()
+    for stale_key, at in list(_notified_at.items()):
+        if now - at > window:
+            _notified_at.pop(stale_key, None)
+
+    return any(key in _notified_at for key in _notify_memo_keys(guild_id, links))
+
+
+def remember_notify(guild_id: int, links: list[str]) -> None:
+    """알림을 **실제로 보낸 뒤에만** 기억합니다.
+
+    보내기 전에 기억하면, 전송이 실패했는데도 쿨타임 동안 다시 시도하지
+    않아 그 바이옴 알림이 통째로 사라집니다.
+    """
+    now = time.monotonic()
+    for key in _notify_memo_keys(guild_id, links):
+        _notified_at[key] = now
+
+    if len(_notified_at) > _NOTIFY_MEMO_MAX:
+        for old in sorted(_notified_at, key=_notified_at.get)[:len(_notified_at) // 2]:
+            _notified_at.pop(old, None)
+
+
+def _merge_role_targets(original_roles, extra_ids: list[int]) -> list:
+    """원본이 멘션한 역할 + 봇이 붙일 역할을 하나의 허용 목록으로 만듭니다.
+
+    봇이 붙이는 쪽은 역할 객체가 없을 수 있어 `discord.Object` 로 넘깁니다.
+    `AllowedMentions.roles` 는 id 만 있으면 되므로 이걸로 충분합니다.
+    """
+    merged = list(original_roles or [])
+    seen = {getattr(r, "id", None) for r in merged}
+    for rid in extra_ids or []:
+        if rid in seen:
+            continue
+        merged.append(discord.Object(id=rid))
+        seen.add(rid)
+    return merged
+
+
+def describe_notify_rule(rule: dict, guild) -> str:
+    """관리자 화면에 한 줄로 보여줄 규칙 설명."""
+    kind = rule.get("mention", "roles")
+    if kind == "everyone":
+        target = "@everyone"
+    elif kind == "here":
+        target = "@here"
+    else:
+        names = []
+        for rid in rule.get("role_ids") or []:
+            role = guild.get_role(rid) if guild else None
+            names.append(role.mention if role else f"⚠️ 삭제된 역할({rid})")
+        target = " ".join(names) or "⚠️ 역할 없음"
+
+    scope = []
+    for cid in rule.get("channel_ids") or []:
+        scope.append(f"<#{cid}>")
+    for cat_id in rule.get("category_ids") or []:
+        category = guild.get_channel(cat_id) if guild else None
+        scope.append(f"📂 {category.name}" if category else f"📂 {cat_id}")
+    where = " ".join(scope) or "감시 중인 모든 채널"
+
+    biomes = rule.get("biomes") or []
+    when = ", ".join(f"`{b}`" for b in biomes) if biomes else "모든 바이옴"
+
+    return f"{where} · {when} → {target}"
+
+
 # ── 보호된 링크 버튼 (영구 View) ──────────────────────────────────────
 
 class ProtectedLinkView(discord.ui.View):
@@ -1722,12 +1991,375 @@ class AutoDeleteToggleView(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ── 바이옴 알림 멘션 설정 UI ─────────────────────────────────────────
+
+def build_notify_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
+    rules = settings.get("notify_rules") or []
+    cooldown = settings.get("notify_cooldown_minutes", 30)
+    carry = settings.get("carry_embed_mentions", True)
+
+    if rules:
+        lines = [f"`{i + 1}.` {describe_notify_rule(r, guild)}"
+                 for i, r in enumerate(rules)]
+    else:
+        lines = ["아직 규칙이 없습니다. **➕ 규칙 추가** 로 만드세요."]
+
+    embed = discord.Embed(
+        title="🔔 바이옴 알림 멘션",
+        description=(
+            "매크로 임베드에는 멘션이 **아예 없는** 경우가 많습니다. 그러면 "
+            "링크를 보호해 다시 올려도 사람들은 바이옴이 뜬 것을 모릅니다. "
+            "여기서 **봇이 직접 붙일 멘션**을 정합니다.\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="⏱️ 같은 링크 재알림 간격",
+        value=(f"**{cooldown}분**\n매크로는 같은 링크를 상태 갱신마다 다시 "
+               "올립니다(실측 평균 145번). 그 사이에는 조용히 갱신만 합니다."
+               if cooldown else
+               "**끔** ⚠️ 같은 링크가 다시 보호될 때마다 전부 울립니다."),
+        inline=False
+    )
+    embed.add_field(
+        name="🔁 임베드 안의 멘션 살리기",
+        value=("✅ 켜짐" if carry else "❌ 꺼짐") +
+              "\n임베드 **안**에 적힌 `<@&역할>` 은 글자로만 보이고 알림이 "
+              "가지 않습니다. 켜면 본문으로 끌어올려 실제로 울립니다.",
+        inline=False
+    )
+    embed.set_footer(text="위에 있는 규칙이 먼저 적용됩니다 (맞는 것 하나만).")
+    return embed
+
+
+def _notify_perm_warning(guild: discord.Guild, rule: dict) -> str:
+    """이 규칙이 실제로 울릴 수 있는지 **저장하는 순간** 검사합니다.
+
+    초록불만 띄우면 운영진은 며칠 뒤 "왜 알림이 안 와요" 문의를 받고서야
+    압니다. 연동 역할(`linked_role_id`)에서 이미 겪은 일입니다.
+    """
+    me = guild.me
+    if me is None:
+        return ""
+
+    kind = rule.get("mention", "roles")
+    needs = kind in ("everyone", "here")
+    if not needs:
+        for rid in rule.get("role_ids") or []:
+            role = guild.get_role(rid)
+            if role is None or not role.mentionable:
+                needs = True
+                break
+    if not needs:
+        return ""
+
+    targets = []
+    for cid in rule.get("channel_ids") or []:
+        ch = guild.get_channel(cid)
+        if ch is not None:
+            targets.append(ch)
+    for cat_id in rule.get("category_ids") or []:
+        category = guild.get_channel(cat_id)
+        if isinstance(category, discord.CategoryChannel):
+            targets.extend(category.text_channels)
+    if not targets:
+        targets = list(guild.text_channels)
+
+    blocked = [c for c in targets if not c.permissions_for(me).mention_everyone]
+    if not blocked:
+        return ""
+
+    shown = " ".join(c.mention for c in blocked[:5])
+    more = f" 외 {len(blocked) - 5}곳" if len(blocked) > 5 else ""
+    return (f"⚠️ 봇에게 **'@everyone, @here, 모든 역할 멘션'** 권한이 없어 "
+            f"{shown}{more} 에서는 **글자만 남고 알림이 가지 않습니다.**")
+
+
+async def _save_notify_rule(interaction: discord.Interaction, rule: dict) -> None:
+    # @everyone 은 채널을 반드시 지정해야 합니다. 범위 없는 전원 호출은
+    # 되돌릴 수 없고, 매크로가 아닌 웹훅이 있는 채널까지 휩쓸립니다.
+    if (rule.get("mention") == "everyone"
+            and not (rule.get("channel_ids") or rule.get("category_ids"))):
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⛔ @everyone 은 채널을 지정해야 합니다",
+                description=(
+                    "채널을 고르지 않으면 **감시 중인 모든 채널**에서 서버 전원을 "
+                    "부르게 됩니다. 매크로 채널을 직접 골라 주세요.\n\n"
+                    "-# 범위를 좁히지 않은 전원 호출은 되돌릴 수 없습니다.\n"
+                    "-# 채널을 안 고르고 쓰려면 `@here` 나 역할을 쓰세요."),
+                color=discord.Color.red()),
+            ephemeral=True)
+        return
+
+    settings = await get_linkguard_settings(interaction.guild.id)
+    rules = list(settings.get("notify_rules") or [])
+    rules.append(rule)
+    await save_linkguard_settings(interaction.guild.id, {"notify_rules": rules})
+
+    warning = _notify_perm_warning(interaction.guild, rule)
+    embed = discord.Embed(
+        title="✅ 알림 규칙 추가 완료" if not warning else "⚠️ 저장했지만 확인이 필요합니다",
+        description=(f"**{len(rules)}번 규칙**\n"
+                     f"{describe_notify_rule(rule, interaction.guild)}"
+                     + (f"\n\n{warning}" if warning else "")),
+        color=discord.Color.green() if not warning else discord.Color.orange()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class NotifyTargetRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, channel_ids, category_ids, biomes):
+        super().__init__(placeholder="울릴 역할을 고르세요 (여러 개 가능)...",
+                         min_values=1, max_values=5)
+        self._channel_ids = channel_ids
+        self._category_ids = category_ids
+        self._biomes = biomes
+
+    async def callback(self, interaction: discord.Interaction):
+        await _save_notify_rule(interaction, {
+            "channel_ids": self._channel_ids,
+            "category_ids": self._category_ids,
+            "biomes": self._biomes,
+            "mention": "roles",
+            "role_ids": [r.id for r in self.values],
+        })
+
+
+class NotifyTargetView(discord.ui.View):
+    def __init__(self, channel_ids, category_ids, biomes):
+        super().__init__(timeout=180)
+        self._channel_ids = channel_ids
+        self._category_ids = category_ids
+        self._biomes = biomes
+        self.add_item(NotifyTargetRoleSelect(channel_ids, category_ids, biomes))
+
+    async def _pick(self, interaction: discord.Interaction, kind: str):
+        await _save_notify_rule(interaction, {
+            "channel_ids": self._channel_ids,
+            "category_ids": self._category_ids,
+            "biomes": self._biomes,
+            "mention": kind,
+            "role_ids": [],
+        })
+
+    @discord.ui.button(label="@everyone (서버 전원)", style=discord.ButtonStyle.danger, emoji="📢")
+    async def everyone(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "everyone")
+
+    @discord.ui.button(label="@here (접속 중인 사람)", style=discord.ButtonStyle.primary, emoji="🟢")
+    async def here(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "here")
+
+
+class NotifyBiomeModal(discord.ui.Modal, title="🔔 어떤 바이옴에 알릴까요"):
+    biomes = discord.ui.TextInput(
+        label="바이옴 이름 (쉼표 또는 줄바꿈으로 구분)",
+        placeholder="예: DREAMSPACE, CYBERSPACE, GLITCH   ·   비우면 모든 바이옴",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500
+    )
+
+    def __init__(self, channel_ids, category_ids):
+        super().__init__()
+        self._channel_ids = channel_ids
+        self._category_ids = category_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.biomes.value or "").replace(chr(10), ",")
+        names = [x.strip() for x in raw.split(",") if x.strip()]
+
+        where = [f"<#{cid}>" for cid in self._channel_ids]
+        for cat_id in self._category_ids:
+            category = interaction.guild.get_channel(cat_id)
+            where.append(f"📂 {category.name}" if category else f"📂 {cat_id}")
+
+        listed = ", ".join("`" + n + "`" for n in names)
+        embed = discord.Embed(
+            title="🔔 누구를 부를까요",
+            description=(
+                f"**어디서** {' '.join(where) or '감시 중인 모든 채널'}\n"
+                f"**언제** {listed or '모든 바이옴'}\n\n"
+                "울릴 대상을 고르세요."
+            ),
+            color=discord.Color.blurple()
+        )
+        if names:
+            embed.set_footer(text="이름은 대소문자·공백·기호를 무시하고 '들어있는지'로 봅니다.")
+        await interaction.response.send_message(
+            embed=embed,
+            view=NotifyTargetView(self._channel_ids, self._category_ids, names),
+            ephemeral=True
+        )
+
+
+class NotifyScopeSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="이 규칙을 적용할 채널 / 카테고리를 고르세요...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.category],
+            max_values=10
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        channel_ids, category_ids = [], []
+        for picked in self.values:
+            if picked.type == discord.ChannelType.category:
+                category_ids.append(picked.id)
+            else:
+                channel_ids.append(picked.id)
+        await interaction.response.send_modal(NotifyBiomeModal(channel_ids, category_ids))
+
+
+class NotifyScopeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(NotifyScopeSelect())
+
+    @discord.ui.button(label="채널 구분 없이 전부", style=discord.ButtonStyle.secondary, emoji="🌐")
+    async def everywhere(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NotifyBiomeModal([], []))
+
+
+class NotifyRuleRemoveSelect(discord.ui.Select):
+    def __init__(self, rules: list, guild: discord.Guild):
+        options = []
+        for i, rule in enumerate(rules[:25]):
+            options.append(discord.SelectOption(
+                label=f"{i + 1}번 규칙"[:100],
+                value=str(i),
+                description=describe_notify_rule(rule, guild)[:95],
+                emoji="🗑️"
+            ))
+        super().__init__(placeholder="삭제할 규칙을 고르세요...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        index = int(self.values[0])
+        settings = await get_linkguard_settings(interaction.guild.id)
+        rules = list(settings.get("notify_rules") or [])
+        if index >= len(rules):
+            await interaction.response.send_message(
+                "⚠️ 그 사이에 규칙이 바뀌었습니다. 다시 열어 주세요.", ephemeral=True)
+            return
+        removed = rules.pop(index)
+        await save_linkguard_settings(interaction.guild.id, {"notify_rules": rules})
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🗑️ 알림 규칙 삭제 완료",
+                description=describe_notify_rule(removed, interaction.guild),
+                color=discord.Color.orange()),
+            ephemeral=True)
+
+
+class NotifyRuleRemoveView(discord.ui.View):
+    def __init__(self, rules: list, guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.add_item(NotifyRuleRemoveSelect(rules, guild))
+
+
+class NotifyCooldownModal(discord.ui.Modal, title="⏱️ 같은 링크 재알림 간격"):
+    minutes = discord.ui.TextInput(
+        label="몇 분 동안 다시 울리지 않을까요",
+        placeholder="예: 30   ·   0 이면 보호할 때마다 전부 울립니다",
+        required=True,
+        max_length=5
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.minutes.value or "").strip()
+        # required=True 는 공백을 막지 못합니다. 숫자가 아닌 입력을 여기서
+        # 거르지 않으면 '설정 완료'만 뜨고 값은 그대로인 상태가 됩니다.
+        try:
+            value = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ 숫자만 입력해 주세요 (예: `30`). 설정은 그대로 두었습니다.",
+                ephemeral=True)
+            return
+        if value < 0 or value > 1440:
+            await interaction.response.send_message(
+                "⚠️ 0 에서 1440(24시간) 사이로 넣어 주세요. 설정은 그대로 두었습니다.",
+                ephemeral=True)
+            return
+
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"notify_cooldown_minutes": value})
+        if value:
+            desc = (f"같은 링크가 다시 보호되면 **{value}분** 동안은 멘션 없이 "
+                    "조용히 갱신합니다.")
+            color = discord.Color.green()
+        else:
+            desc = ("⚠️ **끔** — 같은 링크가 다시 보호될 때마다 전부 울립니다. "
+                    "매크로는 같은 링크를 평균 145번 다시 올립니다.")
+            color = discord.Color.orange()
+        await interaction.response.send_message(
+            embed=discord.Embed(title="⏱️ 재알림 간격 변경", description=desc, color=color),
+            ephemeral=True)
+
+
+class NotifyRuleView(discord.ui.View):
+    def __init__(self, settings: dict):
+        super().__init__(timeout=180)
+        carry = settings.get("carry_embed_mentions", True)
+        self.carry.label = "임베드 멘션 살리기: " + ("켜짐" if carry else "꺼짐")
+        self.carry.style = (discord.ButtonStyle.success if carry
+                            else discord.ButtonStyle.secondary)
+
+    @discord.ui.button(label="규칙 추가", style=discord.ButtonStyle.primary, emoji="➕")
+    async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🔔 어디에 적용할까요",
+                description=("멘션을 붙일 채널이나 카테고리를 고르세요.\n"
+                             "고르지 않고 **채널 구분 없이 전부** 를 누르면 "
+                             "감시 중인 모든 채널에 적용됩니다."),
+                color=discord.Color.blurple()),
+            view=NotifyScopeView(), ephemeral=True)
+
+    @discord.ui.button(label="규칙 삭제", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_linkguard_settings(interaction.guild.id)
+        rules = settings.get("notify_rules") or []
+        if not rules:
+            await interaction.response.send_message("삭제할 규칙이 없습니다.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=discord.Embed(title="🗑️ 삭제할 규칙 선택", color=discord.Color.orange()),
+            view=NotifyRuleRemoveView(rules, interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="재알림 간격", style=discord.ButtonStyle.secondary, emoji="⏱️")
+    async def cooldown(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NotifyCooldownModal())
+
+    @discord.ui.button(label="임베드 멘션 살리기", style=discord.ButtonStyle.secondary, emoji="🔁")
+    async def carry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_linkguard_settings(interaction.guild.id)
+        new_state = not settings.get("carry_embed_mentions", True)
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"carry_embed_mentions": new_state})
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🔁 임베드 멘션 살리기 " + ("✅ 켜짐" if new_state else "❌ 꺼짐"),
+                description=("임베드 **안**에 적힌 역할 멘션을 본문으로 끌어올려 "
+                             "실제로 알림이 가게 합니다."
+                             if new_state else
+                             "임베드 안의 멘션은 글자로만 남고 알림이 가지 않습니다."),
+                color=discord.Color.green() if new_state else discord.Color.greyple()),
+            ephemeral=True)
+
+
 class GuardSettingsSelect(discord.ui.Select):
     def __init__(self, current: dict):
         channel_count = len(current.get("channel_ids", []))
         category_count = len(current.get("category_ids", []))
         exc_count = len(current.get("exception_channel_ids", []))
         enabled_desc = "현재: ✅ 활성화" if current.get("enabled", True) else "현재: ❌ 비활성화"
+        rule_count = len(current.get("notify_rules", []))
+        notify_desc = (f"현재 {rule_count}개 규칙 — 재게시할 때 봇이 직접 멘션합니다."
+                       if rule_count else
+                       "매크로 임베드에 멘션이 없으면 봇이 직접 붙입니다.")
 
         options = [
             discord.SelectOption(
@@ -1789,6 +2421,12 @@ class GuardSettingsSelect(discord.ui.Select):
                 value="text",
                 description="링크 버튼 문구와 잠금 안내 문구를 변경합니다.",
                 emoji="📝"
+            ),
+            discord.SelectOption(
+                label="바이옴 알림 멘션",
+                value="notify",
+                description=notify_desc,
+                emoji="🔔"
             ),
             discord.SelectOption(
                 label="로그 채널 설정",
@@ -2001,6 +2639,13 @@ class GuardSettingsSelect(discord.ui.Select):
         elif choice == "text":
             await interaction.response.send_modal(GuardTextModal(settings))
 
+        elif choice == "notify":
+            await interaction.response.send_message(
+                embed=build_notify_embed(guild, settings),
+                view=NotifyRuleView(settings),
+                ephemeral=True
+            )
+
         elif choice == "logchannel":
             current_id = settings.get("log_channel_id")
             current = guild.get_channel(int(current_id)) if current_id else None
@@ -2158,6 +2803,31 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
         value=role.mention if role else "⚠️ 미설정 — `/인증설정`에서 먼저 역할을 지정해 주세요",
         inline=False
     )
+    # 알림 멘션은 **설정했는데 권한이 없어 조용히 죽는** 대표적인 자리입니다.
+    # 여기서 보여주지 않으면 "왜 알림이 안 와요"를 아무도 못 풉니다.
+    rules = settings.get("notify_rules") or []
+    if rules:
+        lines = []
+        for i, rule in enumerate(rules[:5]):
+            warn = _notify_perm_warning(guild, rule)
+            mark = "⚠️" if warn else "✅"
+            lines.append(f"{mark} `{i + 1}.` {describe_notify_rule(rule, guild)}")
+        if len(rules) > 5:
+            lines.append(f"-# 외 {len(rules) - 5}개")
+        cooldown = settings.get("notify_cooldown_minutes", 30)
+        lines.append(f"-# 같은 링크 재알림 간격: **{cooldown}분**"
+                     if cooldown else
+                     "-# ⚠️ 재알림 간격이 꺼져 있어 같은 링크마다 전부 울립니다")
+        if any(_notify_perm_warning(guild, r) for r in rules):
+            lines.append("-# ⚠️ 표시된 규칙은 봇에게 "
+                         "`@everyone, @here, 모든 역할 멘션` 권한이 없어 "
+                         "글자만 남고 알림이 가지 않습니다.")
+        value = "\n".join(lines)
+    else:
+        value = ("미설정 — 매크로 임베드에 멘션이 없으면 아무도 바이옴이 뜬 것을 "
+                 "모릅니다. **바이옴 알림 멘션**에서 규칙을 만드세요.")
+    embed.add_field(name="🔔 바이옴 알림 멘션", value=value[:1024], inline=False)
+
     embed.add_field(
         name="🔗 버튼 문구",
         value=f"`{settings.get('button_label', '🎮 개인서버 입장하기')}`",
@@ -2280,9 +2950,62 @@ class LinkGuard(commands.Cog):
         # 라이브러리 기본값에 맡기지 않고 **명시**합니다. 지금은 기본값이
         # 멘션을 허용하지만, 나중에 누가 Bot(allowed_mentions=...) 를 주는
         # 순간 이 알림이 조용히 죽습니다.
+        #
+        # 그런데 **원본에 멘션이 아예 없는 채널이 있습니다** — MultiScope 는
+        # 임베드와 링크 버튼만 보냅니다. 살릴 것이 없으니 사람들은 바이옴이
+        # 뜬 것을 모릅니다. 그래서 아래 두 갈래를 더 얹습니다.
+        #   ② 임베드 **안**에 적힌 멘션을 본문으로 끌어올리기
+        #      (임베드 안의 `<@&역할>` 은 글자로만 보이고 알림이 안 갑니다)
+        #   ③ 설정한 규칙대로 봇이 직접 붙이기 (채널·바이옴별)
+        add_roles: list[int] = []
+        add_everyone = add_here = False
+
+        if settings.get("carry_embed_mentions", True):
+            e_roles, e_everyone, e_here = extract_embed_mentions(message)
+            add_roles.extend(e_roles)
+            add_everyone = add_everyone or e_everyone
+            add_here = add_here or e_here
+
+        rule, matched_biome = match_notify_rule(
+            settings, message.channel, biome_haystack(message))
+        if rule is not None:
+            kind = rule.get("mention", "roles")
+            if kind == "everyone":
+                add_everyone = True
+            elif kind == "here":
+                add_here = True
+            for rid in rule.get("role_ids") or []:
+                if rid not in add_roles:
+                    add_roles.append(rid)
+
+        # 같은 링크를 다시 보호하는 것뿐이면 **알림만** 건너뜁니다.
+        # (보호 자체는 그대로 합니다 — 매크로가 같은 링크를 평균 145번
+        #  다시 올리므로, 매번 울리면 6000명이 같은 알림을 수백 번 받습니다)
+        muted_by_cooldown = False
+        if (add_roles or add_everyone or add_here) and notify_on_cooldown(
+                guild.id, all_links, settings.get("notify_cooldown_minutes", 30)):
+            add_roles, add_everyone, add_here = [], False, False
+            muted_by_cooldown = True
+
+        # 본문에 이미 있는 멘션은 두 번 적지 않습니다.
+        existing = clean_content or ""
+        bits: list[str] = []
+        if add_everyone and not EVERYONE_RE.search(existing):
+            bits.append("@everyone")
+        elif add_here and not add_everyone and not HERE_RE.search(existing):
+            bits.append("@here")
+        for rid in add_roles:
+            token = f"<@&{rid}>"
+            if token not in existing:
+                bits.append(token)
+
+        if bits:
+            line = " ".join(bits)
+            clean_content = f"{line}\n{existing}" if existing.strip() else line
+
         allowed = discord.AllowedMentions(
-            everyone=message.mention_everyone,
-            roles=list(message.role_mentions) or False,
+            everyone=bool(message.mention_everyone or add_everyone or add_here),
+            roles=_merge_role_targets(message.role_mentions, add_roles) or False,
             # 유저 멘션까지 다시 울릴 이유는 없습니다. 원본은 이미 지워졌고,
             # 같은 사람에게 두 번 알림이 가는 것이 더 이상합니다.
             users=False,
@@ -2291,11 +3014,21 @@ class LinkGuard(commands.Cog):
 
         # 멘션이 있는데 울릴 권한이 없으면 **글자만 남고 알림은 안 갑니다.**
         # 조용히 지나가면 "왜 알림이 안 오지?" 를 아무도 못 풉니다.
-        needs_perm = message.mention_everyone or any(
+        needs_perm = bool(message.mention_everyone or add_everyone or add_here) or any(
             not r.mentionable for r in message.role_mentions)
+        for rid in add_roles:
+            role = guild.get_role(rid)
+            if role is None:
+                print(
+                    f"[LinkGuard] 알림 역할 {rid} 을 찾을 수 없습니다 — 역할이 "
+                    "삭제된 것 같습니다. /링크보호설정 → 바이옴 알림 멘션 에서 "
+                    "규칙을 고쳐 주세요.",
+                    flush=True)
+            elif not role.mentionable:
+                needs_perm = True
         if needs_perm and perms is not None and not perms.mention_everyone:
             print(
-                f"[LinkGuard] #{message.channel} 원본의 멘션을 다시 울릴 수 "
+                f"[LinkGuard] #{message.channel} 알림 멘션을 울릴 수 "
                 "없습니다 — 봇에게 '@everyone, @here, 모든 역할 멘션' 권한을 "
                 "주세요. 지금은 멘션 글자만 남고 알림은 가지 않습니다.",
                 flush=True)
@@ -2310,6 +3043,12 @@ class LinkGuard(commands.Cog):
         except Exception as e:
             print(f"[LinkGuard] 보호 메시지 재전송 중 오류: {e}", flush=True)
             return
+
+        # 알림을 **실제로 보낸 뒤에만** 기억합니다. 보내기 전에 기억하면
+        # 전송이 실패했을 때 쿨타임 동안 다시 시도하지 않아 그 바이옴 알림이
+        # 통째로 사라집니다.
+        if bits and not muted_by_cooldown:
+            remember_notify(guild.id, all_links)
 
         # 6. 재게시된 메시지 ID를 키로 원본 링크를 저장 (버튼이 이 키로 조회합니다)
         await save_protected_link(guild.id, sent.id, all_links)

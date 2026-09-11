@@ -304,6 +304,93 @@ async def main():
     note(len(after.get("notify_rules") or []) == 1, "거부된 규칙이 저장되지 않음")
 
     print("")
+    print("=== 10-3. 카테고리로 지정하면 그 안의 채널 전부 ===")
+    # 매크로 채널은 카테고리별로 나뉘어 있습니다. 채널을 하나씩 고르게 하면
+    # 새 채널이 생길 때마다 규칙을 고쳐야 하고, 고치기 전까지 그 채널의
+    # 희귀 바이옴은 조용히 지나갑니다.
+    category = GUILD.categories[0]          # 444
+    in_cat = GUILD.channels[1]              # 222 — 이 카테고리 안에 있다고 둡니다
+    out_cat = GUILD.channels[0]             # 111 — 카테고리 밖
+    in_cat.category_id = category.id
+    out_cat.category_id = None
+
+    await setup(channel_ids=[in_cat.id, out_cat.id], notify_rules=[{
+        "channel_ids": [], "category_ids": [category.id],
+        "biomes": RARE, "mention": "everyone", "role_ids": [],
+    }])
+    await run(macro_msg(in_cat, "Biome Started - DREAMSPACE", link("cat1")))
+    note(pings_everyone(in_cat), "카테고리 안의 채널에서 울림")
+
+    await run(macro_msg(out_cat, "Biome Started - DREAMSPACE", link("cat2")))
+    body, am = said(out_cat)
+    note(out_cat.sent, "카테고리 밖 채널도 보호는 그대로")
+    note("@everyone" not in body, "카테고리 밖에서는 울리지 않음", repr(body[:40]))
+
+    print("")
+    print("  카테고리에 나중에 생긴 채널도 자동으로 포함됩니다")
+    newborn = F.Channel(555001, "새매크로채널", GUILD)
+    newborn.category_id = category.id
+    GUILD._chans[newborn.id] = newborn
+    await setup(channel_ids=[in_cat.id], category_ids=[category.id],
+                notify_rules=[{
+                    "channel_ids": [], "category_ids": [category.id],
+                    "biomes": RARE, "mention": "everyone", "role_ids": [],
+                }])
+    newborn.sent.clear()
+    await run(macro_msg(newborn, "Biome Started - GLITCH", link("cat3")))
+    note(pings_everyone(newborn), "규칙을 고치지 않아도 새 채널에서 울림")
+
+    print("")
+    print("  @everyone 은 카테고리만 지정해도 허용됩니다 (범위가 있으므로)")
+    it = Inter()
+    view = LG.NotifyTargetView([], [category.id], RARE)
+    await view.everyone.callback(it)
+    sent = it.response.sent[0] if it.response.sent else {}
+    embed_out = sent.get("embed")
+    note(embed_out is not None and "⛔" not in (embed_out.title or ""),
+         "카테고리를 지정한 @everyone 은 저장됨", str(embed_out and embed_out.title))
+
+    print("")
+    print("  카테고리를 고르면 category_ids 로 들어가야 합니다")
+    it = Inter()
+    scope = LG.NotifyScopeSelect()
+    scope._values = [category, in_cat]
+    await scope.callback(it)
+    note(it.response.modal == "NotifyBiomeModal", "채널+카테고리 혼합 선택도 진행됨")
+
+    scope2 = LG.NotifyScopeSelect()
+    scope2._values = [category]
+    it2 = Inter()
+    await scope2.callback(it2)
+    note(discord.ChannelType.category in [c.type for c in scope2.values],
+         "카테고리가 선택값으로 들어옴")
+
+    print("")
+    print("  설명 줄에 카테고리 이름이 보여야 합니다")
+    desc = LG.describe_notify_rule({
+        "channel_ids": [], "category_ids": [category.id],
+        "biomes": RARE, "mention": "everyone", "role_ids": []}, GUILD)
+    note(category.name in desc, "카테고리 이름이 보임", desc[:60])
+
+    print("")
+    print("  문자열로 저장된 카테고리 ID 도 정규화돼야 합니다")
+    await setup(channel_ids=[in_cat.id], notify_rules=[{
+        "channel_ids": [], "category_ids": [str(category.id)],
+        "biomes": RARE, "mention": "everyone", "role_ids": [],
+    }])
+    loaded_cat = await vdb.get_linkguard_settings(GUILD.id)
+    rule_cat = (loaded_cat.get("notify_rules") or [{}])[0]
+    note(rule_cat.get("category_ids") == [category.id],
+         "카테고리 ID 가 int 로 정규화됨", str(rule_cat.get("category_ids")))
+    in_cat.sent.clear()
+    await run(macro_msg(in_cat, "Biome Started - CYBERSPACE", link("cat4")))
+    note(pings_everyone(in_cat), "문자열로 저장돼 있어도 카테고리 규칙이 동작")
+
+    # 뒤 검사들이 카테고리에 영향받지 않도록 되돌립니다
+    in_cat.category_id = None
+    out_cat.category_id = None
+
+    print("")
     print("=== 11. 채널을 지정하지 않은 규칙은 모든 감시 채널에 ===")
     await setup(notify_rules=[{
         "channel_ids": [], "category_ids": [],

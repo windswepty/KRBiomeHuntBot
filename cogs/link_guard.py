@@ -2198,7 +2198,7 @@ class NotifyBiomeModal(discord.ui.Modal, title="🔔 어떤 바이옴에 알릴�
 class NotifyScopeSelect(discord.ui.ChannelSelect):
     def __init__(self):
         super().__init__(
-            placeholder="이 규칙을 적용할 채널 / 카테고리를 고르세요...",
+            placeholder="📂 카테고리(권장) 또는 채널을 고르세요...",
             channel_types=[discord.ChannelType.text, discord.ChannelType.category],
             max_values=10
         )
@@ -2312,9 +2312,16 @@ class NotifyRuleView(discord.ui.View):
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="🔔 어디에 적용할까요",
-                description=("멘션을 붙일 채널이나 카테고리를 고르세요.\n"
-                             "고르지 않고 **채널 구분 없이 전부** 를 누르면 "
-                             "감시 중인 모든 채널에 적용됩니다."),
+                description=(
+                    "멘션을 붙일 **채널 또는 카테고리**를 고르세요 (최대 10개, "
+                    "섞어서 고를 수 있습니다).\n\n"
+                    "📂 **카테고리를 고르는 쪽을 권합니다.** 그 안의 채널이 전부 "
+                    "적용되고, 나중에 그 카테고리에 **새 채널이 생겨도 규칙을 "
+                    "고칠 필요가 없습니다.** 채널을 하나씩 걸어 두면 새 매크로 "
+                    "채널이 생긴 날 그 채널의 희귀 바이옴은 조용히 지나갑니다.\n\n"
+                    "-# 고르지 않고 **채널 구분 없이 전부** 를 누르면 감시 중인 "
+                    "모든 채널에 적용됩니다. `@everyone` 은 이 방식으로는 "
+                    "저장할 수 없습니다."),
                 color=discord.Color.blurple()),
             view=NotifyScopeView(), ephemeral=True)
 

@@ -310,6 +310,30 @@ def check_secrets_ignored():
          ".env.example 은 예외로 되살려 둠 (문서용이라 추적해야 합니다)")
 
 
+
+def check_docs_budget():
+    """CLAUDE.md 가 다시 부풀지 않는지 봅니다.
+
+    이 파일은 **세션이 열릴 때마다 통째로 읽힙니다.** 65KB 까지 자랐을 때
+    그만큼을 먼저 먹고 시작해서 대화가 일찍 잘렸고, 그래서 2026-09-11 에
+    과거 사고 기록을 `docs/LESSONS.md` 로 옮겼습니다.
+
+    **또 여기에 쌓으면 같은 일이 반복됩니다.** 새 지뢰는 LESSONS 에 적으세요.
+    """
+    budget = 52000
+    claude = (PROJ / "CLAUDE.md").read_bytes()
+    lessons = PROJ / "docs" / "LESSONS.md"
+    note(len(claude) <= budget,
+         f"CLAUDE.md 가 예산 안에 있음 ({len(claude):,} / {budget:,} B)",
+         "넘으면 과거 기록을 docs/LESSONS.md 로 옮기세요")
+    note(lessons.exists() and lessons.stat().st_size > 5000,
+         "docs/LESSONS.md 가 있고 비어 있지 않음",
+         f"{lessons.stat().st_size:,} B" if lessons.exists() else "없음")
+    text = claude.decode("utf-8")
+    note("docs/LESSONS.md" in text,
+         "CLAUDE.md 가 LESSONS 를 가리킴 (안 그러면 아무도 안 읽습니다)")
+
+
 check_ephemeral()
 check_db_wrap()
 check_silent()
@@ -317,6 +341,7 @@ check_custom_id()
 check_points()
 check_guild_only()
 check_secrets_ignored()
+check_docs_budget()
 
 print(f"\n  실패 {len(FAILS)}건 / 성공 {len(OKS)}건")
 for x in FAILS:

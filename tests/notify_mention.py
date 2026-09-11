@@ -327,6 +327,67 @@ async def main():
         note("@everyone" not in body, f"{name:11} 흔한 바이옴(SNOWY) → 안 울림")
 
     print("")
+    print("  Biome Forward — 링크를 **본문**에 넣고 역할 멘션을 직접 붙입니다")
+    # 7번째 형식입니다. 앞의 6종과 달리 링크가 임베드가 아니라 본문에 있고,
+    # 매크로가 `@Hell` 같은 역할 멘션을 **원본 본문에** 적어 보냅니다.
+    # (`바이옴 알림` 카테고리가 이 형식입니다)
+    def biome_forward(biome, started=True):
+        e = discord.Embed(
+            title=f"BIOME {'STARTED' if started else 'ENDED'} - {biome} Found")
+        e.set_author(name="Biome Forward")
+        e.add_field(name="Channel", value="# 1🌸1🌺 | kang3767_1 | 🔣")
+        e.add_field(name="Time", value="2분 전")
+        e.add_field(name="Message",
+                    value="[Jump to Message](https://discord.com/channels/1/2/3)")
+        # 제작자 연락처입니다 — **유저 멘션**이라 매번 울리면 안 됩니다.
+        e.set_footer(text="Message <@616699109931352113> (shayge_) for any bugs")
+        return e
+
+    hell = Role(1442029067535646774, "Hell", 6)
+    await setup(notify_rules=[])
+    _mid[0] += 1
+    fwd = Msg(_mid[0], macro_ch, Member(3, "Biome Forward", guild=GUILD))
+    fwd.guild, fwd.webhook_id = GUILD, 12345
+    fwd.content = f"{hell.mention}\n{link('fwd1')}"
+    fwd.role_mentions = [hell]
+    fwd.embeds = [biome_forward("HELL")]
+    await run(fwd)
+    body, am = said(macro_ch)
+    note(hell.mention in body, "원본 역할 멘션(@Hell)이 재게시본에 남음", repr(body[:30]))
+    note(bool(am) and hell.id in [r.id for r in (am.roles or [])],
+         "그 역할이 실제로 울리도록 허용됨")
+    note("roblox.com" not in body, "링크는 가려짐")
+
+    note("616699109931352113" not in body,
+         "⚠️ 임베드의 유저 멘션은 끌어올리지 않음 (제작자에게 매번 알림 가면 안 됨)",
+         repr(body[:60]))
+    note(bool(am) and am.users is False, "유저 멘션은 허용 자체를 하지 않음")
+
+    print("")
+    print("  이 형식도 희귀 바이옴 규칙이 걸리면 울려야 합니다")
+    await setup()
+    _mid[0] += 1
+    fwd2 = Msg(_mid[0], macro_ch, Member(3, "Biome Forward", guild=GUILD))
+    fwd2.guild, fwd2.webhook_id = GUILD, 12345
+    fwd2.content = link("fwd2")
+    fwd2.embeds = [biome_forward("DREAMSPACE")]
+    await run(fwd2)
+    note(pings_everyone(macro_ch), "BIOME STARTED - DREAMSPACE Found → 울림")
+
+    print("")
+    print("  이 형식의 종료 표기도 제외에 걸려야 합니다")
+    _mid[0] += 1
+    fwd3 = Msg(_mid[0], macro_ch, Member(3, "Biome Forward", guild=GUILD))
+    fwd3.guild, fwd3.webhook_id = GUILD, 12345
+    fwd3.content = link("fwd3")
+    fwd3.embeds = [biome_forward("DREAMSPACE", started=False)]
+    await run(fwd3)
+    body, am = said(macro_ch)
+    note("@everyone" not in body,
+         "BIOME ENDED - DREAMSPACE Found → 안 울림 ('Biome End' 가 덮음)",
+         repr(body[:30]))
+
+    print("")
     print("  ⚠️ 매크로 **이름**에 바이옴 이름이 들어가도 걸리면 안 됩니다")
     # 작성자·바닥글에는 매크로 이름과 버전이 들어갑니다. 판정에 섞으면
     # 그 매크로의 **모든** 메시지가 희귀 바이옴으로 잡힙니다.

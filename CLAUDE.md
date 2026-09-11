@@ -286,12 +286,17 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
   제외에 걸리면 규칙 멘션도, 임베드에서 끌어올리는 멘션도 전부 막습니다.
   (실제로는 종료 임베드에 **링크가 없어** 보호 대상이 아니라 여기까지
   오지도 않습니다. 링크를 붙이는 매크로가 생길 경우의 안전망입니다)
-- **매크로마다 임베드가 다릅니다.** 확인한 6종(MultiScope · DroidScope ·
-  EggSol · Coteab · maxstellar · 크로마틱)은 전부 제목이
-  `Biome Started - <이름>` / `Biome Ended - <이름>` 이었고, 링크는 필드
-  (`Private Server` · `Private Server Link`)나 본문 `[Join Server](…)` 로
-  제각각이었습니다. **하나에서 확인하고 "된다"고 하지 마세요** —
-  `tests/notify_mention.py` 에 6종을 전부 넣어 두었습니다.
+- **매크로마다 임베드가 다릅니다.** 확인한 7종(MultiScope · DroidScope ·
+  EggSol · Coteab · maxstellar · 크로마틱 · Biome Forward)은 제목이
+  `Biome Started - <이름>` 또는 `BIOME STARTED - <이름> Found` 였고,
+  링크는 필드(`Private Server` · `Private Server Link`) · 본문
+  `[Join Server](…)` · 링크 버튼 · **메시지 본문**으로 제각각이었습니다.
+  **하나에서 확인하고 "된다"고 하지 마세요** — `tests/notify_mention.py`
+  에 7종을 전부 넣어 두었습니다.
+- **임베드의 유저 멘션(`<@…>`)은 끌어올리지 않습니다.** Biome Forward 는
+  바닥글에 제작자 연락처를 유저 멘션으로 넣습니다. 이걸 같이 올리면
+  **바이옴이 뜰 때마다 그 사람에게 알림이 갑니다.** `ROLE_MENTION_RE` 가
+  `<@&…>` 만 잡고 `allowed_mentions.users` 가 False 인 것은 그래서입니다.
 - **작성자·바닥글은 바이옴 판정에서 뺍니다**(`embed_texts(meta=False)`).
   거기엔 매크로 이름과 버전이 들어갑니다 — `frluxky's Macro`,
   `MultiScope v2.0.5`. 판정에 섞으면 **매크로 이름에 바이옴 이름이 들어간

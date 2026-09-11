@@ -106,6 +106,7 @@ async def main():
             }],
             "notify_cooldown_minutes": 30,
             "carry_embed_mentions": True,
+            "notify_exclude": ["Biome Ended", "바이옴 종료"],
         }
         base.update(over)
         await vdb.save_linkguard_settings(GUILD.id, base)
@@ -167,6 +168,70 @@ async def main():
     note(LG.biome_matches(["Biome Started - DREAMSPACE"],
                           "Biome Ended - DREAMSPACE") is None,
          "'Biome Started - …' 로 적으면 Ended 는 안 걸림")
+
+    print("")
+    print("=== 3-2. 바이옴 종료 임베드에는 멘션하지 않아야 ===")
+    # 종료 임베드에도 같은 바이옴 이름이 들어 있어서, 이게 없으면
+    # 뜰 때와 끝날 때 **두 번** 울립니다.
+    await setup()
+    await run(macro_msg(macro_ch, "Biome Ended - DREAMSPACE", link("end1")))
+    body, am = said(macro_ch)
+    note(macro_ch.sent, "종료 임베드도 보호는 그대로 함 (멘션만 안 붙임)")
+    note("@everyone" not in body, "종료에는 @everyone 이 붙지 않음", repr(body[:40]))
+    note(not (am and am.everyone), "알림도 허용되지 않음")
+
+    print("")
+    print("  시작은 그대로 울려야 합니다")
+    await run(macro_msg(macro_ch, "Biome Started - DREAMSPACE", link("end2")))
+    note(pings_everyone(macro_ch), "같은 바이옴의 시작은 울림")
+
+    print("")
+    print("  ⚠️ 'Recommended' 같은 말에 잘못 걸리면 시작이 조용히 죽습니다")
+    # 기본값을 `Ended` 로 짧게 두지 않은 이유입니다 — 'Recommended' 안에도
+    # 'ended' 가 들어 있습니다.
+    await setup()
+    await run(macro_msg(macro_ch, "Biome Started - CYBERSPACE", link("end3"),
+                        fields=[("Recommended", "Join now"),
+                                ("Status", "Extended uptime")]))
+    note(pings_everyone(macro_ch),
+         "Recommended / Extended 가 있어도 시작 알림은 울림")
+
+    print("")
+    print("  임베드에 적힌 역할 멘션도 종료에서는 끌어올리지 않아야 합니다")
+    end_role = GUILD.roles[3]
+    await setup(notify_rules=[])
+    await run(macro_msg(macro_ch, "Biome Ended - DREAMSPACE", link("end4"),
+                        fields=[("알림", end_role.mention)]))
+    body, am = said(macro_ch)
+    note(end_role.mention not in body,
+         "종료 임베드의 역할 멘션은 본문으로 올리지 않음", repr(body[:40]))
+
+    print("")
+    print("  제외 단어를 비우면 종료에도 울립니다 (끄는 경로)")
+    await setup(notify_exclude=[])
+    await run(macro_msg(macro_ch, "Biome Ended - DREAMSPACE", link("end5")))
+    note(pings_everyone(macro_ch), "제외 단어를 비우면 종료에도 울림")
+
+    print("")
+    print("  제외 단어 UI")
+    it = Inter()
+    ex = LG.NotifyExcludeModal()
+    ex.words._value = "Biome Ended, 바이옴 종료\nStopped"
+    await ex.on_submit(it)
+    saved_ex = await vdb.get_linkguard_settings(GUILD.id)
+    note(saved_ex.get("notify_exclude") == ["Biome Ended", "바이옴 종료", "Stopped"],
+         "제외 단어가 저장됨", str(saved_ex.get("notify_exclude")))
+
+    it = Inter()
+    ex = LG.NotifyExcludeModal()
+    ex.words._value = "   "
+    await ex.on_submit(it)
+    saved_ex = await vdb.get_linkguard_settings(GUILD.id)
+    note(saved_ex.get("notify_exclude") == [],
+         "공백만 넣으면 비워짐 (required=True 는 공백을 막지 못합니다)")
+    sent_ex = it.response.sent[0] if it.response.sent else {}
+    note("⚠️" in ((sent_ex.get("embed") and sent_ex["embed"].description) or ""),
+         "비우면 종료에도 울린다고 경고함")
 
     print("")
     print("=== 4. ⚠️ 채팅으로는 절대 울리지 않아야 ===")

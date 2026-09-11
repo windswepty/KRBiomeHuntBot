@@ -386,6 +386,12 @@ https://www.roblox.com/games/920587237/Adopt-Me?privateServerLinkCode=xxxxx#hbh-
   (`DREAMSPACE` = `Dream Space` = `dream_space`).
   `Biome Ended` 까지 울리는 것이 싫으면 `Biome Started - DREAMSPACE` 처럼
   더 길게 적으면 됩니다.
+- **바이옴 종료 임베드에는 멘션하지 않습니다.** 종료 임베드에도 같은 바이옴
+  이름이 들어 있어서, 그냥 두면 뜰 때와 끝날 때 두 번 울립니다. 기본으로
+  `Biome Ended` · `바이옴 종료` 가 걸려 있고, `🚫 제외 단어`에서 바꿉니다.
+  **매크로의 종료 임베드 문구가 다르면 그 문구를 넣어 주세요.**
+  (짧게 `Ended` 만 넣으면 `Recommended` 같은 말에 걸려 시작 알림이 조용히
+  안 울리므로, 되도록 문장으로 넣으세요.)
 - **`@everyone` 은 채널을 반드시 골라야 합니다.** 범위를 비우면 감시 중인
   모든 채널이 전원 호출 통로가 되기 때문에 저장이 거부됩니다.
 - **같은 링크가 다시 올라오면 30분 동안은 조용히 갱신만 합니다.** 매크로는

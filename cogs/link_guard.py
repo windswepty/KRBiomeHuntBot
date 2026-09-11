@@ -464,7 +464,7 @@ def _norm_biome(text: str) -> str:
     매크로마다 `DREAMSPACE` `Dream Space` `dream_space` 로 제각각이라
     글자 그대로 비교하면 **설정해 둔 바이옴이 조용히 안 걸립니다.**
     """
-    return re.sub(r'[^0-9A-Z가-힣]+', '', (text or "").upper())
+    return re.sub(r'[^0-9A-Z가-힣]+', '', str(text or "").upper())
 
 
 def biome_matches(biomes, haystack: str) -> str | None:
@@ -480,6 +480,16 @@ def biome_matches(biomes, haystack: str) -> str | None:
         if key and key in norm:
             return name
     return None
+
+
+def notify_excluded(settings: dict, haystack: str) -> str | None:
+    """멘션을 붙이면 안 되는 임베드인지 봅니다 (바이옴 종료 등).
+
+    종료 임베드에도 같은 바이옴 이름이 들어 있어서, 이 검사가 없으면
+    **뜰 때와 끝날 때 두 번** 울립니다. 보호 자체는 그대로 하고 멘션만
+    붙이지 않습니다.
+    """
+    return biome_matches(settings.get("notify_exclude") or [], haystack)
 
 
 def rule_covers_channel(rule: dict, channel) -> bool:
@@ -2029,6 +2039,17 @@ def build_notify_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
               "가지 않습니다. 켜면 본문으로 끌어올려 실제로 울립니다.",
         inline=False
     )
+    excludes = settings.get("notify_exclude") or []
+    embed.add_field(
+        name="🚫 이 말이 들어 있으면 멘션 안 함",
+        value=((", ".join(f"`{w}`" for w in excludes)
+                + "\n바이옴 **종료** 임베드에도 같은 이름이 들어 있어서, 이게 "
+                  "없으면 뜰 때와 끝날 때 두 번 울립니다.")
+               if excludes else
+               "**없음** ⚠️ 종료 임베드에도 같은 바이옴 이름이 들어 있으면 "
+               "끝날 때도 울립니다."),
+        inline=False
+    )
     embed.set_footer(text="위에 있는 규칙이 먼저 적용됩니다 (맞는 것 하나만).")
     return embed
 
@@ -2299,6 +2320,36 @@ class NotifyCooldownModal(discord.ui.Modal, title="⏱️ 같은 링크 재알�
             ephemeral=True)
 
 
+class NotifyExcludeModal(discord.ui.Modal, title="🚫 멘션하지 않을 임베드"):
+    words = discord.ui.TextInput(
+        label="이 말이 들어 있으면 멘션하지 않습니다",
+        placeholder="예: Biome Ended, 바이옴 종료   ·   비우면 전부 멘션합니다",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.words.value or "").replace(chr(10), ",")
+        items = [x.strip() for x in raw.split(",") if x.strip()]
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"notify_exclude": items})
+
+        if items:
+            desc = ("이 말이 임베드에 들어 있으면 봇이 멘션을 붙이지 않습니다.\n"
+                    + ", ".join(f"`{w}`" for w in items)
+                    + "\n\n-# 보호는 그대로 합니다 — 멘션만 안 붙입니다.\n"
+                      "-# 대소문자·공백·기호는 무시하고 '들어있는지'로 봅니다.")
+            color = discord.Color.green()
+        else:
+            desc = ("⚠️ **비웠습니다.** 이제 바이옴 **종료** 임베드에도 같은 "
+                    "이름이 들어 있으면 끝날 때 한 번 더 울립니다.")
+            color = discord.Color.orange()
+        await interaction.response.send_message(
+            embed=discord.Embed(title="🚫 제외 단어 변경", description=desc, color=color),
+            ephemeral=True)
+
+
 class NotifyRuleView(discord.ui.View):
     def __init__(self, settings: dict):
         super().__init__(timeout=180)
@@ -2339,6 +2390,10 @@ class NotifyRuleView(discord.ui.View):
     @discord.ui.button(label="재알림 간격", style=discord.ButtonStyle.secondary, emoji="⏱️")
     async def cooldown(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NotifyCooldownModal())
+
+    @discord.ui.button(label="제외 단어", style=discord.ButtonStyle.secondary, emoji="🚫")
+    async def exclude(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NotifyExcludeModal())
 
     @discord.ui.button(label="임베드 멘션 살리기", style=discord.ButtonStyle.secondary, emoji="🔁")
     async def carry(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2821,6 +2876,9 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
             lines.append(f"{mark} `{i + 1}.` {describe_notify_rule(rule, guild)}")
         if len(rules) > 5:
             lines.append(f"-# 외 {len(rules) - 5}개")
+        excludes = settings.get("notify_exclude") or []
+        lines.append("-# 🚫 멘션 안 함: " + (", ".join(f"`{w}`" for w in excludes)
+                     if excludes else "**없음** — 종료 임베드에도 울립니다"))
         cooldown = settings.get("notify_cooldown_minutes", 30)
         lines.append(f"-# 같은 링크 재알림 간격: **{cooldown}분**"
                      if cooldown else
@@ -2973,8 +3031,16 @@ class LinkGuard(commands.Cog):
             add_everyone = add_everyone or e_everyone
             add_here = add_here or e_here
 
-        rule, matched_biome = match_notify_rule(
-            settings, message.channel, biome_haystack(message))
+        haystack = biome_haystack(message)
+
+        # 바이옴 **종료** 임베드에는 붙이지 않습니다. 같은 바이옴 이름이
+        # 들어 있어서, 이게 없으면 뜰 때와 끝날 때 두 번 울립니다.
+        excluded = notify_excluded(settings, haystack)
+
+        rule, matched_biome = match_notify_rule(settings, message.channel, haystack)
+        if excluded is not None:
+            rule = None
+            add_roles, add_everyone, add_here = [], False, False
         if rule is not None:
             kind = rule.get("mention", "roles")
             if kind == "everyone":

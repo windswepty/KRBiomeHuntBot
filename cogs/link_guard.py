@@ -563,53 +563,15 @@ def match_notify_rule(settings: dict, channel, haystack: str) -> tuple[dict | No
     return None, None
 
 
-# 같은 링크를 다시 보호할 때 멘션을 또 울리지 않도록 기억합니다.
-# 매크로는 **같은 개인서버 링크를 상태 갱신마다 다시 올립니다** — 실측으로
-# 고유 링크 하나당 평균 145번입니다. 이 기억이 없으면 6000명이 같은 바이옴
-# 알림을 수백 번 받습니다.
-_notified_at: dict[str, float] = {}
-_NOTIFY_MEMO_MAX = 2000
-
-
-def _notify_memo_keys(guild_id: int, links: list[str]) -> list[str]:
-    keys = []
-    for url in links:
-        key = link_key(url)
-        if key:
-            keys.append(f"{guild_id}:{key}")
-    return keys
-
-
-def notify_on_cooldown(guild_id: int, links: list[str], minutes) -> bool:
-    """이 링크로 최근에 이미 알렸는지 봅니다 (알림만 건너뛰고 보호는 그대로)."""
-    try:
-        window = float(minutes or 0) * 60
-    except (TypeError, ValueError):
-        window = 0
-    if window <= 0:
-        return False
-
-    now = time.monotonic()
-    for stale_key, at in list(_notified_at.items()):
-        if now - at > window:
-            _notified_at.pop(stale_key, None)
-
-    return any(key in _notified_at for key in _notify_memo_keys(guild_id, links))
-
-
-def remember_notify(guild_id: int, links: list[str]) -> None:
-    """알림을 **실제로 보낸 뒤에만** 기억합니다.
-
-    보내기 전에 기억하면, 전송이 실패했는데도 쿨타임 동안 다시 시도하지
-    않아 그 바이옴 알림이 통째로 사라집니다.
-    """
-    now = time.monotonic()
-    for key in _notify_memo_keys(guild_id, links):
-        _notified_at[key] = now
-
-    if len(_notified_at) > _NOTIFY_MEMO_MAX:
-        for old in sorted(_notified_at, key=_notified_at.get)[:len(_notified_at) // 2]:
-            _notified_at.pop(old, None)
+# ⚠️ **같은 링크로 알림을 막지 마세요.**
+#
+# 예전에 "같은 링크를 다시 보호하면 30분간 멘션 생략" 을 넣었다가 걷어냈습니다.
+# 개인서버 링크는 **그대로인 채 바이옴만 바뀝니다.** 그래서 같은 서버에서
+# 00:10 DREAMSPACE 를 알린 뒤 00:25 CYBERSPACE 가 떠도 창에 걸려 묻혔습니다.
+# 바이옴은 길어야 10분이라 30분 창은 **다음 희귀 바이옴을 통째로 삼킵니다.**
+#
+# 도배가 실제로 생기면 키를 **(링크 + 바이옴)** 으로 잡고 창을 바이옴 길이보다
+# 짧게 두세요. 링크만으로는 무엇을 해도 틀립니다.
 
 
 def _merge_role_targets(original_roles, extra_ids: list[int]) -> list:
@@ -2018,7 +1980,6 @@ class AutoDeleteToggleView(discord.ui.View):
 
 def build_notify_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
     rules = settings.get("notify_rules") or []
-    cooldown = settings.get("notify_cooldown_minutes", 30)
     carry = settings.get("carry_embed_mentions", True)
 
     if rules:
@@ -2036,14 +1997,6 @@ def build_notify_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
             + "\n".join(lines)
         ),
         color=discord.Color.blurple()
-    )
-    embed.add_field(
-        name="⏱️ 같은 링크 재알림 간격",
-        value=(f"**{cooldown}분**\n매크로는 같은 링크를 상태 갱신마다 다시 "
-               "올립니다(실측 평균 145번). 그 사이에는 조용히 갱신만 합니다."
-               if cooldown else
-               "**끔** ⚠️ 같은 링크가 다시 보호될 때마다 전부 울립니다."),
-        inline=False
     )
     embed.add_field(
         name="🔁 임베드 안의 멘션 살리기",
@@ -2293,46 +2246,6 @@ class NotifyRuleRemoveView(discord.ui.View):
         self.add_item(NotifyRuleRemoveSelect(rules, guild))
 
 
-class NotifyCooldownModal(discord.ui.Modal, title="⏱️ 같은 링크 재알림 간격"):
-    minutes = discord.ui.TextInput(
-        label="몇 분 동안 다시 울리지 않을까요",
-        placeholder="예: 30   ·   0 이면 보호할 때마다 전부 울립니다",
-        required=True,
-        max_length=5
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = str(self.minutes.value or "").strip()
-        # required=True 는 공백을 막지 못합니다. 숫자가 아닌 입력을 여기서
-        # 거르지 않으면 '설정 완료'만 뜨고 값은 그대로인 상태가 됩니다.
-        try:
-            value = int(raw)
-        except ValueError:
-            await interaction.response.send_message(
-                "⚠️ 숫자만 입력해 주세요 (예: `30`). 설정은 그대로 두었습니다.",
-                ephemeral=True)
-            return
-        if value < 0 or value > 1440:
-            await interaction.response.send_message(
-                "⚠️ 0 에서 1440(24시간) 사이로 넣어 주세요. 설정은 그대로 두었습니다.",
-                ephemeral=True)
-            return
-
-        await save_linkguard_settings(interaction.guild.id,
-                                      {"notify_cooldown_minutes": value})
-        if value:
-            desc = (f"같은 링크가 다시 보호되면 **{value}분** 동안은 멘션 없이 "
-                    "조용히 갱신합니다.")
-            color = discord.Color.green()
-        else:
-            desc = ("⚠️ **끔** — 같은 링크가 다시 보호될 때마다 전부 울립니다. "
-                    "매크로는 같은 링크를 평균 145번 다시 올립니다.")
-            color = discord.Color.orange()
-        await interaction.response.send_message(
-            embed=discord.Embed(title="⏱️ 재알림 간격 변경", description=desc, color=color),
-            ephemeral=True)
-
-
 class NotifyExcludeModal(discord.ui.Modal, title="🚫 멘션하지 않을 임베드"):
     words = discord.ui.TextInput(
         label="이 말이 들어 있으면 멘션하지 않습니다",
@@ -2399,10 +2312,6 @@ class NotifyRuleView(discord.ui.View):
         await interaction.response.send_message(
             embed=discord.Embed(title="🗑️ 삭제할 규칙 선택", color=discord.Color.orange()),
             view=NotifyRuleRemoveView(rules, interaction.guild), ephemeral=True)
-
-    @discord.ui.button(label="재알림 간격", style=discord.ButtonStyle.secondary, emoji="⏱️")
-    async def cooldown(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(NotifyCooldownModal())
 
     @discord.ui.button(label="제외 단어", style=discord.ButtonStyle.secondary, emoji="🚫")
     async def exclude(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2892,10 +2801,6 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
         excludes = settings.get("notify_exclude") or []
         lines.append("-# 🚫 멘션 안 함: " + (", ".join(f"`{w}`" for w in excludes)
                      if excludes else "**없음** — 종료 임베드에도 울립니다"))
-        cooldown = settings.get("notify_cooldown_minutes", 30)
-        lines.append(f"-# 같은 링크 재알림 간격: **{cooldown}분**"
-                     if cooldown else
-                     "-# ⚠️ 재알림 간격이 꺼져 있어 같은 링크마다 전부 울립니다")
         if any(_notify_perm_warning(guild, r) for r in rules):
             lines.append("-# ⚠️ 표시된 규칙은 봇에게 "
                          "`@everyone, @here, 모든 역할 멘션` 권한이 없어 "
@@ -3064,15 +2969,6 @@ class LinkGuard(commands.Cog):
                 if rid not in add_roles:
                     add_roles.append(rid)
 
-        # 같은 링크를 다시 보호하는 것뿐이면 **알림만** 건너뜁니다.
-        # (보호 자체는 그대로 합니다 — 매크로가 같은 링크를 평균 145번
-        #  다시 올리므로, 매번 울리면 6000명이 같은 알림을 수백 번 받습니다)
-        muted_by_cooldown = False
-        if (add_roles or add_everyone or add_here) and notify_on_cooldown(
-                guild.id, all_links, settings.get("notify_cooldown_minutes", 30)):
-            add_roles, add_everyone, add_here = [], False, False
-            muted_by_cooldown = True
-
         # 본문에 이미 있는 멘션은 두 번 적지 않습니다.
         existing = clean_content or ""
         bits: list[str] = []
@@ -3129,12 +3025,6 @@ class LinkGuard(commands.Cog):
         except Exception as e:
             print(f"[LinkGuard] 보호 메시지 재전송 중 오류: {e}", flush=True)
             return
-
-        # 알림을 **실제로 보낸 뒤에만** 기억합니다. 보내기 전에 기억하면
-        # 전송이 실패했을 때 쿨타임 동안 다시 시도하지 않아 그 바이옴 알림이
-        # 통째로 사라집니다.
-        if bits and not muted_by_cooldown:
-            remember_notify(guild.id, all_links)
 
         # 6. 재게시된 메시지 ID를 키로 원본 링크를 저장 (버튼이 이 키로 조회합니다)
         await save_protected_link(guild.id, sent.id, all_links)

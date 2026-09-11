@@ -28,7 +28,6 @@ VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
 
 RARE = ["DREAMSPACE", "CYBERSPACE", "GLITCHED"]
 
-# 링크마다 코드가 달라야 재알림 쿨타임을 제대로 시험할 수 있습니다.
 def link(code: str) -> str:
     return ("https://www.roblox.com/games/1234567/Test"
             f"?privateServerLinkCode={code}")
@@ -81,8 +80,8 @@ async def main():
     # ⚠️ **반드시 load_extension 뒤에 잡아야 합니다.**
     # discord.py 의 load_extension 은 sys.modules 를 확인하지 않고 모듈을
     # **새로 만들어 덮어씁니다.** 먼저 import 해 두면 그 이름은 버려진 옛
-    # 인스턴스를 가리켜, 여기서 `_notified_at` 을 비워도 실제로 도는 쪽은
-    # 그대로입니다. 그러면 쿨타임이 남아 **테스트만 조용히 틀립니다.**
+    # 인스턴스를 가리켜, 모듈 전역(캐시·기억)을 비워도 실제로 도는 쪽은
+    # 그대로입니다. 그러면 **테스트만 조용히 틀립니다.**
     LG = sys.modules["cogs.link_guard"]
     note(LG.__dict__ is lg._guard_message.__func__.__globals__,
          "테스트가 실제로 도는 모듈을 잡았는지 (load_extension 이 새로 만듭니다)")
@@ -104,13 +103,11 @@ async def main():
                 "channel_ids": [macro_ch.id], "category_ids": [],
                 "biomes": RARE, "mention": "everyone", "role_ids": [],
             }],
-            "notify_cooldown_minutes": 30,
             "carry_embed_mentions": True,
             "notify_exclude": ["Biome Ended", "바이옴 종료"],
         }
         base.update(over)
         await vdb.save_linkguard_settings(GUILD.id, base)
-        LG._notified_at.clear()
         macro_ch.sent.clear()
         other_ch.sent.clear()
 
@@ -446,37 +443,50 @@ async def main():
     note(not (am and am.everyone), "알림도 허용되지 않음")
 
     print("")
-    print("=== 6. 같은 링크를 다시 보호할 때는 조용히 ===")
-    # 매크로는 같은 링크를 상태 갱신마다 다시 올립니다(실측 평균 145번).
-    # 매번 울리면 6,500명이 같은 바이옴 알림을 수백 번 받습니다.
+    print("=== 6. ⚠️ 같은 링크라고 알림을 막으면 안 됩니다 ===")
+    # 예전에 "같은 링크면 30분간 멘션 생략" 을 넣었다가 걷어냈습니다.
+    # **개인서버 링크는 그대로인 채 바이옴만 바뀝니다.** 그래서 같은 서버에서
+    # 다음 희귀 바이옴이 떠도 창에 걸려 묻혔습니다. 바이옴은 길어야 10분이라
+    # 30분 창은 다음 바이옴을 통째로 삼킵니다.
     await setup()
     same = link("fff1")
     await run(macro_msg(macro_ch, "Biome Started - DREAMSPACE", same))
-    note(pings_everyone(macro_ch), "첫 번째는 울림")
-    first_count = len(macro_ch.sent)
+    note(pings_everyone(macro_ch), "DREAMSPACE → 울림")
 
+    await run(macro_msg(macro_ch, "Biome Started - CYBERSPACE", same))
+    note(pings_everyone(macro_ch),
+         "같은 개인서버에서 바로 이어진 CYBERSPACE 도 울림 (여기가 묻혔던 자리)")
+
+    await run(macro_msg(macro_ch, "Biome Started - GLITCHED", same))
+    note(pings_everyone(macro_ch), "이어진 GLITCHED 도 울림")
+
+    print("")
+    print("  같은 바이옴이 다시 올라와도 울립니다 (막는 장치가 없습니다)")
     await run(macro_msg(macro_ch, "Biome Started - DREAMSPACE", same,
                         fields=[("Uptime", "14m 2s")]))
-    body, am = said(macro_ch)
-    note(len(macro_ch.sent) > first_count, "두 번째도 보호는 그대로 함")
-    note("@everyone" not in body, "두 번째는 멘션이 빠짐", repr(body[:40]))
-    note(not (am and am.everyone), "두 번째는 알림도 허용되지 않음")
+    note(pings_everyone(macro_ch), "같은 바이옴 재게시도 울림")
 
     print("")
-    print("  다른 링크면 쿨타임과 무관하게 울려야 합니다")
+    print("  링크가 달라도 당연히 울립니다")
     await run(macro_msg(macro_ch, "Biome Started - DREAMSPACE", link("fff2")))
-    note(pings_everyone(macro_ch), "링크가 다르면 울림")
+    note(pings_everyone(macro_ch), "다른 링크도 울림")
 
     print("")
-    print("  간격을 0 으로 두면 매번 울립니다 (끄는 경로)")
-    await setup(notify_cooldown_minutes=0)
-    repeat = link("ggg1")
-    await run(macro_msg(macro_ch, "Biome Started - GLITCHED", repeat))
-    note(pings_everyone(macro_ch), "0분: 첫 번째 울림")
-    await run(macro_msg(macro_ch, "Biome Started - GLITCHED", repeat))
-    note(pings_everyone(macro_ch), "0분: 두 번째도 울림")
+    print("  쿨타임 설정이 남아 있어도 무시해야 합니다 (옛 설정 호환)")
+    # 이미 DB 에 notify_cooldown_minutes 가 저장된 서버가 있습니다.
+    # 그 값이 다시 알림을 막으면 안 됩니다.
+    await setup(notify_cooldown_minutes=1440)
+    legacy = link("fff3")
+    await run(macro_msg(macro_ch, "Biome Started - DREAMSPACE", legacy))
+    note(pings_everyone(macro_ch), "옛 설정값이 있어도 첫 번째 울림")
+    await run(macro_msg(macro_ch, "Biome Started - CYBERSPACE", legacy))
+    note(pings_everyone(macro_ch), "옛 설정값이 있어도 이어진 바이옴 울림")
 
-    print("")
+    note(not hasattr(LG, "notify_on_cooldown"),
+         "쿨타임 코드가 남아 있지 않음")
+    note(not hasattr(LG, "NotifyCooldownModal"),
+         "쿨타임 설정 UI 가 남아 있지 않음")
+
     print("=== 7. 규칙 밖 채널은 건드리지 않아야 ===")
     await setup()
     await run(macro_msg(other_ch, "Biome Started - DREAMSPACE", link("hhh1")))
@@ -727,7 +737,6 @@ async def main():
 
     print("")
     print("  저장한 규칙이 실제로 울려야 합니다 (설정 → 동작 연결 확인)")
-    LG._notified_at.clear()
     macro_ch.sent.clear()
     await run(macro_msg(macro_ch, "Biome Started - CYBERSPACE", link("ooo1")))
     note(pings_everyone(macro_ch), "UI 로 만든 규칙이 그대로 동작함")
@@ -739,20 +748,6 @@ async def main():
     await remove.callback(it)
     saved = await vdb.get_linkguard_settings(GUILD.id)
     note(not (saved.get("notify_rules") or []), "규칙 삭제가 동작함")
-
-    print("")
-    for raw, ok in (("15", True), ("0", True), ("공백", False),
-                    ("   ", False), ("-5", False), ("99999", False)):
-        it = Inter()
-        cool = LG.NotifyCooldownModal()
-        cool.minutes._value = raw
-        await cool.on_submit(it)
-        sent = it.response.sent[0] if it.response.sent else {}
-        embed = sent.get("embed")
-        accepted = embed is not None
-        note(accepted == ok, f"재알림 간격 입력 {raw!r:10} "
-                             f"{'통과기대' if ok else '거부기대'}",
-             "통과" if accepted else "거부")
 
     print("")
     it = Inter()

@@ -281,9 +281,23 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 - 이름 비교는 대소문자·공백·기호를 지우고 **들어있는지**로 봅니다
   (`DREAMSPACE` / `Dream Space` / `dream_space` 가 전부 같은 것).
 - **바이옴 종료 임베드에는 붙이지 않습니다**(`notify_exclude`, 기본
-  `Biome Ended` · `바이옴 종료`). 종료 임베드에도 **같은 바이옴 이름이
+  `Biome End` · `바이옴 종료`). 종료 임베드에도 **같은 바이옴 이름이
   들어 있어서**, 이게 없으면 뜰 때와 끝날 때 두 번 울립니다.
   제외에 걸리면 규칙 멘션도, 임베드에서 끌어올리는 멘션도 전부 막습니다.
+  (실제로는 종료 임베드에 **링크가 없어** 보호 대상이 아니라 여기까지
+  오지도 않습니다. 링크를 붙이는 매크로가 생길 경우의 안전망입니다)
+- **매크로마다 임베드가 다릅니다.** 확인한 6종(MultiScope · DroidScope ·
+  EggSol · Coteab · maxstellar · 크로마틱)은 전부 제목이
+  `Biome Started - <이름>` / `Biome Ended - <이름>` 이었고, 링크는 필드
+  (`Private Server` · `Private Server Link`)나 본문 `[Join Server](…)` 로
+  제각각이었습니다. **하나에서 확인하고 "된다"고 하지 마세요** —
+  `tests/notify_mention.py` 에 6종을 전부 넣어 두었습니다.
+- **작성자·바닥글은 바이옴 판정에서 뺍니다**(`embed_texts(meta=False)`).
+  거기엔 매크로 이름과 버전이 들어갑니다 — `frluxky's Macro`,
+  `MultiScope v2.0.5`. 판정에 섞으면 **매크로 이름에 바이옴 이름이 들어간
+  순간 그 매크로의 모든 메시지가 희귀 바이옴이 됩니다.**
+  멘션 수집(`extract_embed_mentions`)은 반대로 **전부** 훑습니다 —
+  역할 멘션은 어디에 적혀 있든 사람에게 닿아야 하기 때문입니다.
 - **제외 단어를 `Ended` 처럼 짧게 두지 마세요.** 비교가 '들어있는지'라
   `Recommended` `Extended` 안에도 들어 있습니다. 그러면 **시작 알림이
   조용히 안 울립니다** — 잘못 울리는 것보다 찾기 어렵습니다.

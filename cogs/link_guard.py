@@ -380,8 +380,18 @@ EVERYONE_RE = re.compile(r'@everyone(?![A-Za-z0-9_])', re.IGNORECASE)
 HERE_RE = re.compile(r'@here(?![A-Za-z0-9_])', re.IGNORECASE)
 
 
-def embed_texts(embed) -> list[str]:
-    """임베드에서 사람이 읽는 텍스트를 전부 모읍니다 (이미지·URL 은 제외)."""
+def embed_texts(embed, *, meta: bool = True) -> list[str]:
+    """임베드에서 사람이 읽는 텍스트를 모읍니다 (이미지·URL 은 제외).
+
+    `meta=False` 면 **작성자(author)와 바닥글(footer)을 뺍니다.**
+    거기에는 매크로 **이름과 버전**이 들어갑니다 — `크로마틱`,
+    `frluxky's Macro`, `MultiScope v2.0.5`, `EggSol v1.9.9-2`,
+    `Coteab Macro v2.2.0`, `maxstellar's Biome Macro | v2.3`.
+    바이옴 판정에 이걸 섞으면 **매크로 이름에 바이옴 이름이 들어간 순간
+    그 매크로의 모든 메시지가 희귀 바이옴으로 잡힙니다.** 실제 매크로
+    6종을 확인해 보니 바이옴 이름은 **전부 제목**에 있었고, 작성자·바닥글에
+    있던 적은 없었습니다.
+    """
     try:
         data = embed.to_dict()
     except Exception:
@@ -393,12 +403,13 @@ def embed_texts(embed) -> list[str]:
         if value:
             out.append(str(value))
 
-    for key in ("author", "footer"):
-        part = data.get(key)
-        if isinstance(part, dict):
-            for sub in ("name", "text"):
-                if part.get(sub):
-                    out.append(str(part[sub]))
+    if meta:
+        for key in ("author", "footer"):
+            part = data.get(key)
+            if isinstance(part, dict):
+                for sub in ("name", "text"):
+                    if part.get(sub):
+                        out.append(str(part[sub]))
 
     for field in data.get("fields") or []:
         if not isinstance(field, dict):
@@ -448,13 +459,15 @@ def biome_haystack(message) -> str:
      그 검사 하나에 전원 호출을 걸어 두지 않습니다. 안전장치는 겹쳐야
      하나가 무너져도 버팁니다.)
 
-    바이옴 이름이 임베드 어디에 적힐지는 매크로마다 다릅니다. MultiScope 는
-    제목("Biome Started - DREAMSPACE")에 넣지만 필드에 넣는 것도 있어
-    임베드 안은 전부 훑습니다.
+    실제 매크로 6종(MultiScope · DroidScope · EggSol · Coteab ·
+    maxstellar · 크로마틱)을 확인해 보니 전부 제목이 `Biome Started - <이름>`
+    형식이었습니다. 그래도 제목만 보지는 않습니다 — 필드에 넣는 매크로가
+    나중에 들어올 수 있습니다. 다만 **작성자·바닥글은 뺍니다**
+    (매크로 이름과 버전이라 바이옴과 무관하고, 섞으면 오검출이 납니다).
     """
     parts: list[str] = []
     for embed in getattr(message, "embeds", None) or []:
-        parts.extend(embed_texts(embed))
+        parts.extend(embed_texts(embed, meta=False))
     return " ".join(parts)
 
 

@@ -234,6 +234,125 @@ async def main():
          "비우면 종료에도 울린다고 경고함")
 
     print("")
+    print("=== 3-3. 실제 매크로 6종의 임베드 형식 ===")
+    # 서버에서 실제로 도는 매크로들입니다. 형식이 제각각이라 하나에서만
+    # 확인하고 "된다"고 하면 나머지에서 조용히 안 울립니다.
+    #   (embed 를 만드는 함수, 매크로 이름, 바닥글)
+    def multiscope(biome, started, url):
+        e = discord.Embed(title=f"Biome {'Started' if started else 'Ended'} - {biome}",
+                          description=url if started else None)
+        e.set_author(name="크로마틱")
+        e.add_field(name="Account", value="M0noChr0m3X")
+        e.add_field(name="Uptime", value="1hr 0m 52s")
+        if started:
+            e.add_field(name="Started", value="16분 전")
+        e.set_footer(text="MultiScope v2.0.5")
+        return e
+
+    def droidscope(biome, started, url):
+        e = discord.Embed(title=f"Biome {'Started' if started else 'Ended'} - {biome}",
+                          description="오전 12:48:37 (15분 전)")
+        e.set_author(name="Macro")
+        if started:
+            e.add_field(name="Private Server", value=url)
+        e.set_footer(text="DroidScope | Release v1.0.0")
+        return e
+
+    def eggsol(biome, started, url):
+        e = discord.Embed(
+            title=f"Biome {'Started' if started else 'Ended'} - {biome}",
+            description=f"[Join Server]({url})" if started else "")
+        e.set_author(name="frluxky's Macro")
+        e.set_footer(text="EggSol v1.9.9-2")
+        return e
+
+    def maxstellar(biome, started, url):
+        e = discord.Embed(
+            title=f"Biome {'Started' if started else 'Ended'} - {biome}",
+            description="[00:54:39]")
+        e.set_author(name="Macro")
+        if started:
+            e.add_field(name="Private Server Link", value=url)
+        e.set_footer(text="maxstellar's Biome Macro | v2.3")
+        return e
+
+    def coteab(biome, started, url):
+        e = discord.Embed(
+            title=f"Biome {'Started' if started else 'Ended'} - {biome}",
+            description=("2026년 9월 11일 금요일 오후 11:34 (2시간 전)"
+                         + (f"\n[Join Server]({url})" if started else "")))
+        e.set_author(name="Macro")
+        e.set_footer(text="Coteab Macro v2.2.0")
+        return e
+
+    MACROS = [("MultiScope", multiscope), ("DroidScope", droidscope),
+              ("EggSol", eggsol), ("maxstellar", maxstellar),
+              ("Coteab", coteab)]
+
+    def macro_embed_msg(channel, embed):
+        _mid[0] += 1
+        m = Msg(_mid[0], channel, Member(3, "Macro", guild=GUILD))
+        m.guild, m.webhook_id, m.content = GUILD, 12345, ""
+        m.embeds = [embed]
+        return m
+
+    n = 0
+    for name, build in MACROS:
+        n += 1
+        await setup()
+        await run(macro_embed_msg(macro_ch, build("DREAMSPACE", True, link(f"m{n}s"))))
+        note(pings_everyone(macro_ch), f"{name:11} 희귀 바이옴 시작 → 울림")
+        before = len(macro_ch.sent)
+
+        # 실제 종료 임베드에는 **링크가 없습니다**(스크린샷 확인). 링크가
+        # 없으면 보호할 것이 없어 봇이 원본을 건드리지도 않습니다.
+        ended = build("DREAMSPACE", False, "")
+        await run(macro_embed_msg(macro_ch, ended))
+        note(len(macro_ch.sent) == before,
+             f"{name:11} 종료 임베드는 링크가 없어 재게시조차 안 함")
+
+        # 그래도 링크가 붙어 오는 경우를 대비합니다. 보호는 하되 멘션은
+        # 붙이지 않아야 합니다.
+        ended2 = build("DREAMSPACE", False, "")
+        ended2.add_field(name="Private Server", value=link(f"m{n}e"))
+        await run(macro_embed_msg(macro_ch, ended2))
+        body, am = said(macro_ch)
+        note(len(macro_ch.sent) > before, f"{name:11} 종료에 링크가 있으면 보호는 함")
+        note("@everyone" not in body, f"{name:11} 그래도 종료에는 멘션 안 붙음",
+             repr(body[:30]))
+
+        await setup()
+        await run(macro_embed_msg(macro_ch, build("SNOWY", True, link(f"m{n}c"))))
+        body, am = said(macro_ch)
+        note("@everyone" not in body, f"{name:11} 흔한 바이옴(SNOWY) → 안 울림")
+
+    print("")
+    print("  ⚠️ 매크로 **이름**에 바이옴 이름이 들어가도 걸리면 안 됩니다")
+    # 작성자·바닥글에는 매크로 이름과 버전이 들어갑니다. 판정에 섞으면
+    # 그 매크로의 **모든** 메시지가 희귀 바이옴으로 잡힙니다.
+    await setup()
+    tricky = discord.Embed(title="Biome Started - SNOWY", description=link("trick"))
+    tricky.set_author(name="DREAMSPACE 전문 Macro")
+    tricky.set_footer(text="CYBERSPACE Scope v1.0")
+    await run(macro_embed_msg(macro_ch, tricky))
+    body, am = said(macro_ch)
+    note(macro_ch.sent, "보호는 그대로 동작함")
+    note("@everyone" not in body,
+         "매크로 이름·버전의 바이옴 이름으로는 안 울림", repr(body[:40]))
+
+    print("")
+    print("  다만 임베드 안 역할 멘션은 작성자·바닥글에서도 찾습니다")
+    # 판정(바이옴 이름)과 멘션 수집은 목적이 다릅니다. 멘션은 어디에
+    # 적혀 있든 사람에게 닿아야 하는 것이므로 전부 훑습니다.
+    carry_role = GUILD.roles[3]
+    await setup(notify_rules=[])
+    foot = discord.Embed(title="Biome Started - SNOWY", description=link("foot1"))
+    foot.set_footer(text=f"알림 {carry_role.mention}")
+    await run(macro_embed_msg(macro_ch, foot))
+    body, am = said(macro_ch)
+    note(carry_role.mention in body, "바닥글에 적힌 역할도 끌어올림", repr(body[:40]))
+
+    print("")
     print("=== 4. ⚠️ 채팅으로는 절대 울리지 않아야 ===")
     # 여기가 이 기능에서 제일 위험한 곳입니다. 유저가 바이옴 이름을 치는
     # 것만으로 6,500명이 호출되면 되돌릴 수 없습니다.

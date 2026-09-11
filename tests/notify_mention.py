@@ -26,7 +26,7 @@ VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
             "watermark_col", "guardkey_col", "usage_col", "logref_col",
             "roblox_col"]
 
-RARE = ["DREAMSPACE", "CYBERSPACE", "GLITCH"]
+RARE = ["DREAMSPACE", "CYBERSPACE", "GLITCHED"]
 
 # 링크마다 코드가 달라야 재알림 쿨타임을 제대로 시험할 수 있습니다.
 def link(code: str) -> str:
@@ -130,7 +130,7 @@ async def main():
     note(bool(am and am.users is False), "유저 멘션은 다시 울리지 않음")
     note("roblox.com" not in body, "링크는 여전히 가려짐")
 
-    for name in ("CYBERSPACE", "GLITCH"):
+    for name in ("CYBERSPACE", "GLITCHED"):
         await setup()
         await run(macro_msg(macro_ch, f"Biome Started - {name}", link("aaa2")))
         note(pings_everyone(macro_ch), f"{name} 도 울림")
@@ -149,10 +149,24 @@ async def main():
     # 매크로마다 DREAMSPACE / Dream Space / dream_space 로 제각각입니다.
     for title in ("biome started - dreamspace",
                   "Biome Started - Cyber Space",
-                  "BIOME  STARTED :: glitch_biome"):
+                  "BIOME  STARTED :: glitched_biome"):
         await setup()
         await run(macro_msg(macro_ch, title, link("ccc1")))
         note(pings_everyone(macro_ch), f"표기가 달라도 걸림: {title[:32]}")
+
+    print("")
+    print("  '들어있는지'로 보므로 더 긴 이름을 적으면 더 좁혀집니다")
+    # 실제 바이옴 이름은 GLITCHED 입니다. GLITCH 로 적어 두면 GLITCHED 까지
+    # 걸리지만, GLITCHED 로 적으면 GLITCH 만 있는 것에는 걸리지 않습니다.
+    note(LG.biome_matches(["GLITCH"], "Biome Started - GLITCHED") == "GLITCH",
+         "짧게 적으면 더 넓게 걸림 (GLITCH → GLITCHED 도 포함)")
+    note(LG.biome_matches(["GLITCHED"], "Biome Started - GLITCH") is None,
+         "길게 적으면 더 좁게 걸림 (GLITCHED 는 GLITCH 에 안 걸림)")
+    note(LG.biome_matches(RARE, "Biome Ended - DREAMSPACE") == "DREAMSPACE",
+         "이름만 적으면 Ended 도 걸림 — 싫으면 'Biome Started - …' 로 적습니다")
+    note(LG.biome_matches(["Biome Started - DREAMSPACE"],
+                          "Biome Ended - DREAMSPACE") is None,
+         "'Biome Started - …' 로 적으면 Ended 는 안 걸림")
 
     print("")
     print("=== 4. ⚠️ 채팅으로는 절대 울리지 않아야 ===")
@@ -212,9 +226,9 @@ async def main():
     print("  간격을 0 으로 두면 매번 울립니다 (끄는 경로)")
     await setup(notify_cooldown_minutes=0)
     repeat = link("ggg1")
-    await run(macro_msg(macro_ch, "Biome Started - GLITCH", repeat))
+    await run(macro_msg(macro_ch, "Biome Started - GLITCHED", repeat))
     note(pings_everyone(macro_ch), "0분: 첫 번째 울림")
-    await run(macro_msg(macro_ch, "Biome Started - GLITCH", repeat))
+    await run(macro_msg(macro_ch, "Biome Started - GLITCHED", repeat))
     note(pings_everyone(macro_ch), "0분: 두 번째도 울림")
 
     print("")
@@ -337,7 +351,7 @@ async def main():
                     "biomes": RARE, "mention": "everyone", "role_ids": [],
                 }])
     newborn.sent.clear()
-    await run(macro_msg(newborn, "Biome Started - GLITCH", link("cat3")))
+    await run(macro_msg(newborn, "Biome Started - GLITCHED", link("cat3")))
     note(pings_everyone(newborn), "규칙을 고치지 않아도 새 채널에서 울림")
 
     print("")
@@ -452,7 +466,7 @@ async def main():
 
     it = Inter()
     modal = LG.NotifyBiomeModal([macro_ch.id], [])
-    modal.biomes._value = "DREAMSPACE, CYBERSPACE\nGLITCH"
+    modal.biomes._value = "DREAMSPACE, CYBERSPACE\nGLITCHED"
     await modal.on_submit(it)
     note(it.response.sent, "바이옴을 적으면 대상 선택이 뜸")
 

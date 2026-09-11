@@ -372,7 +372,7 @@ https://www.roblox.com/games/920587237/Adopt-Me?privateServerLinkCode=xxxxx#hbh-
 ```
 /링크보호설정 → 🔔 바이옴 알림 멘션 → ➕ 규칙 추가
    → ① 📂 매크로 카테고리 선택 (채널 하나씩도 가능, 섞어서 최대 10개)
-   → ② 바이옴 이름 입력   예: DREAMSPACE, CYBERSPACE, GLITCH
+   → ② 바이옴 이름 입력   예: DREAMSPACE, CYBERSPACE, GLITCHED
    → ③ 📢 @everyone / 🟢 @here / 역할 중 선택
 ```
 

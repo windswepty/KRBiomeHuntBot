@@ -2156,7 +2156,7 @@ class NotifyTargetView(discord.ui.View):
 class NotifyBiomeModal(discord.ui.Modal, title="🔔 어떤 바이옴에 알릴까요"):
     biomes = discord.ui.TextInput(
         label="바이옴 이름 (쉼표 또는 줄바꿈으로 구분)",
-        placeholder="예: DREAMSPACE, CYBERSPACE, GLITCH   ·   비우면 모든 바이옴",
+        placeholder="예: DREAMSPACE, CYBERSPACE, GLITCHED   ·   비우면 모든 바이옴",
         style=discord.TextStyle.paragraph,
         required=False,
         max_length=500

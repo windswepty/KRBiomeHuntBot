@@ -397,6 +397,12 @@ DEFAULT_LINKGUARD_SETTINGS = {
     # **시작 알림이 조용히 안 울리는** 쪽으로 틀립니다. 잘못 울리는 것보다
     # 찾기 어렵습니다.
     "notify_exclude": ["Biome End", "바이옴 종료"],
+
+    # 희귀 바이옴 실시간 카운터 보드. 지정한 채널의 **메시지 하나를 계속
+    # 수정**합니다. 매번 새로 보내면 도배가 되어 정작 중요한 신호가 묻힙니다
+    # (봇 상태 임베드와 같은 방식).
+    "biome_board_channel_id": None,
+    "biome_board_message_id": None,
 }
 
 

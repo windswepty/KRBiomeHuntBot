@@ -13,10 +13,11 @@
 import re
 import time
 import asyncio
+from datetime import datetime, timezone, timedelta
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from utils import link_tokens, oauth_gate
+from utils import link_tokens, oauth_gate, health
 from utils.verify_db import (
     get_linkguard_settings, save_linkguard_settings,
     save_protected_link, get_protected_link,
@@ -2372,6 +2373,10 @@ class GuardSettingsSelect(discord.ui.Select):
         category_count = len(current.get("category_ids", []))
         exc_count = len(current.get("exception_channel_ids", []))
         enabled_desc = "현재: ✅ 활성화" if current.get("enabled", True) else "현재: ❌ 비활성화"
+        board_id = current.get("biome_board_channel_id")
+        board_summary = (f"현재 <#{board_id}> 에 실시간 카운터를 올립니다."
+                         if board_id else
+                         "희귀 바이옴 등장 수를 한 채널에 모아 보여줍니다.")
         rule_count = len(current.get("notify_rules", []))
         notify_desc = (f"현재 {rule_count}개 규칙 — 재게시할 때 봇이 직접 멘션합니다."
                        if rule_count else
@@ -2437,6 +2442,12 @@ class GuardSettingsSelect(discord.ui.Select):
                 value="text",
                 description="링크 버튼 문구와 잠금 안내 문구를 변경합니다.",
                 emoji="📝"
+            ),
+            discord.SelectOption(
+                label="바이옴 카운터 채널",
+                value="biomeboard",
+                description=board_summary,
+                emoji="🌋"
             ),
             discord.SelectOption(
                 label="바이옴 알림 멘션",
@@ -2654,6 +2665,20 @@ class GuardSettingsSelect(discord.ui.Select):
 
         elif choice == "text":
             await interaction.response.send_modal(GuardTextModal(settings))
+
+        elif choice == "biomeboard":
+            board_id = settings.get("biome_board_channel_id")
+            current_ch = guild.get_channel(int(board_id)) if board_id else None
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="🌋 바이옴 실시간 카운터",
+                    description=(
+                        "희귀 바이옴이 **오늘 · 7일 · 30일** 각각 몇 번 떴는지를 "
+                        "한 채널에 모아 보여줍니다.\n\n"
+                        f"**현재 채널** {current_ch.mention if current_ch else '미설정'}\n"
+                        "-# 메시지 하나를 계속 수정하므로 도배되지 않습니다."),
+                    color=discord.Color.gold()),
+                view=BiomeBoardView(), ephemeral=True)
 
         elif choice == "notify":
             await interaction.response.send_message(
@@ -2962,6 +2987,75 @@ def build_biome_stats_embed(guild: discord.Guild, rows: list[dict],
     return embed
 
 
+class BiomeBoardSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(placeholder="카운터를 올릴 채널을 고르세요...",
+                         channel_types=[discord.ChannelType.text], max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
+        resolved = interaction.guild.get_channel(channel.id)
+
+        # **옮기면 옛 메시지 ID 를 반드시 버립니다.** 안 버리면 새 채널에서
+        # 그 ID 를 찾다 NotFound 가 나고, 그때마다 보드를 새로 올려 쌓입니다.
+        await save_linkguard_settings(interaction.guild.id, {
+            "biome_board_channel_id": channel.id,
+            "biome_board_message_id": None,
+        })
+
+        me = interaction.guild.me
+        perms = resolved.permissions_for(me) if (resolved and me) else None
+        warn = ""
+        if perms is not None and not (perms.send_messages and perms.embed_links):
+            warn = ("\n\n⚠️ 봇에게 이 채널의 **`메시지 보내기` · `링크 첨부`** "
+                    "권한이 없어 카운터가 올라가지 않습니다.")
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🌋 바이옴 카운터 채널 설정" + ("" if not warn else " (확인 필요)"),
+                description=(f"카운터를 {channel.mention} 에 올립니다.\n"
+                             "-# 메시지 **하나를 계속 수정**합니다 — 도배되지 않습니다.\n"
+                             "-# 희귀 바이옴이 뜰 때마다 갱신되고, 10분마다 한 번 더 "
+                             "맞춥니다(날짜가 바뀌면 '오늘' 이 0 이 되어야 하므로).\n"
+                             "-# 유저가 볼 채널이면 **읽기 전용**으로 두세요."
+                             + warn),
+                color=discord.Color.gold() if not warn else discord.Color.orange()),
+            ephemeral=True)
+
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await _apply_board_refresh(interaction.guild, settings)
+
+
+class BiomeBoardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(BiomeBoardSelect())
+
+    @discord.ui.button(label="지금 새로 고침", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_linkguard_settings(interaction.guild.id)
+        if not settings.get("biome_board_channel_id"):
+            await interaction.response.send_message(
+                "⚠️ 먼저 카운터를 올릴 채널을 지정해 주세요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _apply_board_refresh(interaction.guild, settings)
+        await interaction.followup.send("🔄 카운터를 갱신했습니다.", ephemeral=True)
+
+    @discord.ui.button(label="카운터 끄기", style=discord.ButtonStyle.danger, emoji="🚫")
+    async def disable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await save_linkguard_settings(interaction.guild.id, {
+            "biome_board_channel_id": None, "biome_board_message_id": None})
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🚫 바이옴 카운터 끔",
+                description="더 이상 갱신하지 않습니다.\n"
+                            "-# 이미 올라간 메시지는 **지우지 않았습니다** — "
+                            "필요하면 직접 지우세요.",
+                color=discord.Color.greyple()),
+            ephemeral=True)
+
+
 class BiomeStatsView(discord.ui.View):
     def __init__(self, hours: int = 24):
         super().__init__(timeout=180)
@@ -2989,6 +3083,206 @@ class BiomeStatsButton(discord.ui.Button):
             view=BiomeStatsView(self._hours), ephemeral=True)
 
 
+# ── 희귀 바이옴 실시간 카운터 보드 ───────────────────────────────────
+#
+# 채널 하나를 정해 **메시지 하나를 계속 수정**합니다. 매번 새로 보내면
+# 도배가 되어 정작 중요한 신호가 묻힙니다(봇 상태 임베드와 같은 이유).
+
+KST = timezone(timedelta(hours=9))
+
+# 보드 갱신 빈도 제한. 보호는 시간당 수백 건이라 매번 고치면 디스코드
+# 편집 한도에 닿습니다. 창이 닫힌 뒤 **최신 값으로 한 번 더** 고칩니다.
+BOARD_REFRESH_INTERVAL = 30.0
+_last_board_refresh: dict[int, float] = {}
+_board_trailing: dict[int, asyncio.Task] = {}
+# 동시 요청이 보드를 **두 개 만들지** 않도록 하는 길드별 잠금
+_board_locks: dict[int, asyncio.Lock] = {}
+
+
+def _kst_today_start():
+    now = datetime.now(KST)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def summarize_biome_board(rows: list[dict]) -> dict[str, dict]:
+    """한 번 읽은 기록으로 오늘 · 7일 · 30일을 **한꺼번에** 집계합니다.
+
+    기간마다 따로 조회하면 같은 문서를 세 번 읽습니다.
+    """
+    today = _kst_today_start()
+    now = datetime.now(timezone.utc)
+    week = now - timedelta(days=7)
+    month = now - timedelta(days=30)
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        when = row.get("updated")
+        if not hasattr(when, "timestamp"):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        name = str(row.get("biome") or "?")
+        cur = out.setdefault(name, {"today": 0, "week": 0, "month": 0,
+                                    "last": None, "notified": 0})
+        if when >= month:
+            cur["month"] += 1
+        if when >= week:
+            cur["week"] += 1
+        if when.astimezone(KST) >= today:
+            cur["today"] += 1
+        if row.get("notified"):
+            cur["notified"] += 1
+        if cur["last"] is None or when > cur["last"]:
+            cur["last"] = when
+    return out
+
+
+def build_biome_board_embed(guild: discord.Guild, rows: list[dict],
+                            settings: dict) -> discord.Embed:
+    agg = summarize_biome_board(rows)
+    rare = rare_biome_names(settings)
+
+    embed = discord.Embed(
+        title="🌋 희귀 바이옴 실시간 카운터",
+        color=discord.Color.gold()
+    )
+
+    if rare:
+        lines = []
+        for name in rare:
+            # 설정한 이름과 실제 기록된 이름이 다를 수 있습니다
+            # (`GLITCH` 로 적어 뒀는데 기록은 `GLITCHED`). 그래서 같은
+            # '들어있는지' 비교로 묶습니다 — 안 그러면 뜬 것이 0 으로 보입니다.
+            hits = [v for k, v in agg.items() if biome_matches([name], k)]
+            today = sum(h["today"] for h in hits)
+            week = sum(h["week"] for h in hits)
+            month = sum(h["month"] for h in hits)
+            last = max((h["last"] for h in hits if h["last"]), default=None)
+            when = f" · 마지막 <t:{int(last.timestamp())}:R>" if last else ""
+            lines.append(f"**{name}**\n"
+                         f"　오늘 **{today}** · 7일 **{week}** · 30일 **{month}**{when}")
+        embed.add_field(name="⭐ 희귀 바이옴", value="\n".join(lines)[:1024],
+                        inline=False)
+    else:
+        embed.add_field(
+            name="⭐ 희귀 바이옴",
+            value="아직 알림 규칙이 없어 무엇이 희귀인지 모릅니다.\n"
+                  "-# `/링크보호설정` → 🔔 바이옴 알림 멘션 에서 지정하세요.",
+            inline=False)
+
+    others = sorted(
+        ((k, v) for k, v in agg.items() if not biome_matches(rare, k)),
+        key=lambda kv: (-kv[1]["today"], -kv[1]["week"], kv[0]))
+    if others:
+        body = [f"• **{k}** — 오늘 {v['today']} · 7일 {v['week']}"
+                for k, v in others[:8]]
+        if len(others) > 8:
+            body.append(f"-# 외 {len(others) - 8}종")
+        embed.add_field(name="🌍 그 밖의 바이옴", value="\n".join(body)[:1024],
+                        inline=False)
+
+    total_today = sum(v["today"] for v in agg.values())
+    embed.description = (
+        f"오늘 **{total_today}회** 등장 (서로 다른 개인서버 기준)\n"
+        f"-# 갱신 <t:{int(datetime.now(timezone.utc).timestamp())}:R> · "
+        "매크로가 같은 링크를 여러 번 올려도 1회로 셉니다."
+    )
+    embed.set_footer(text="이 메시지는 자동으로 갱신됩니다")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
+async def _apply_board_refresh(guild: discord.Guild, settings: dict) -> None:
+    channel_id = settings.get("biome_board_channel_id")
+    if not channel_id:
+        return
+    channel = guild.get_channel(int(channel_id))
+    if channel is None:
+        print(f"[LinkGuard] 바이옴 보드 채널({channel_id})을 찾을 수 없습니다.",
+              flush=True)
+        return
+
+    me = guild.me
+    perms = channel.permissions_for(me) if me else None
+    if perms is not None and not (perms.send_messages and perms.embed_links):
+        print(f"[LinkGuard] #{channel} 에 보드를 올릴 권한이 없습니다 "
+              "('메시지 보내기' · '링크 첨부' 확인).", flush=True)
+        return
+
+    rows = await get_biome_events(guild.id, 24 * 30)
+    embed = build_biome_board_embed(guild, rows, settings)
+
+    lock = _board_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        # 잠금 안에서 **다시 읽습니다.** 기다리는 사이 다른 요청이 보드를
+        # 만들었을 수 있는데, 캐시된 값을 쓰면 두 개가 생깁니다.
+        fresh = await get_linkguard_settings(guild.id)
+        message_id = fresh.get("biome_board_message_id")
+
+        if message_id:
+            try:
+                msg = await channel.fetch_message(int(message_id))
+                await msg.edit(embed=embed)
+                return
+            except discord.NotFound:
+                pass          # 누가 지웠습니다 — 아래에서 다시 올립니다
+            except discord.Forbidden:
+                print(f"[LinkGuard] #{channel} 보드 수정 권한이 없습니다.", flush=True)
+                return
+            except Exception as e:
+                print(f"[LinkGuard] 바이옴 보드 수정 실패: {type(e).__name__}: {e}",
+                      flush=True)
+                return
+
+        try:
+            sent = await channel.send(embed=embed)
+        except Exception as e:
+            print(f"[LinkGuard] 바이옴 보드 게시 실패: {type(e).__name__}: {e}",
+                  flush=True)
+            return
+        await save_linkguard_settings(guild.id,
+                                      {"biome_board_message_id": sent.id})
+
+
+def schedule_board_refresh(guild: discord.Guild, settings: dict) -> None:
+    """보드 갱신을 예약합니다 (디바운스 + 트레일링).
+
+    보호는 시간당 수백 건입니다. 매번 고치면 디스코드 편집 한도에 닿고,
+    그렇다고 창 안의 것을 버리면 **마지막 등장이 반영되지 않은 채** 끝납니다.
+    """
+    if not settings.get("biome_board_channel_id"):
+        return
+
+    now = time.monotonic()
+    last = _last_board_refresh.get(guild.id, 0.0)
+    wait = BOARD_REFRESH_INTERVAL - (now - last)
+
+    if wait <= 0:
+        _last_board_refresh[guild.id] = now
+        asyncio.create_task(_board_runner(guild, settings, 0))
+        return
+
+    if guild.id in _board_trailing:
+        return
+    _board_trailing[guild.id] = asyncio.create_task(
+        _board_runner(guild, settings, wait))
+
+
+async def _board_runner(guild: discord.Guild, settings: dict, delay: float) -> None:
+    try:
+        if delay > 0:
+            await asyncio.sleep(delay)
+            _last_board_refresh[guild.id] = time.monotonic()
+        await _apply_board_refresh(guild, settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[LinkGuard] 바이옴 보드 갱신 오류: {type(e).__name__}: {e}", flush=True)
+    finally:
+        if delay > 0:
+            _board_trailing.pop(guild.id, None)
+
+
 # ── Cog ───────────────────────────────────────────────────────────────
 
 class LinkGuard(commands.Cog):
@@ -2996,6 +3290,33 @@ class LinkGuard(commands.Cog):
         self.bot = bot
         # 같은 메시지를 두 번 처리하지 않도록 최근 처리분을 기억합니다
         self._handled: set[int] = set()
+        self.board_refresh.start()
+
+    def cog_unload(self):
+        self.board_refresh.cancel()
+
+    # 바이옴이 안 떠도 **날짜가 바뀌면 '오늘' 이 0 이 되어야** 합니다.
+    # 등장할 때만 갱신하면 자정 넘어 조용한 날 어제 숫자가 그대로 남습니다.
+    @tasks.loop(minutes=10)
+    async def board_refresh(self):
+        for guild in self.bot.guilds:
+            try:
+                settings = await get_linkguard_settings(guild.id)
+                if settings.get("biome_board_channel_id"):
+                    await _apply_board_refresh(guild, settings)
+            except Exception as e:
+                print(f"[LinkGuard] {guild.name}: 바이옴 보드 주기 갱신 실패 - "
+                      f"{type(e).__name__}: {e}", flush=True)
+
+    @board_refresh.before_loop
+    async def before_board_refresh(self):
+        await self.bot.wait_until_ready()
+
+    # 주기 작업은 예상 못한 예외가 **한 번** 나면 그대로 영구히 멈춥니다.
+    # 재시도도 알림도 없고 프로세스는 멀쩡해 호스팅도 감지하지 못합니다.
+    @board_refresh.error
+    async def board_refresh_error(self, error):
+        await health.revive_loop(self.board_refresh, "board_refresh", error)
 
     def _mark_handled(self, message_id: int) -> bool:
         """이미 처리한 메시지면 False를 반환합니다."""
@@ -3202,6 +3523,7 @@ class LinkGuard(commands.Cog):
                     guild.id, biome_name,
                     link_key(all_links[0]) if all_links else "",
                     message.channel.id, sent.id, bool(bits))
+                schedule_board_refresh(guild, settings)
             except Exception as e:
                 print(f"[LinkGuard] 바이옴 기록 실패: {type(e).__name__}: {e}", flush=True)
 

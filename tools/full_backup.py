@@ -26,6 +26,7 @@ import os
 import sys
 import json
 import glob
+import gzip
 import datetime
 
 from bson import ObjectId
@@ -118,7 +119,10 @@ def _latest() -> str:
     `backups/` 에는 `/백업설정` 이 내려준 포인트 전용 파일(`users-*.json`)도
     섞여 있습니다. 형식이 달라 여기서 읽으면 안 되므로 우리 파일만 봅니다.
     """
-    files = [f for pat in ("full_*.json", "pre-restore_*.json")
+    # ⚠️ `.json.gz` 를 빠뜨리면 **실제 백업을 하나도 못 찾습니다.**
+    # 8MB 를 넘으면 압축되는데 실 DB 는 이미 40MB 대라 매일 .gz 로 올라옵니다.
+    files = [f for pat in ("full_*.json", "full_*.json.gz",
+                           "pre-restore_*.json", "pre-restore_*.json.gz")
              for f in glob.glob(os.path.join(BACKUP_DIR, pat))]
     if not files:
         sys.exit(f"{BACKUP_DIR}/ 에 전체 백업 파일이 없습니다. "
@@ -127,16 +131,28 @@ def _latest() -> str:
 
 
 def _load(path: str) -> dict:
-    """백업 파일을 읽고 우리 형식이 맞는지 확인합니다."""
+    """백업 파일을 읽고 우리 형식이 맞는지 확인합니다.
+
+    **gzip 을 반드시 함께 처리해야 합니다.** 8MB 를 넘으면 압축해서 올리는데
+    실 DB 는 이미 40MB 대라 채널에 올라오는 것은 **전부 `.json.gz`** 입니다.
+    여기서 못 읽으면 백업은 있는데 되돌릴 수 없는 상태가 됩니다.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
-            payload = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+        with open(path, "rb") as f:
+            head = f.read(2)
+            f.seek(0)
+            blob = gzip.decompress(f.read()) if head == b"\x1f\x8b" else f.read()
+        payload = json.loads(blob.decode("utf-8"))
+    except (OSError, ValueError, EOFError) as e:
+        # UnicodeDecodeError · JSONDecodeError 는 ValueError 하위라 여기 걸립니다.
+        # 예전에는 둘 다 빠져나가 생짜 트레이스백이 났습니다.
         sys.exit(f"파일을 읽을 수 없습니다: {path}\n  {type(e).__name__}: {e}")
 
     if not isinstance(payload, dict) or "data" not in payload:
         hint = ""
-        if isinstance(payload, dict) and "documents" in payload:
+        # 포인트 전용 파일의 실제 키는 `users` 입니다. 예전에는 `documents` 를
+        # 보고 있어서 **이 안내가 한 번도 뜨지 않았습니다.**
+        if isinstance(payload, dict) and ("users" in payload or "taken_at_kst" in payload):
             hint = ("\n  이 파일은 `/백업설정` 의 **포인트 전용** 백업입니다."
                     "\n  복원은 디스코드에서 `/백업설정` -> 복원 으로 하세요.")
         sys.exit(f"전체 백업 형식이 아닙니다: {path}{hint}")

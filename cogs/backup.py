@@ -173,10 +173,20 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
         return False, "no-permission"
 
     payload = await export_full_payload()
-    data, filename = full_backup_bytes(payload)
     meta = payload["_meta"]
     counts = meta.get("collections", {})
     total = sum(counts.values())
+
+    # ⚠️ 실패한 덤프를 '전체 백업' 으로 올리면 안 됩니다. 올리는 순간
+    # 마지막 백업 시각이 갱신돼 상태 임베드가 초록으로 바뀌고, 정작 파일에는
+    # 아무것도 없습니다. **되돌릴 수 없는 시점에 그걸 알게 됩니다.**
+    if meta.get("failed") or total == 0:
+        why = meta.get("failed") or "수집된 문서가 0건"
+        print(f"[Backup] {guild.name}: 전체 백업을 만들지 못해 업로드를 중단합니다 — {why}",
+              flush=True)
+        return False, "dump-failed"
+
+    data, filename = full_backup_bytes(payload)
 
     embed = discord.Embed(
         title="💾 전체 백업",

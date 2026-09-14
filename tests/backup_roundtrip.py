@@ -20,7 +20,7 @@ DB_COLS = ["users_col", "settings_col", "shop_col", "gacha_col", "logs_col",
            "quest_state_col", "event_col"]
 VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
             "watermark_col", "guardkey_col", "usage_col", "logref_col",
-            "roblox_col"]
+            "roblox_col", "biome_col"]
 
 
 class UpdateOne:
@@ -67,6 +67,7 @@ async def main():
         "link_usage": vcols["usage_col"],
         "log_references": vcols["logref_col"],
         "roblox_links": vcols["roblox_col"],
+        "biome_events": vcols["biome_col"],
     }
     db.mongo_db = FM.FakeDatabase(NAMES)
 
@@ -250,6 +251,122 @@ async def main():
     await db.save_backup_channel(GUILD.id, None)
     ok, info = await B.send_full_backup(FakeBot(), GUILD, reason="test")
     note(not ok and info == "no-channel", "채널 미설정이면 조용히 건너뜀", str(info))
+
+    print("")
+    print("=== ⚠️ 실제로 올라가는 형식(gzip)을 복원 도구가 읽어야 합니다 ===")
+    # 실 DB 는 40MB 대라 **매일 .json.gz 로 올라갑니다.** 여기서 못 읽으면
+    # 백업은 있는데 되돌릴 수 없는 상태가 됩니다(2026-09-15 에 실제로 그랬습니다).
+    import gzip as _gzip, glob as _glob, importlib.util as _ilu, tempfile as _tf
+
+    spec = _ilu.spec_from_file_location("fbtool", os.path.join(PROJ, "tools/full_backup.py"))
+    fb = _ilu.module_from_spec(spec)
+    sys.modules["fbtool"] = fb
+    try:
+        spec.loader.exec_module(fb)
+    except SystemExit:
+        pass
+
+    bdir = _tf.mkdtemp()
+    fb.BACKUP_DIR = bdir
+    payload = await db.export_full_payload()
+    raw, name = db.full_backup_bytes(payload)
+
+    gz_path = os.path.join(bdir, "full_20260915_050000.json.gz")
+    with open(gz_path, "wb") as f:
+        f.write(_gzip.compress(json.dumps(payload, ensure_ascii=False,
+                                          default=db._encode_bson).encode("utf-8"), 6))
+
+    try:
+        found = fb._latest()
+        note(found.endswith(".gz"), "_latest() 가 .gz 백업을 찾음", os.path.basename(found))
+    except SystemExit as e:
+        note(False, "_latest() 가 .gz 백업을 찾음", str(e).split(chr(10))[0][:60])
+
+    try:
+        got = fb._load(gz_path)
+        note(isinstance(got, dict) and "data" in got,
+             "_load() 가 gzip 백업을 읽음", str(list(got.keys()))[:40])
+    except SystemExit as e:
+        note(False, "_load() 가 gzip 백업을 읽음", f"SystemExit: {str(e)[:50]}")
+    except Exception as e:
+        note(False, "_load() 가 gzip 백업을 읽음",
+             f"❌ 잡히지 않은 예외 {type(e).__name__}")
+
+    print("")
+    print("  압축되지 않은 백업도 그대로 읽혀야 합니다")
+    plain = os.path.join(bdir, "full_20260101_000000.json")
+    with open(plain, "wb") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, default=db._encode_bson).encode("utf-8"))
+    try:
+        got = fb._load(plain)
+        note("data" in got, "_load() 가 일반 JSON 도 읽음")
+    except BaseException as e:
+        note(False, "_load() 가 일반 JSON 도 읽음", f"{type(e).__name__}")
+
+    print("")
+    print("  깨진 파일은 **안내와 함께** 죽어야 합니다 (생짜 트레이스백 금지)")
+    broken = os.path.join(bdir, "full_20260102_000000.json")
+    with open(broken, "wb") as f:
+        f.write(b"\x00\x01\x02 not json at all")
+    try:
+        fb._load(broken)
+        note(False, "깨진 파일을 읽어버림")
+    except SystemExit as e:
+        note("읽을 수 없습니다" in str(e), "깨진 파일은 안내 메시지로 종료",
+             str(e).split(chr(10))[0][:50])
+    except Exception as e:
+        note(False, "깨진 파일에서 잡히지 않은 예외", type(e).__name__)
+
+    print("")
+    print("  포인트 전용 파일을 넣으면 어디로 가야 하는지 알려줘야 합니다")
+    pts = os.path.join(bdir, "points-20260915_050000.json")
+    pts_payload = await db.export_points_payload(GUILD.id)
+    with open(pts, "w", encoding="utf-8") as f:
+        json.dump(pts_payload, f, ensure_ascii=False)
+    try:
+        fb._load(pts)
+        note(False, "포인트 전용 파일을 전체 백업으로 읽어버림")
+    except SystemExit as e:
+        note("포인트 전용" in str(e), "포인트 전용 파일이라고 안내함",
+             str(e).replace(chr(10), " ")[:70])
+
+    print("")
+    print("=== ⚠️ 덤프가 실패했으면 '성공'으로 올리면 안 됩니다 ===")
+    # 빈 파일을 올리고 마지막 백업 시각까지 갱신하면, 상태 임베드가 초록으로
+    # 바뀌어 **되돌릴 수 없는 시점에야** 비어 있다는 걸 알게 됩니다.
+    await db.save_backup_channel(GUILD.id, GUILD.channels[2].id)
+    real_export = db.export_full_payload
+
+    async def broken_export():
+        out = await real_export()
+        out["_meta"]["failed"] = "RuntimeError: 일부러 낸 오류"
+        out["data"] = {}
+        out["_meta"]["collections"] = {}
+        return out
+
+    B.export_full_payload = broken_export
+    try:
+        before = len(GUILD.channels[2].sent)
+        ok2, info2 = await B.send_full_backup(FakeBot(), GUILD, reason="test")
+        note(not ok2 and info2 == "dump-failed",
+             "덤프 실패 시 업로드를 중단함", f"{ok2}/{info2}")
+        note(len(GUILD.channels[2].sent) == before, "빈 파일을 올리지 않음")
+    finally:
+        B.export_full_payload = real_export
+
+    print("")
+    print("  수집이 0건이어도 올리지 않습니다")
+    async def empty_export():
+        out = await real_export()
+        out["data"] = {}
+        out["_meta"]["collections"] = {}
+        return out
+    B.export_full_payload = empty_export
+    try:
+        ok3, info3 = await B.send_full_backup(FakeBot(), GUILD, reason="test")
+        note(not ok3 and info3 == "dump-failed", "0건이면 업로드 중단", f"{ok3}/{info3}")
+    finally:
+        B.export_full_payload = real_export
 
     await bot.close()
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")

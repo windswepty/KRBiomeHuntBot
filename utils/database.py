@@ -1710,6 +1710,7 @@ async def export_full_payload() -> dict:
     """
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
+    failed = None
     if mongo_db is not None:
         def _collect():
             out = {}
@@ -1721,6 +1722,7 @@ async def export_full_payload() -> dict:
         except Exception as e:
             print(f"MongoDB export_full_payload error: {e}", flush=True)
             data = {}
+            failed = f"{type(e).__name__}: {e}"
     else:
         # 폴백 모드에서는 data/ 안의 JSON 을 그대로 담습니다.
         def _collect_files():
@@ -1738,16 +1740,19 @@ async def export_full_payload() -> dict:
         data = await asyncio.to_thread(_collect_files)
 
     counts = {k: (len(v) if isinstance(v, (list, dict)) else 0) for k, v in data.items()}
-    return {
-        "_meta": {
-            "database": "krbiomehuntbot",
-            "created_kst": now_kst,
-            "collections": counts,
-            "storage_mode": STORAGE_MODE,
-            "note": "전체 덤프 — 유저 ID·포인트 포함. 공개 채널에 올리지 마세요.",
-        },
-        "data": data,
+    meta = {
+        "database": "krbiomehuntbot",
+        "created_kst": now_kst,
+        "collections": counts,
+        "storage_mode": STORAGE_MODE,
+        "note": "전체 덤프 — 유저 ID·포인트 포함. 공개 채널에 올리지 마세요.",
     }
+    # ⚠️ 수집이 실패했으면 **반드시 표시합니다.** 예전에는 조용히 빈 dict 가
+    # 되어, 내용이 0건인 파일이 '전체 백업' 으로 올라가고 마지막 백업 시각까지
+    # 갱신됐습니다. 무인 운영에서는 그게 며칠 뒤 복구를 시도할 때 드러납니다.
+    if failed:
+        meta["failed"] = failed
+    return {"_meta": meta, "data": data}
 
 
 def full_backup_bytes(payload: dict) -> tuple[bytes, str]:

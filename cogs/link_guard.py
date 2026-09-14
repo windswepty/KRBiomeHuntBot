@@ -24,6 +24,7 @@ from utils.verify_db import (
     make_watermark_code, save_watermark, get_watermark,
     register_guarded_keys, get_guarded_keys,
     record_link_usage, get_link_usage, find_issued_to,
+    record_biome_event, get_biome_events,
     save_log_reference, get_log_reference, get_log_reference_by_protected,
     get_roblox_names,
 )
@@ -446,6 +447,37 @@ def extract_embed_mentions(message) -> tuple[list[int], bool, bool]:
                 here = True
 
     return role_ids, everyone, here
+
+
+# 매크로 7종이 전부 제목을 `Biome Started - <이름>` 형식으로 씁니다
+# (`BIOME STARTED - HELL Found`, `BIOME  STARTED :: glitched_biome` 포함).
+# 구분자와 대소문자만 제각각이라 하나의 정규식으로 덮입니다.
+BIOME_TITLE_RE = re.compile(
+    r"biome\s*(started|ended)\s*[-\u2013\u2014:]+\s*(.+?)\s*(?:found)?\s*$",
+    re.IGNORECASE)
+
+
+def detect_biome_name(message) -> str | None:
+    """임베드 **제목**에서 바이옴 이름을 뽑습니다. 시작 알림만 셉니다.
+
+    ⚠️ 제목만 봅니다. 본문·작성자·바닥글까지 훑으면 매크로 이름이나 채팅에
+    든 글자가 바이옴으로 잡힙니다(알림 판정에서 이미 겪은 문제입니다).
+    형식이 맞지 않으면 **`None` 을 돌려주고 아무것도 기록하지 않습니다** —
+    이름을 모르는 채로 '?' 를 쌓으면 통계가 쓰레기가 됩니다.
+    """
+    for embed in getattr(message, "embeds", None) or []:
+        try:
+            title = (embed.to_dict() or {}).get("title") or ""
+        except Exception:
+            continue
+        m = BIOME_TITLE_RE.search(str(title))
+        if not m:
+            continue
+        if m.group(1).lower() != "started":
+            return None            # 종료 알림은 '등장' 이 아닙니다
+        name = m.group(2).strip(" -:_").strip()
+        return name[:60] or None
+    return None
 
 
 def biome_haystack(message) -> str:
@@ -2825,6 +2857,138 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
     return embed
 
 
+# ── 바이옴 등장 통계 ─────────────────────────────────────────────────
+
+BIOME_PERIODS = [("24시간", 24), ("7일", 24 * 7), ("30일", 24 * 30)]
+
+
+def rare_biome_names(settings: dict) -> list[str]:
+    """알림 규칙이 지정한 바이옴 이름을 모두 모읍니다 (희귀 표시용)."""
+    names = []
+    for rule in settings.get("notify_rules") or []:
+        if isinstance(rule, dict):
+            for b in rule.get("biomes") or []:
+                if b and b not in names:
+                    names.append(b)
+    return names
+
+
+def build_biome_stats_embed(guild: discord.Guild, rows: list[dict],
+                            settings: dict, hours: int) -> discord.Embed:
+    label = next((n for n, h in BIOME_PERIODS if h == hours), f"{hours}시간")
+    rare = rare_biome_names(settings)
+
+    # 같은 바이옴끼리 묶습니다. 한 건 = 고유 링크 하나이므로 **등장 횟수**이고,
+    # reposts 는 매크로가 같은 링크를 몇 번 다시 올렸는지입니다.
+    agg: dict[str, dict] = {}
+    for row in rows:
+        name = str(row.get("biome") or "?")
+        cur = agg.setdefault(name, {"seen": 0, "reposts": 0, "notified": 0,
+                                    "last": None})
+        cur["seen"] += 1
+        cur["reposts"] += int(row.get("reposts", 0) or 0)
+        if row.get("notified"):
+            cur["notified"] += 1
+        when = row.get("updated")
+        if when is not None and (cur["last"] is None or when > cur["last"]):
+            cur["last"] = when
+
+    total_seen = sum(v["seen"] for v in agg.values())
+    total_notified = sum(v["notified"] for v in agg.values())
+    rare_seen = sum(v["seen"] for k, v in agg.items()
+                    if biome_matches(rare, k) is not None)
+
+    embed = discord.Embed(
+        title=f"📊 바이옴 등장 통계 · 최근 {label}",
+        color=discord.Color.blurple()
+    )
+
+    if not agg:
+        embed.description = (
+            "이 기간에 기록된 바이옴이 없습니다.\n\n"
+            "-# 기록은 **링크 보호가 동작한 시점부터** 쌓입니다. 기능을 방금 "
+            "넣었다면 아직 비어 있는 것이 정상입니다.\n"
+            "-# 매크로 임베드 제목이 `Biome Started - <이름>` 형식이 아니면 "
+            "이름을 알 수 없어 기록하지 않습니다."
+        )
+        return embed
+
+    embed.description = (
+        f"🌍 **등장 {total_seen:,}회** (서로 다른 개인서버 기준)\n"
+        f"🔔 **알림 발송 {total_notified:,}회**"
+        + (f" · 희귀 바이옴 **{rare_seen:,}회**" if rare else "")
+        + "\n-# 매크로가 같은 링크를 여러 번 올려도 **1회로 셉니다.**"
+    )
+
+    ordered = sorted(agg.items(), key=lambda kv: (-kv[1]["seen"], kv[0]))
+    lines = []
+    for name, v in ordered[:20]:
+        is_rare = biome_matches(rare, name) is not None
+        mark = "⭐" if is_rare else "•"
+        bell = f" 🔔{v['notified']}" if v["notified"] else (" 🔕" if is_rare else "")
+        when = v["last"]
+        ago = f" · <t:{int(when.timestamp())}:R>" if hasattr(when, "timestamp") else ""
+        lines.append(f"{mark} **{name}** — {v['seen']:,}회{bell}{ago}")
+    if len(ordered) > 20:
+        lines.append(f"-# 외 {len(ordered) - 20}종")
+
+    embed.add_field(name="🌋 바이옴별 등장", value="\n".join(lines)[:1024],
+                    inline=False)
+
+    if rare:
+        # 희귀인데 알림이 한 번도 안 나갔으면 **설정이 잘못된 것**입니다.
+        # 통계의 존재 이유가 이걸 잡는 것입니다.
+        silent = [k for k, v in agg.items()
+                  if biome_matches(rare, k) is not None and v["notified"] == 0]
+        if silent:
+            embed.add_field(
+                name="⚠️ 떴는데 알림이 안 나간 희귀 바이옴",
+                value=(", ".join(f"`{n}`" for n in silent[:10])
+                       + "\n-# 해당 채널이 알림 규칙 범위에 없거나, 봇에게 "
+                         "`@everyone, @here, 모든 역할 멘션` 권한이 없습니다.\n"
+                         "-# `/링크보호설정` → 📊 현재 설정 및 권한 점검 에서 "
+                         "확인하세요."),
+                inline=False)
+        else:
+            embed.add_field(
+                name="✅ 희귀 바이옴 알림",
+                value=f"이 기간에 뜬 희귀 바이옴 **{rare_seen:,}회** 모두 알림이 "
+                      "나갔습니다.",
+                inline=False)
+        embed.set_footer(text="⭐ = 알림 규칙에 등록된 희귀 바이옴")
+    else:
+        embed.set_footer(text="알림 규칙이 없어 희귀 바이옴 구분이 없습니다.")
+
+    return embed
+
+
+class BiomeStatsView(discord.ui.View):
+    def __init__(self, hours: int = 24):
+        super().__init__(timeout=180)
+        for name, h in BIOME_PERIODS:
+            self.add_item(BiomeStatsButton(name, h, active=(h == hours)))
+
+
+class BiomeStatsButton(discord.ui.Button):
+    def __init__(self, label: str, hours: int, active: bool = False):
+        super().__init__(
+            label=f"최근 {label}",
+            style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+            emoji="📊", disabled=active)
+        self._hours = hours
+
+    async def callback(self, interaction: discord.Interaction):
+        # 기간이 길면 문서를 수천 건 읽습니다. 먼저 defer 하지 않으면
+        # 3초 제한에 걸립니다.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await get_biome_events(interaction.guild.id, self._hours)
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await interaction.followup.send(
+            embed=build_biome_stats_embed(interaction.guild, rows,
+                                          settings, self._hours),
+            view=BiomeStatsView(self._hours), ephemeral=True)
+
+
 # ── Cog ───────────────────────────────────────────────────────────────
 
 class LinkGuard(commands.Cog):
@@ -3028,6 +3192,18 @@ class LinkGuard(commands.Cog):
 
         # 6. 재게시된 메시지 ID를 키로 원본 링크를 저장 (버튼이 이 키로 조회합니다)
         await save_protected_link(guild.id, sent.id, all_links)
+
+        # 6-2. 통계용 바이옴 기록. **실패해도 보호를 멈추지 않습니다** —
+        #      통계는 있으면 좋은 것이고 보호는 없으면 안 되는 것입니다.
+        biome_name = detect_biome_name(message)
+        if biome_name:
+            try:
+                await record_biome_event(
+                    guild.id, biome_name,
+                    link_key(all_links[0]) if all_links else "",
+                    message.channel.id, sent.id, bool(bits))
+            except Exception as e:
+                print(f"[LinkGuard] 바이옴 기록 실패: {type(e).__name__}: {e}", flush=True)
 
         # 7. 유출 감시 색인에 등록 (이 링크가 서버 어딘가에 다시 뜨면 잡아냅니다)
         await register_guarded_keys(guild.id, [k for k in (link_key(u) for u in all_links) if k])
@@ -3308,6 +3484,19 @@ class LinkGuard(commands.Cog):
             await self._detect_leak(after)
         except Exception as e:
             print(f"[LinkGuard] 유출 감지(수정) 오류: {e}", flush=True)
+
+    @app_commands.command(name="바이옴통계",
+                          description="[관리자 전용] 어떤 바이옴이 몇 번 떴고 알림이 나갔는지 확인합니다.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def biome_stats(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await get_biome_events(interaction.guild.id, 24)
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await interaction.followup.send(
+            embed=build_biome_stats_embed(interaction.guild, rows, settings, 24),
+            view=BiomeStatsView(24), ephemeral=True)
 
     @app_commands.command(name="링크보호설정", description="[관리자 전용] 웹훅 임베드의 링크를 인증 유저 전용으로 보호합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.

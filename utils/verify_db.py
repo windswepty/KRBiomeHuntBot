@@ -40,6 +40,7 @@ _guardkey_lock = asyncio.Lock()
 _usage_lock = asyncio.Lock()
 _logref_lock = asyncio.Lock()
 _roblox_lock = asyncio.Lock()
+_biome_lock = asyncio.Lock()
 
 verify_col = None
 linkguard_col = None
@@ -50,6 +51,7 @@ guardkey_col = None
 usage_col = None
 logref_col = None
 roblox_col = None
+biome_col = None
 
 if MONGO_URI:
     try:
@@ -66,6 +68,7 @@ if MONGO_URI:
         usage_col = _db["link_usage"]
         logref_col = _db["log_references"]
         roblox_col = _db["roblox_links"]
+        biome_col = _db["biome_events"]
 
         # 인덱스는 없어도 기능은 동작하므로, 생성에 실패해도 Mongo 연결 자체를
         # 포기하지 않도록 별도의 try로 감쌉니다. create_index는 멱등이라
@@ -107,6 +110,16 @@ if MONGO_URI:
             # 유출자가 남의 계정을 등록해 명단을 오염시키는 것을 막습니다.
             roblox_col.create_index(
                 [("guild_id", 1), ("roblox_id", 1)], name="roblox_unique", unique=True
+            )
+            # 바이옴 등장 기록. 통계 화면이 기간으로 잘라 보므로 시간 인덱스가
+            # 필요합니다(없으면 풀스캔).
+            biome_col.create_index(
+                [("guild_id", 1), ("updated", -1)], name="biome_recent"
+            )
+            # 90일. 통계는 '지난달 대비' 를 보고 싶어지므로 조사용(30일)보다
+            # 넉넉히 둡니다. 한 건이 200바이트 남짓이라 부담이 없습니다.
+            biome_col.create_index(
+                "updated", name="biome_ttl", expireAfterSeconds=90 * 24 * 3600
             )
         except Exception as e:
             print(f"MongoDB index setup warning: {e}", flush=True)
@@ -1366,3 +1379,94 @@ async def search_roblox_links(guild_id: int, query: str, limit: int = 10) -> lis
                         break
 
     return results[:limit]
+
+
+# ── 바이옴 등장 기록 (통계용) ─────────────────────────────────────────
+#
+# 지금까지 어디에도 **바이옴 이름이 남지 않았습니다.** `link_usage` 는 누가
+# 눌렀는지만, `protected_links` 는 어떤 링크였는지만 압니다. 그래서
+# "이번 주에 DREAMSPACE 가 몇 번 떴나" 를 아무도 답할 수 없었습니다.
+#
+# 보호할 때마다 한 건씩 남깁니다. 매크로가 같은 링크를 몇백 번 다시 올리므로
+# **같은 링크 + 같은 바이옴은 한 건으로 묶습니다**(`_id` 를 그렇게 잡습니다).
+# 묶지 않으면 21,227건짜리 컬렉션이 되고 통계도 등장 횟수가 아니라
+# 재게시 횟수를 세게 됩니다.
+
+BIOME_FILE = os.path.join(DATA_DIR, "biome_events.json")
+
+
+def _biome_event_id(guild_id: int, biome: str, link_key_str: str) -> str:
+    return f"{guild_id}:{(biome or '?')[:60]}:{link_key_str or '-'}"
+
+
+async def record_biome_event(guild_id: int, biome: str, link_key_str: str,
+                             channel_id: int, message_id: int,
+                             notified: bool) -> None:
+    """바이옴 등장을 한 건 남깁니다 (같은 링크·같은 바이옴은 한 건).
+
+    `notified` 는 **봇이 실제로 멘션을 붙였는지**입니다. 나중에 "알림이 안
+    왔다" 는 제보가 들어왔을 때, 설정이 문제였는지 그 바이옴이 아예 안 떴는지를
+    가릅니다.
+    """
+    key = _biome_event_id(guild_id, biome, link_key_str)
+    now = datetime.now(timezone.utc)
+
+    if biome_col is not None:
+        try:
+            await _db(biome_col.update_one, {"_id": key},
+                      {"$set": {"updated": now, "notified_last": bool(notified),
+                                "channel_id": int(channel_id),
+                                "message_id": int(message_id)},
+                       "$inc": {"reposts": 1},
+                       "$setOnInsert": {"guild_id": str(guild_id),
+                                        "biome": biome or "?",
+                                        "first_seen": now,
+                                        "notified": bool(notified)}},
+                      upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB record_biome_event error: {e}, using local file.", flush=True)
+
+    async with _biome_lock:
+        all_rows = _read_json(BIOME_FILE)
+        row = all_rows.get(key) or {"guild_id": str(guild_id), "biome": biome or "?",
+                                    "first_seen": now.isoformat(),
+                                    "notified": bool(notified), "reposts": 0}
+        row["reposts"] = int(row.get("reposts", 0)) + 1
+        row["updated"] = now.isoformat()
+        row["notified_last"] = bool(notified)
+        row["channel_id"] = int(channel_id)
+        row["message_id"] = int(message_id)
+        all_rows[key] = row
+        _write_json(BIOME_FILE, all_rows)
+
+
+async def get_biome_events(guild_id: int, since_hours: int = 24) -> list[dict]:
+    """기간 안의 바이옴 등장 기록을 돌려줍니다 (최근 순)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(since_hours)))
+
+    if biome_col is not None:
+        try:
+            def _fetch():
+                # 커서는 **스레드 안에서 리스트로** 만들어 돌려줍니다.
+                return list(biome_col.find(
+                    {"guild_id": str(guild_id), "updated": {"$gte": cutoff}}
+                ).sort("updated", -1).limit(3000))
+            return await _db(_fetch)
+        except Exception as e:
+            print(f"MongoDB get_biome_events error: {e}, using local file.", flush=True)
+
+    async with _biome_lock:
+        all_rows = _read_json(BIOME_FILE)
+    out = []
+    for row in all_rows.values():
+        if str(row.get("guild_id")) != str(guild_id):
+            continue
+        try:
+            when = datetime.fromisoformat(row.get("updated"))
+        except (TypeError, ValueError):
+            continue
+        if when >= cutoff:
+            out.append({**row, "updated": when})
+    out.sort(key=lambda r: r.get("updated"), reverse=True)
+    return out

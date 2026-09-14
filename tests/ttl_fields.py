@@ -25,7 +25,7 @@ DB_COLS = ["users_col", "settings_col", "shop_col", "gacha_col", "logs_col",
            "quest_state_col", "event_col"]
 VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
             "watermark_col", "guardkey_col", "usage_col", "logref_col",
-            "roblox_col"]
+            "roblox_col", "biome_col"]
 
 
 def declared_ttls(path):
@@ -60,10 +60,12 @@ async def main():
     await db.bump_quest_progress(G, U, "chat", 1)
     await vdb.register_guarded_keys(G, ["https://example.com/a"])
     await vdb.save_protected_link(G, 12345, ["https://example.com/a"])
+    await vdb.record_biome_event(G, "DREAMSPACE", "ps:abc", 111, 222, True)
 
     checks = [("quest_state_col", cols), ("quest_prog_col", cols),
               ("guardkey_col", vcols), ("plink_col", vcols),
-              ("usage_col", vcols), ("logref_col", vcols)]
+              ("usage_col", vcols), ("logref_col", vcols),
+              ("biome_col", vcols)]
 
     print()
     for attr, pool in checks:

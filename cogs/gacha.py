@@ -41,176 +41,331 @@ def is_valid_100_percent(items: list[dict]) -> bool:
 
 # ── Gacha Play View ───────────────────────────────────────────────────
 
-class GachaPlayView(discord.ui.View):
-    def __init__(self, is_out_of_stock: bool = False):
-        super().__init__(timeout=180)
-        if is_out_of_stock:
-            self.roll_gacha.disabled = True
-            self.roll_gacha.label = "🚫 모든 상품 품절 (재고 없음)"
-            self.roll_gacha.style = discord.ButtonStyle.secondary
-            self.roll_gacha.emoji = "🚫"
+# ── 추첨 엔진 (1회 · 10회 공용) ───────────────────────────────────────
 
-    @discord.ui.button(label="1회 뽑기 실행", style=discord.ButtonStyle.primary, emoji="🎲", custom_id="gacha_roll_btn")
-    async def roll_gacha(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = interaction.guild.id
-        user_id = interaction.user.id
+BULK_COUNT = 10
 
-        settings = await get_gacha_settings(guild_id)
-        is_enabled = settings.get("enabled", True)
-        is_admin = interaction.user.guild_permissions.administrator
 
-        if not is_enabled and not is_admin:
-            await interaction.response.send_message("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다.", ephemeral=True)
-            return
+def bulk_price(settings: dict) -> int:
+    """10회 뽑기 가격. 설정이 없으면 1회 가격의 10배입니다."""
+    price = int(settings.get("price", 100) or 0)
+    discounted = int(settings.get("price_10", 0) or 0)
+    return discounted if discounted > 0 else price * BULK_COUNT
 
-        price = settings.get("price", 100)
-        items = settings.get("items", [])
 
-        if not items:
-            await interaction.response.send_message("⚠️ 등록된 뽑기 항목이 없습니다. 관리자에게 문의해 주세요.", ephemeral=True)
-            return
+def bulk_discount(settings: dict) -> int:
+    """10회로 묶었을 때 아끼는 포인트 (없으면 0)."""
+    return max(0, int(settings.get("price", 100) or 0) * BULK_COUNT
+               - bulk_price(settings))
 
-        # 재고 남아있는 가용 항목들 필터링
-        available_items = [item for item in items if item.get("stock", -1) != 0]
-        if not available_items:
-            button.disabled = True
-            button.label = "🚫 모든 상품 품절 (재고 없음)"
-            button.style = discord.ButtonStyle.secondary
-            button.emoji = "🚫"
-            try:
-                await interaction.message.edit(view=button.view)
-            except Exception:
-                pass
 
-            embed = discord.Embed(
-                title="⚠️ 모든 뽑기 상품 품절",
-                description="현재 남아있는 모든 뽑기 상품의 재고가 소진(품절)되었습니다.",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+async def perform_rolls(guild, member, settings: dict, count: int,
+                        total_price: int) -> dict:
+    """실제 추첨을 수행합니다. 1회도 10회도 이 함수 하나를 씁니다.
 
-        # 전체 등록 항목 기준 100% 검증
-        total_pct = get_total_percent(items)
-        if not is_valid_100_percent(items):
-            embed = discord.Embed(
-                title="⚠️ 뽑기 실행 불가",
-                description=f"관리자가 설정한 전체 뽑기 항목들의 **확률 합이 100%가 아니어서** 현재 뽑기를 진행할 수 없습니다.\n\n"
-                            f"📊 **현재 확률 합계**: `{total_pct:.2f}%` (100%로 설정되어야 함)",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+    **포인트는 먼저 전액 차감하고, 못 채운 횟수만큼 돌려줍니다.**
+    먼저 뽑고 나중에 차감하면 잔액이 모자란 사람이 상품만 받아 갑니다.
 
-        # 포인트 차감 시도
-        success, remaining = await deduct_user_points(guild_id, user_id, price)
-        if not success:
-            embed = discord.Embed(
-                title="⚠️ 포인트 부족",
-                description=f"뽑기를 진행하려면 **{price:,} P**가 필요합니다.\n\n"
-                            f"💰 **현재 보유 포인트**: **{remaining:,} P**",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+    재고가 있는 항목에 당첨되면 `consume_gacha_stock()` 으로 **원자적으로**
+    1 차감합니다. 그 사이 다른 사람이 마지막 하나를 가져갔으면 그 항목만
+    후보에서 빼고 **같은 회차를 다시 뽑습니다** — 한 회차를 통째로 날리지
+    않기 위해서입니다. 뽑을 수 있는 항목이 하나도 남지 않으면 거기서 멈추고
+    남은 회차분을 환불합니다.
+    """
+    items = [dict(i) for i in settings.get("items", [])]   # 로컬 사본
+    ok, remaining = await deduct_user_points(guild.id, member.id, total_price)
+    if not ok:
+        return {"error": "no_points", "balance": remaining,
+                "need": total_price, "results": []}
 
-        # 가용한 항목들 중에서 확률 추첨 (random.choices)
-        weights = [float(item.get("percent", item.get("weight", 0))) for item in available_items]
-        selected_item = random.choices(available_items, weights=weights, k=1)[0]
+    results: list[dict] = []
+    for _ in range(count):
+        picked = None
+        # 품절로 빠지는 항목이 있을 수 있으므로 항목 수만큼은 다시 시도합니다
+        for _attempt in range(len(items) + 1):
+            avail = [i for i in items if i.get("stock", -1) != 0]
+            weights = [float(i.get("percent", i.get("weight", 0))) for i in avail]
+            if not avail or sum(weights) <= 0:
+                break
+            cand = random.choices(avail, weights=weights, k=1)[0]
 
-        item_name = selected_item["name"]
-        reward_points = selected_item.get("reward_points", 0)
-        reward_role_id = selected_item.get("reward_role_id", 0)
-        desc = selected_item.get("description", "")
-        stock = selected_item.get("stock", -1)
+            stock = cand.get("stock", -1)
+            if stock > 0:
+                got = await consume_gacha_stock(guild.id, cand.get("id"))
+                if not got:
+                    # 방금 다른 사람이 마지막 재고를 가져갔습니다.
+                    # 이 항목만 빼고 이 회차를 다시 뽑습니다.
+                    cand["stock"] = 0
+                    continue
+                cand["stock"] = stock - 1
+            picked = cand
+            break
 
-        # 재고 1 차감 — 목록 전체를 덮어쓰지 않고 **원자적으로** 처리합니다.
-        # 동시에 뽑은 두 명이 같은 마지막 항목에 당첨되면 2개가 나가기 때문입니다.
-        if stock > 0:
-            got = await consume_gacha_stock(guild_id, selected_item.get("id"))
-            if not got:
-                # 그 사이 다른 유저가 마지막 재고를 가져갔습니다 → 전액 환불
-                await add_user_points(guild_id, user_id, price)
-                embed = discord.Embed(
-                    title="⚠️ 방금 품절되었습니다",
-                    description=f"당첨된 **{item_name}** 항목의 마지막 재고가 방금 소진되었습니다.\n\n"
-                                f"💰 차감된 **{price:,} P**는 **전액 환불**되었습니다. 다시 시도해 주세요.",
-                    color=discord.Color.orange()
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
-            # 화면 표시용으로 로컬 사본도 맞춰 둡니다
-            for item in items:
-                if item.get("id") == selected_item.get("id"):
-                    item["stock"] = stock - 1
-                    break
+        if picked is None:
+            break               # 더 뽑을 것이 없습니다
+        results.append(dict(picked))
 
-        new_stock = stock - 1 if stock > 0 else -1
-        stock_text = format_stock_str(new_stock)
+    filled = len(results)
+    # 못 채운 회차는 환불합니다. 나누어떨어지지 않으면 **유저 쪽으로** 올립니다.
+    refund = (total_price - (total_price * filled) // count) if filled < count else 0
+    reward_points = sum(int(r.get("reward_points", 0) or 0) for r in results)
 
-        # 뽑기 후 남은 가용 항목 재확인하여 다 떨어졌으면 버튼 비활성화
-        new_available = [item for item in items if item.get("stock", -1) != 0]
-        if not new_available:
-            button.disabled = True
-            button.label = "🚫 모든 상품 품절 (재고 없음)"
-            button.style = discord.ButtonStyle.secondary
-            button.emoji = "🚫"
-            try:
-                await interaction.message.edit(view=button.view)
-            except Exception:
-                pass
+    credit = reward_points + refund
+    balance = (await add_user_points(guild.id, member.id, credit)
+               if credit else remaining)
 
-        # 포인트 보상인 경우 자동 추가
-        new_balance = remaining
-        if reward_points > 0:
-            new_balance = await add_user_points(guild_id, user_id, reward_points)
-
-        # 역할 보상 자동 지급 시도
-        role_notice = ""
-        if reward_role_id and reward_role_id > 0:
-            role = interaction.guild.get_role(reward_role_id)
-            if role:
-                try:
-                    await interaction.user.add_roles(role)
-                    role_notice = f"\n🎭 **{role.mention}** 역할이 계정에 즉시 지급되었습니다!"
-                except Exception as e:
-                    role_notice = f"\n⚠️ 역할 자동 지급 실패 (봇 권한/역할 순서 확인 필요: {e})"
-            else:
-                role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
-
-        # 로그 기록
-        await add_activity_log(guild_id, "gacha", user_id, interaction.user.display_name, f"[{item_name}] 뽑기 당첨 (-{price:,}P)")
-        # 퀘스트 진행도 (실패해도 뽑기 결과에는 영향을 주지 않습니다)
+    # 역할은 같은 것을 여러 번 뽑아도 한 번만 줍니다
+    role_given, role_failed = [], []
+    for rid in dict.fromkeys(int(r.get("reward_role_id", 0) or 0) for r in results):
+        if rid <= 0:
+            continue
+        role = guild.get_role(rid)
+        if role is None:
+            role_failed.append(f"ID `{rid}` (서버에서 찾을 수 없음)")
+            continue
         try:
-            await bump_quest_progress(guild_id, user_id, "gacha")
-            await bump_quest_progress(guild_id, user_id, "wgacha", weekly=True)
-            await bump_event_progress(guild_id, user_id, "gacha")
+            await member.add_roles(role)
+            role_given.append(role)
+        except Exception as e:
+            # 무엇을 고쳐야 하는지 남깁니다. 뭉뚱그리면 원인을 못 찾습니다.
+            role_failed.append(f"{role.mention} (봇 권한/역할 순서 확인: {type(e).__name__})")
+
+    if filled:
+        # 진행도 기록이 실패해도 뽑기 결과에는 영향을 주지 않습니다
+        try:
+            await bump_quest_progress(guild.id, member.id, "gacha", amount=filled)
+            await bump_quest_progress(guild.id, member.id, "wgacha",
+                                      amount=filled, weekly=True)
+            await bump_event_progress(guild.id, member.id, "gacha", amount=filled)
         except Exception as e:
             print(f"[Quest] 뽑기 진행도 기록 실패: {type(e).__name__}: {e}", flush=True)
 
-        gacha_title = settings.get("title", "한바헌 럭키 뽑기")
+    return {
+        "error": None,
+        "results": results,
+        "items": items,              # 재고가 반영된 사본 (품절 판정용)
+        "requested": count,
+        "filled": filled,
+        "spent": total_price - refund,
+        "refund": refund,
+        "reward_points": reward_points,
+        "balance": balance,
+        "role_given": role_given,
+        "role_failed": role_failed,
+    }
 
-        # 결과 임베드
-        embed = discord.Embed(
-            title=f"{gacha_title} 결과!",
-            description=f"🎉 축하합니다! **[{item_name}]** 에 당첨되셨습니다!{role_notice}\n\n"
-                        f"💳 **소모 포인트**: -{price:,} P\n"
-                        f"💰 **현재 총 보유 포인트**: **{new_balance:,} P**\n"
-                        f"📦 **해당 상품 남은 재고**: `{stock_text}`",
-            color=discord.Color.gold()
-        )
-        if desc:
-            embed.add_field(name="📝 항목 설명", value=parse_role_mentions(desc), inline=False)
 
-        if reward_points > 0:
-            embed.add_field(
-                name="🎁 보상 자동 적립",
-                value=f"포인트 보상 **+{reward_points:,} P**가 지갑에 자동 적립되었습니다!",
-                inline=False
+def summarize_results(results: list[dict]) -> list[tuple[str, int]]:
+    """같은 항목끼리 묶어 (이름, 횟수) 로 돌려줍니다 (많이 나온 순)."""
+    counts: dict[str, int] = {}
+    for r in results:
+        name = r.get("name", "알 수 없음")
+        counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
+class GachaPlayView(discord.ui.View):
+    def __init__(self, is_out_of_stock: bool = False, settings: dict | None = None):
+        super().__init__(timeout=180)
+
+        if settings is not None:
+            saving = bulk_discount(settings)
+            self.roll_gacha.label = f"1회 뽑기 ({settings.get('price', 100):,} P)"
+            self.roll_gacha_10.label = (
+                f"{BULK_COUNT}회 뽑기 ({bulk_price(settings):,} P"
+                + (f" · {saving:,} P 할인)" if saving else ")")
             )
 
+        if is_out_of_stock:
+            for btn in (self.roll_gacha, self.roll_gacha_10):
+                btn.disabled = True
+                btn.style = discord.ButtonStyle.secondary
+                btn.emoji = "🚫"
+            self.roll_gacha.label = "🚫 모든 상품 품절 (재고 없음)"
+            self.roll_gacha_10.label = "🚫 품절"
+
+    def _sold_out_all(self, items: list[dict]) -> bool:
+        return not [i for i in items if i.get("stock", -1) != 0]
+
+    def _mark_sold_out(self) -> None:
+        for btn in (self.roll_gacha, self.roll_gacha_10):
+            btn.disabled = True
+            btn.style = discord.ButtonStyle.secondary
+            btn.emoji = "🚫"
+        self.roll_gacha.label = "🚫 모든 상품 품절 (재고 없음)"
+        self.roll_gacha_10.label = "🚫 품절"
+
+    async def _precheck(self, interaction: discord.Interaction, settings: dict):
+        """뽑기를 진행할 수 있는 상태인지 봅니다. 문제가 있으면 응답까지 마칩니다.
+
+        1회와 10회가 **같은 검사**를 써야 합니다. 한쪽에만 검사를 넣으면
+        다른 쪽으로 우회됩니다.
+        """
+        is_enabled = settings.get("enabled", True)
+        if not is_enabled and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다.", ephemeral=True)
+            return False
+
+        items = settings.get("items", [])
+        if not items:
+            await interaction.response.send_message(
+                "⚠️ 등록된 뽑기 항목이 없습니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            return False
+
+        if self._sold_out_all(items):
+            self._mark_sold_out()
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⚠️ 모든 뽑기 상품 품절",
+                    description="현재 남아있는 모든 뽑기 상품의 재고가 소진(품절)되었습니다.",
+                    color=discord.Color.red()),
+                ephemeral=True)
+            return False
+
+        if not is_valid_100_percent(items):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⚠️ 뽑기 실행 불가",
+                    description="관리자가 설정한 전체 뽑기 항목들의 **확률 합이 100%가 아니어서** "
+                                "현재 뽑기를 진행할 수 없습니다.\n\n"
+                                f"📊 **현재 확률 합계**: `{get_total_percent(items):.2f}%` "
+                                "(100%로 설정되어야 함)",
+                    color=discord.Color.red()),
+                ephemeral=True)
+            return False
+
+        return True
+
+    async def _run(self, interaction: discord.Interaction, count: int, total_price: int):
+        settings = await get_gacha_settings(interaction.guild.id)
+        if not await self._precheck(interaction, settings):
+            return
+
+        # 10회는 재고 차감이 여러 번이라 3초를 넘길 수 있습니다.
+        # 먼저 defer 해 두지 않으면 "상호작용 실패" 가 납니다.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        outcome = await perform_rolls(interaction.guild, interaction.user,
+                                      settings, count, total_price)
+
+        if outcome.get("error") == "no_points":
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ 포인트 부족",
+                    description=f"{count}회 뽑기를 진행하려면 **{total_price:,} P**가 필요합니다.\n\n"
+                                f"💰 **현재 보유 포인트**: **{outcome['balance']:,} P**",
+                    color=discord.Color.red()),
+                ephemeral=True)
+            return
+
+        if outcome["filled"] == 0:
+            # 차감분은 perform_rolls 가 전액 환불했습니다
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ 방금 품절되었습니다",
+                    description="뽑을 수 있는 상품의 재고가 방금 모두 소진되었습니다.\n\n"
+                                f"💰 차감된 **{total_price:,} P**는 **전액 환불**되었습니다.",
+                    color=discord.Color.orange()),
+                ephemeral=True)
+            self._mark_sold_out()
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+            return
+
+        # 남은 재고가 없으면 버튼을 잠급니다
+        if self._sold_out_all(outcome["items"]):
+            self._mark_sold_out()
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+
+        await self._send_result(interaction, settings, outcome, count, total_price)
+
+    async def _send_result(self, interaction, settings, outcome, count, total_price):
+        gacha_title = settings.get("title", "한바헌 럭키 뽑기")
+        results = outcome["results"]
+        filled = outcome["filled"]
+
+        lines = [f"💳 **소모 포인트**: -{outcome['spent']:,} P"]
+        if outcome["refund"]:
+            lines.append(f"↩️ **환불**: +{outcome['refund']:,} P "
+                         f"({count - filled}회분 — 재고가 부족했습니다)")
+        if outcome["reward_points"]:
+            lines.append(f"🎁 **포인트 보상**: +{outcome['reward_points']:,} P")
+        lines.append(f"💰 **현재 총 보유 포인트**: **{outcome['balance']:,} P**")
+
+        if count == 1:
+            item = results[0]
+            head = f"🎉 축하합니다! **[{item['name']}]** 에 당첨되셨습니다!"
+            stock_text = format_stock_str(
+                next((i.get("stock", -1) for i in outcome["items"]
+                      if i.get("id") == item.get("id")), -1))
+            lines.append(f"📦 **해당 상품 남은 재고**: `{stock_text}`")
+        else:
+            head = f"🎲 **{filled}회** 뽑기 결과입니다!"
+
+        embed = discord.Embed(
+            title=f"{gacha_title} 결과!",
+            description=head + "\n\n" + "\n".join(lines),
+            color=discord.Color.gold()
+        )
+
+        if count > 1:
+            summary = summarize_results(results)
+            stock_by_id = {i.get("id"): i.get("stock", -1) for i in outcome["items"]}
+            body = []
+            for name, got in summary:
+                item = next((r for r in results if r.get("name") == name), {})
+                stock_text = format_stock_str(stock_by_id.get(item.get("id"), -1))
+                body.append(f"• **{name}** × **{got}** (남은 재고 `{stock_text}`)")
+            embed.add_field(name="🎁 당첨 내역", value="\n".join(body)[:1024], inline=False)
+        else:
+            desc = results[0].get("description", "")
+            if desc:
+                embed.add_field(name="📝 항목 설명",
+                                value=parse_role_mentions(desc), inline=False)
+
+        if outcome["role_given"]:
+            embed.add_field(
+                name="🎭 지급된 역할",
+                value=" ".join(r.mention for r in outcome["role_given"])
+                      + "\n-# 같은 역할에 여러 번 당첨돼도 한 번만 지급됩니다.",
+                inline=False)
+        if outcome["role_failed"]:
+            # 조용히 넘어가면 "역할을 왜 못 받았지?" 를 아무도 못 풉니다
+            embed.add_field(name="⚠️ 역할 지급 실패",
+                            value="\n".join(outcome["role_failed"])[:1024], inline=False)
+
         embed.set_footer(text=f"{gacha_title} 시스템")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        await add_activity_log(
+            interaction.guild.id, "gacha", interaction.user.id,
+            interaction.user.display_name,
+            (f"[{results[0]['name']}] 뽑기 당첨 (-{outcome['spent']:,}P)"
+             if count == 1 else
+             f"{filled}연차 뽑기 (-{outcome['spent']:,}P) — "
+             + ", ".join(f"{n}x{c}" for n, c in summarize_results(results))))
+
+    @discord.ui.button(label="1회 뽑기 실행", style=discord.ButtonStyle.primary,
+                       emoji="🎲", custom_id="gacha_roll_btn")
+    async def roll_gacha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_gacha_settings(interaction.guild.id)
+        await self._run(interaction, 1, int(settings.get("price", 100) or 0))
+
+    @discord.ui.button(label="10회 뽑기", style=discord.ButtonStyle.success,
+                       emoji="🎰", custom_id="gacha_roll10_btn")
+    async def roll_gacha_10(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_gacha_settings(interaction.guild.id)
+        await self._run(interaction, BULK_COUNT, bulk_price(settings))
 
 
 # ── Admin Gacha Settings Modals & Views ───────────────────────────────
@@ -301,6 +456,60 @@ class SetGachaPriceModal(discord.ui.Modal, title="💰 1회 뽑기 가격 설정
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class SetGachaBulkPriceModal(discord.ui.Modal, title="🎰 10회 뽑기 가격 설정"):
+    price_input = discord.ui.TextInput(
+        label="10회 뽑기 가격 (0 이면 1회 가격의 10배)",
+        placeholder="예: 900   ·   0 이면 할인 없이 1회 가격 × 10",
+        required=True,
+        max_length=12
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = (self.price_input.value or "").strip()
+        # required=True 는 공백을 막지 못합니다. 여기서 거르지 않으면
+        # '설정 완료'만 뜨고 값은 그대로인 상태가 됩니다.
+        try:
+            price = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ 숫자만 입력해 주세요 (0 이면 1회 가격의 10배). 설정은 그대로 두었습니다.",
+                ephemeral=True)
+            return
+        if price < 0:
+            await interaction.response.send_message(
+                "⚠️ 0 이상을 입력해 주세요. 설정은 그대로 두었습니다.", ephemeral=True)
+            return
+
+        settings = await get_gacha_settings(interaction.guild.id)
+        one = int(settings.get("price", 100) or 0)
+        if price > one * BULK_COUNT:
+            # 막지는 않습니다 — 막으면 '10회는 프리미엄' 같은 운영을 못 합니다.
+            # 다만 유저가 1회를 열 번 누르는 것이 더 싸다는 것은 알려야 합니다.
+            notice = (f"\n\n⚠️ 1회를 10번 누르는 것(**{one * BULK_COUNT:,} P**)보다 "
+                      "비쌉니다. 의도한 것이 맞는지 확인해 주세요.")
+            color = discord.Color.orange()
+        else:
+            notice = ""
+            color = discord.Color.green()
+
+        settings["price_10"] = price
+        await save_gacha_settings(interaction.guild.id, settings)
+
+        effective = bulk_price(settings)
+        saving = bulk_discount(settings)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🎰 10회 뽑기 가격 변경 완료",
+                description=(f"{BULK_COUNT}회 뽑기 가격이 **{effective:,} P** 로 설정되었습니다."
+                             + (f"\n💸 1회 × {BULK_COUNT} 대비 **{saving:,} P 할인**됩니다."
+                                if saving else
+                                "\n-# `0` 이라 1회 가격의 10배(할인 없음)로 계산합니다."
+                                if price == 0 else "")
+                             + notice),
+                color=color),
+            ephemeral=True)
 
 
 class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 역할 추가"):
@@ -519,6 +728,10 @@ class RefillGachaItemStockView(discord.ui.View):
 
 class GachaSettingsSelect(discord.ui.Select):
     def __init__(self, current_settings: dict):
+        saving = bulk_discount(current_settings)
+        bulk_price_summary = (f"현재 {bulk_price(current_settings):,} P"
+                              + (f" ({saving:,} P 할인)" if saving
+                                 else " (할인 없음 — 1회 가격의 10배)"))
         self.current_settings = current_settings
         is_enabled = current_settings.get("enabled", True)
         gacha_title = current_settings.get("title", "한바헌 럭키 뽑기")
@@ -544,6 +757,8 @@ class GachaSettingsSelect(discord.ui.Select):
                 emoji="📝"
             ),
             discord.SelectOption(label="1회 뽑기 가격 설정", value="price", description="뽑기 1회에 필요한 포인트를 변경합니다.", emoji="💰"),
+            discord.SelectOption(label="10회 뽑기 가격 설정", value="price10",
+                                 description=bulk_price_summary, emoji="🎰"),
             discord.SelectOption(label="당첨 항목 및 역할 추가", value="add", description="새로운 당첨 항목, 확률(%), 수량, 지급 역할을 추가합니다.", emoji="➕"),
             discord.SelectOption(label="당첨 항목 재고 수정/충전", value="stock", description="일부분/전부 품절된 뽑기 항목의 재고를 수정 및 충전합니다.", emoji="📦"),
             discord.SelectOption(label="당첨 항목 삭제", value="delete", description="등록된 뽑기 당첨 항목을 삭제합니다.", emoji="🗑️"),
@@ -581,6 +796,12 @@ class GachaSettingsSelect(discord.ui.Select):
             settings = await get_gacha_settings(interaction.guild.id)
             modal = SetGachaPriceModal()
             modal.price_input.default = str(settings.get("price", 100))
+            await interaction.response.send_modal(modal)
+
+        elif choice == "price10":
+            settings = await get_gacha_settings(interaction.guild.id)
+            modal = SetGachaBulkPriceModal()
+            modal.price_input.default = str(settings.get("price_10", 0) or 0)
             await interaction.response.send_modal(modal)
 
         elif choice == "add":
@@ -712,7 +933,10 @@ class Gacha(commands.Cog):
             title=title_str,
             description=f"{desc_header}"
                         f"💳 **1회 뽑기 가격**: **{price:,} P**\n"
-                        f"💰 **현재 내 보유 포인트**: **{user_points:,} P**\n\n"
+                        f"🎰 **{BULK_COUNT}회 뽑기 가격**: **{bulk_price(settings):,} P**"
+                        + (f" (**{bulk_discount(settings):,} P 할인**)\n"
+                           if bulk_discount(settings) else "\n")
+                        + f"💰 **현재 내 보유 포인트**: **{user_points:,} P**\n\n"
                         f"{status_line}",
             color=discord.Color.gold() if (is_ready and not is_all_sold_out) else discord.Color.red()
         )
@@ -738,7 +962,7 @@ class Gacha(commands.Cog):
             )
         embed.set_footer(text="당첨된 역할이나 포인트는 계정에 즉시 지급됩니다.")
 
-        view = GachaPlayView(is_out_of_stock=is_all_sold_out)
+        view = GachaPlayView(is_out_of_stock=is_all_sold_out, settings=settings)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 이름, 설명, 가격, 당첨 항목, 확률(총합 100%), 재고, 역할을 관리합니다.")
@@ -764,7 +988,10 @@ class Gacha(commands.Cog):
             title="⚙️ 럭키 뽑기, 역할 및 재고 설정 관리",
             description=f"🏷️ 뽑기 이름: **{gacha_title}**\n"
                         f"📝 뽑기 설명: {desc_text}\n"
-                        f"⚡ 시스템 상태: **{enabled_text}** | 💰 1회 뽑기 가격: **{price:,} P** | 📦 항목 수: **{len(items)}개**\n"
+                        f"⚡ 시스템 상태: **{enabled_text}** | 💰 1회: **{price:,} P** | "
+                        f"🎰 {BULK_COUNT}회: **{bulk_price(settings):,} P**"
+                        + (f" (**{bulk_discount(settings):,} P 할인**)" if bulk_discount(settings) else "")
+                        + f" | 📦 항목 수: **{len(items)}개**\n"
                         f"📊 전체 확률 합계: {status_str}\n\n"
                         "아래 드롭다운 메뉴에서 설정할 관리 기능을 선택하세요.",
             color=discord.Color.dark_gold()

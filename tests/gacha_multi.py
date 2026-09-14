@@ -1,0 +1,296 @@
+"""10회 뽑기 — 포인트·재고 원자성과 부분 환불.
+
+**Mongo 경로를 가짜 드라이버로 실제 실행합니다.** 10회 뽑기는 재고를
+열 번 건드리므로, JSON 폴백만 검증하면 실제로 배포되는 코드를 한 줄도
+보지 못합니다.
+
+가장 중요한 것은 **못 뽑았을 때 돈이 남지 않는가** 입니다.
+재고가 모자라 7회만 됐는데 10회분을 받으면 그건 포인트를 훔치는 것이고,
+반대로 전액 환불하면 상품을 공짜로 주는 것입니다.
+"""
+import sys, os, tempfile, asyncio
+
+PROJ = sys.argv[1]
+sys.path.insert(0, PROJ)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.chdir(tempfile.mkdtemp())
+os.environ["MONGO_URI"] = ""          # 진짜 연결은 절대 하지 않습니다
+
+import discord
+import fakemongo as FM
+import fakes as F
+from fakes import GUILD, Member, Inter, note, drain
+
+DB_COLS = ["users_col", "settings_col", "shop_col", "gacha_col", "logs_col",
+           "blacklist_col", "boost_col", "snapshot_col", "backup_set_col",
+           "checkin_set_col", "quest_set_col", "quest_prog_col",
+           "quest_state_col", "event_col"]
+
+
+def items(*specs):
+    """(이름, 확률, 재고, 보상P, 역할ID) 목록을 뽑기 항목으로 만듭니다."""
+    out = []
+    for i, (name, pct, stock, pts, role) in enumerate(specs, start=1):
+        out.append({"id": i, "name": name, "percent": pct, "stock": stock,
+                    "reward_points": pts, "reward_role_id": role,
+                    "description": ""})
+    return out
+
+
+async def main():
+    import utils.database as db
+
+    cols = FM.install(db, DB_COLS)
+    db._AFTER = FM.AFTER
+    db.STORAGE_MODE = "mongo"
+    print(f"가짜 컬렉션 장착: {len(cols)}개")
+
+    from discord.ext import commands
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+    for f in sorted(os.listdir(os.path.join(PROJ, "cogs"))):
+        if f.endswith(".py") and not f.startswith("__"):
+            await bot.load_extension(f"cogs.{f[:-3]}")
+
+    # ⚠️ load_extension 은 sys.modules 를 **새 인스턴스로 덮어씁니다.**
+    # 먼저 import 해 두면 버려진 옛 모듈을 잡습니다.
+    G = sys.modules["cogs.gacha"]
+
+    member = Member(4242, "뽑는사람", False, guild=GUILD)
+
+    async def setup_gacha(item_list, price=100, price_10=0):
+        await db.save_gacha_settings(GUILD.id, {
+            "enabled": True, "title": "테스트 뽑기", "description": "",
+            "price": price, "price_10": price_10, "items": item_list})
+        return await db.get_gacha_settings(GUILD.id)
+
+    async def set_points(amount):
+        cur = await db.get_user_points(GUILD.id, member.id)
+        if amount > cur:
+            await db.add_user_points(GUILD.id, member.id, amount - cur)
+        elif amount < cur:
+            await db.deduct_user_points(GUILD.id, member.id, cur - amount)
+        return await db.get_user_points(GUILD.id, member.id)
+
+    async def stock_of(item_id):
+        s = await db.get_gacha_settings(GUILD.id)
+        return next((i.get("stock") for i in s["items"] if i.get("id") == item_id), None)
+
+    print("=== 1. 가격 계산 ===")
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
+    note(G.bulk_price(s) == 1000, "price_10 이 0 이면 1회 가격 × 10", str(G.bulk_price(s)))
+    note(G.bulk_discount(s) == 0, "할인 없음")
+
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100, price_10=900)
+    note(G.bulk_price(s) == 900, "설정한 10회 가격을 씀", str(G.bulk_price(s)))
+    note(G.bulk_discount(s) == 100, "할인폭이 계산됨", str(G.bulk_discount(s)))
+
+    print("")
+    print("=== 2. 10회 뽑기 기본 ===")
+    s = await setup_gacha(items(("꽝", 90.0, -1, 0, 0), ("대박", 10.0, -1, 50, 0)),
+                          price=100, price_10=900)
+    await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(out["error"] is None, "정상 실행")
+    note(out["filled"] == 10, "10회 전부 채움", str(out["filled"]))
+    note(out["spent"] == 900, "할인가 900P 만 소모", str(out["spent"]))
+    note(out["refund"] == 0, "환불 없음")
+    expected = 5000 - 900 + out["reward_points"]
+    note(out["balance"] == expected, "잔액이 정확함",
+         f"{out['balance']} (기대 {expected})")
+
+    print("")
+    print("=== 3. 무제한(-1) 재고는 줄지 않아야 ===")
+    note(await stock_of(1) == -1, "무제한 항목의 재고가 그대로")
+
+    print("")
+    print("=== 4. 재고가 10회분씩 줄어야 ===")
+    s = await setup_gacha(items(("한정", 100.0, 30, 0, 0)), price=100)
+    await set_points(5000)
+    await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(await stock_of(1) == 20, "재고 30 → 20", str(await stock_of(1)))
+
+    print("")
+    print("=== 5. ⚠️ 재고가 모자라면 그만큼만 환불해야 ===")
+    # 여기가 돈이 새는 자리입니다. 전액 환불하면 상품을 공짜로 주고,
+    # 환불이 없으면 못 받은 회차 값을 그냥 가져가는 것입니다.
+    s = await setup_gacha(items(("딱3개", 100.0, 3, 0, 0)), price=100)
+    before = await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(out["filled"] == 3, "재고만큼인 3회만 성공", str(out["filled"]))
+    note(out["spent"] == 300, "3회분 300P 만 소모", str(out["spent"]))
+    note(out["refund"] == 700, "7회분 700P 환불", str(out["refund"]))
+    note(out["balance"] == before - 300, "잔액에서 300P 만 빠짐",
+         f"{out['balance']} (기대 {before - 300})")
+    note(await stock_of(1) == 0, "재고가 0 이 됨", str(await stock_of(1)))
+
+    print("")
+    print("  할인가에서 나누어떨어지지 않으면 **유저 쪽으로** 올림")
+    s = await setup_gacha(items(("딱3개", 100.0, 3, 0, 0)), price=100, price_10=999)
+    before = await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(out["refund"] >= 999 - (999 * 3) // 10,
+         "환불이 내림으로 깎이지 않음", f"환불 {out['refund']} / 소모 {out['spent']}")
+    note(out["spent"] + out["refund"] == 999, "소모 + 환불 = 낸 돈",
+         f"{out['spent']} + {out['refund']}")
+
+    print("")
+    print("=== 6. 전부 품절이면 전액 환불 ===")
+    s = await setup_gacha(items(("품절", 100.0, 0, 0, 0)), price=100)
+    before = await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(out["filled"] == 0, "한 번도 못 뽑음")
+    note(out["refund"] == 1000, "전액 환불", str(out["refund"]))
+    note(out["balance"] == before, "잔액이 그대로", f"{out['balance']} (기대 {before})")
+
+    print("")
+    print("=== 7. 포인트가 모자라면 아무것도 일어나지 않아야 ===")
+    s = await setup_gacha(items(("한정", 100.0, 50, 0, 0)), price=100)
+    before = await set_points(500)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(out["error"] == "no_points", "포인트 부족으로 거부", str(out.get("error")))
+    note(await db.get_user_points(GUILD.id, member.id) == before,
+         "포인트가 빠지지 않음")
+    note(await stock_of(1) == 50, "재고도 줄지 않음", str(await stock_of(1)))
+
+    print("")
+    print("=== 8. 포인트 보상은 한 번에 합산 적립 ===")
+    s = await setup_gacha(items(("항상50P", 100.0, -1, 50, 0)), price=100)
+    before = await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(out["reward_points"] == 500, "50P × 10 = 500P", str(out["reward_points"]))
+    note(out["balance"] == before - 1000 + 500, "잔액 반영",
+         f"{out['balance']} (기대 {before - 1000 + 500})")
+
+    print("")
+    print("=== 9. 같은 역할에 여러 번 당첨돼도 한 번만 지급 ===")
+    role = GUILD.roles[3]
+    s = await setup_gacha(items(("역할당첨", 100.0, -1, 0, role.id)), price=100)
+    await set_points(5000)
+    member.added.clear()
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(len(out["role_given"]) == 1, "역할 1개만 지급 대상", str(len(out["role_given"])))
+    note(member.added.count(role.name) == 1,
+         "add_roles 가 한 번만 불림", f"{member.added}")
+    note(not out["role_failed"], "실패 없음")
+
+    print("")
+    print("  없는 역할이면 조용히 넘어가지 않고 알려야 합니다")
+    s = await setup_gacha(items(("유령역할", 100.0, -1, 0, 999999999)), price=100)
+    await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(len(out["role_failed"]) == 1, "실패를 결과에 담음", str(out["role_failed"]))
+
+    print("")
+    print("=== 10. 퀘스트 진행도가 10회분 올라야 ===")
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
+    await set_points(5000)
+    day = db.quest_day()
+    key = db._quest_key(GUILD.id, member.id, day)
+    doc = await db._db(db.quest_prog_col.find_one, {"_id": key})
+    base = ((doc or {}).get("p") or {}).get("gacha", 0)
+    await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    doc = await db._db(db.quest_prog_col.find_one, {"_id": key})
+    after = ((doc or {}).get("p") or {}).get("gacha", 0)
+    note(after - base == 10, "일일 뽑기 진행도 +10", f"{base} → {after}")
+
+    print("")
+    print("=== 11. ⚠️ 동시에 10연차를 돌려도 재고 이상 나가면 안 됩니다 ===")
+    # 재고 5개에 두 명이 동시에 10연차를 돌립니다. 합쳐서 5개만 나가야 합니다.
+    # 읽고 계산해서 쓰면 여기서 10개가 나갑니다.
+    s = await setup_gacha(items(("딱5개", 100.0, 5, 0, 0)), price=10)
+    a = Member(5001, "A", False, guild=GUILD)
+    b = Member(5002, "B", False, guild=GUILD)
+    for m in (a, b):
+        await db.add_user_points(GUILD.id, m.id, 10000)
+
+    outs = await asyncio.gather(
+        G.perform_rolls(GUILD, a, s, G.BULK_COUNT, G.bulk_price(s)),
+        G.perform_rolls(GUILD, b, s, G.BULK_COUNT, G.bulk_price(s)),
+    )
+    total = sum(o["filled"] for o in outs)
+    note(total == 5, "두 명이 합쳐 정확히 5개만 받음", f"{[o['filled'] for o in outs]}")
+    note(await stock_of(1) == 0, "재고가 음수로 내려가지 않음", str(await stock_of(1)))
+    for o, m in zip(outs, (a, b)):
+        note(o["spent"] == o["filled"] * 10,
+             f"{m.name}: 받은 만큼만 냄", f"{o['spent']}P / {o['filled']}개")
+
+    print("")
+    print("=== 12. ⚠️ 잔액보다 많이 쓸 수 없어야 (연타) ===")
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
+    c = Member(5003, "C", False, guild=GUILD)
+    await db.add_user_points(GUILD.id, c.id, 1000)     # 딱 10회분
+    outs = await asyncio.gather(*[
+        G.perform_rolls(GUILD, c, s, G.BULK_COUNT, G.bulk_price(s))
+        for _ in range(3)
+    ])
+    paid = [o for o in outs if o.get("error") is None]
+    note(len(paid) == 1, "세 번 눌러도 한 번만 통과", f"{len(paid)}건 통과")
+    note(await db.get_user_points(GUILD.id, c.id) == 0,
+         "포인트가 음수로 내려가지 않음",
+         str(await db.get_user_points(GUILD.id, c.id)))
+
+    print("")
+    print("=== 13. 1회 뽑기도 같은 엔진을 쓰고 그대로 동작해야 ===")
+    s = await setup_gacha(items(("한정", 100.0, 7, 0, 0)), price=100)
+    before = await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, 1, 100)
+    note(out["filled"] == 1, "1회 성공")
+    note(out["spent"] == 100 and out["refund"] == 0, "100P 소모",
+         f"{out['spent']}/{out['refund']}")
+    note(out["balance"] == before - 100, "잔액 반영")
+    note(await stock_of(1) == 6, "재고 7 → 6", str(await stock_of(1)))
+
+    print("")
+    print("=== 14. 버튼 콜백이 실제로 동작해야 ===")
+    # cog 로드만으로는 NameError 를 잡지 못합니다.
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
+    view = G.GachaPlayView(settings=s)
+    note("10회" in view.roll_gacha_10.label, "10회 버튼 문구에 횟수가 보임",
+         view.roll_gacha_10.label)
+    note("1,000" in view.roll_gacha_10.label, "가격도 보임", view.roll_gacha_10.label)
+
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100, price_10=900)
+    view = G.GachaPlayView(settings=s)
+    note("할인" in view.roll_gacha_10.label, "할인폭이 버튼에 보임",
+         view.roll_gacha_10.label)
+
+    for label, cb in (("1회", "roll_gacha"), ("10회", "roll_gacha_10")):
+        it = Inter(uid=member.id, admin=False)
+        await db.add_user_points(GUILD.id, it.user.id, 100000)
+        v = G.GachaPlayView(settings=s)
+        try:
+            await getattr(v, cb).callback(it)
+            await drain()
+            got = bool(it.response.sent or it.response.done or it.followup.sent)
+            note(got, f"{label} 버튼이 응답함", F.outcome(it))
+        except Exception as e:
+            import traceback
+            note(False, f"{label} 버튼에서 예외", f"{type(e).__name__}: {e}")
+            traceback.print_exc(limit=3)
+
+    print("")
+    print("  품절이면 두 버튼이 모두 잠겨야 합니다")
+    s = await setup_gacha(items(("품절", 100.0, 0, 0, 0)), price=100)
+    v = G.GachaPlayView(is_out_of_stock=True, settings=s)
+    note(v.roll_gacha.disabled and v.roll_gacha_10.disabled,
+         "두 버튼 모두 비활성화")
+
+    print("")
+    print("=== 15. 10회 응답은 ephemeral 이어야 ===")
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
+    it = Inter(uid=member.id, admin=False)
+    await db.add_user_points(GUILD.id, it.user.id, 100000)
+    v = G.GachaPlayView(settings=s)
+    await v.roll_gacha_10.callback(it)
+    await drain()
+    leaked = [x for x in (it.response.sent + it.followup.sent)
+              if not x.get("ephemeral")]
+    note(not leaked, "공개로 나가는 응답이 없음", str(leaked)[:80])
+
+    await bot.close()
+    print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
+    for x in F.FAILS:
+        print("   -", x)
+
+
+asyncio.run(main())

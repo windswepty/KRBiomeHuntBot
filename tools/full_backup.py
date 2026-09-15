@@ -148,6 +148,12 @@ def _load(path: str) -> dict:
         # 예전에는 둘 다 빠져나가 생짜 트레이스백이 났습니다.
         sys.exit(f"파일을 읽을 수 없습니다: {path}\n  {type(e).__name__}: {e}")
 
+    excluded = (payload.get("_meta") or {}).get("excluded") or [] \
+        if isinstance(payload, dict) else []
+    if excluded:
+        print(f"  ℹ️ 이 백업에서 일부러 뺀 컬렉션: {', '.join(excluded)}")
+        print("     (7일이면 사라지는 임시 기록이라 복원 대상이 아닙니다)")
+
     if not isinstance(payload, dict) or "data" not in payload:
         hint = ""
         # 포인트 전용 파일의 실제 키는 `users` 입니다. 예전에는 `documents` 를

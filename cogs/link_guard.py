@@ -2891,6 +2891,14 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
 
 BIOME_PERIODS = [("오늘", 1), ("7일", 7), ("30일", 30)]
 
+# 카운트 대상은 **스스로 유지됩니다.**
+#   · 새 바이옴이 감지되면 자동으로 들어옵니다 (기록되는 순간 목록에 뜹니다)
+#   · 이 기간 동안 한 번도 안 뜬 바이옴은 자동으로 빠집니다
+# 게임에 바이옴이 추가·삭제돼도 사람이 목록을 손볼 일이 없어야 합니다.
+BIOME_ACTIVE_DAYS = 30
+# 처음 등장한 지 이만큼 안 지난 바이옴은 🆕 로 표시합니다.
+BIOME_NEW_DAYS = 7
+
 
 def rare_biome_names(settings: dict) -> list[str]:
     """알림 규칙이 지정한 바이옴 이름을 모두 모읍니다 (희귀 표시용)."""
@@ -2918,7 +2926,8 @@ def summarize_biomes(buckets: list[dict], days: int) -> dict[str, dict]:
         name = str(b.get("biome") or "?")
         day = str(b.get("day") or "")
         cur = out.setdefault(name, {"count": 0, "today": 0, "total": 0,
-                                    "notified": 0, "servers": set(), "last": ""})
+                                    "notified": 0, "servers": set(),
+                                    "last": "", "first": "9999-99-99"})
         n = int(b.get("count", 0) or 0)
         cur["total"] += n
         if day >= cutoff:
@@ -2930,7 +2939,27 @@ def summarize_biomes(buckets: list[dict], days: int) -> dict[str, dict]:
             cur["today"] += n
         if day > cur["last"]:
             cur["last"] = day
+        if day and day < cur["first"]:
+            cur["first"] = day
     return out
+
+
+def active_biomes(agg: dict, days: int = BIOME_ACTIVE_DAYS) -> tuple[list[str], list[str]]:
+    """카운트 대상과, 활동이 끊겨 빠진 바이옴을 갈라 돌려줍니다.
+
+    **조용히 빼면 안 됩니다.** 목록에서 사라진 이유를 알 수 없으면
+    "고장난 건가" 를 판단할 방법이 없으므로, 빠진 것은 숫자로 알립니다.
+    """
+    cutoff = _biome_day_str(days)
+    live = [k for k, v in agg.items() if v.get("last", "") >= cutoff]
+    dropped = [k for k in agg if k not in live]
+    return live, dropped
+
+
+def is_new_biome(v: dict, days: int = BIOME_NEW_DAYS) -> bool:
+    """이 기간 안에 처음 등장한 바이옴인지 (게임에 새로 추가된 것일 수 있습니다)."""
+    first = v.get("first", "")
+    return bool(first) and first != "9999-99-99" and first >= _biome_day_str(days)
 
 
 def _biome_today() -> str:
@@ -2965,19 +2994,25 @@ def _chunk_field(embed: discord.Embed, name: str, lines: list[str]) -> None:
                         value="\n".join(buf), inline=False)
 
 
+def _blank_biome() -> dict:
+    return {"count": 0, "today": 0, "total": 0, "notified": 0,
+            "servers": set(), "last": "", "first": "9999-99-99"}
+
+
 def _biome_lines(agg: dict, rare: list[str], names: list[str]) -> list[str]:
     out = []
     for name in names:
-        v = agg.get(name) or {"count": 0, "today": 0, "total": 0,
-                              "notified": 0, "servers": set(), "last": ""}
+        v = agg.get(name) or _blank_biome()
         is_rare = biome_matches(rare, name) is not None
         mark = "⭐" if is_rare else "•"
+        # 게임에 새로 추가된 바이옴일 수 있으므로 눈에 띄게 표시합니다.
+        new = " 🆕" if is_new_biome(v) else ""
         servers = len(v["servers"]) if isinstance(v["servers"], set) else 0
         bell = ""
         if is_rare:
             bell = f" · 🔔{v['notified']}" if v["notified"] else " · 🔕"
         srv = f" · 서버 {servers}곳" if servers else ""
-        out.append(f"{mark} **{name}** — {v['count']:,}회{srv}{bell}\n"
+        out.append(f"{mark} **{name}**{new} — {v['count']:,}회{srv}{bell}\n"
                    f"　누적 {v['total']:,}회 · 마지막 {v['last'] or '-'}")
     return out
 
@@ -3012,15 +3047,21 @@ def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
 
     # 희귀한 것을 먼저, 그다음 많이 뜬 순서. **전부 보여줍니다** — '외 N종'
     # 으로 접으면 정작 궁금한 바이옴이 그 안에 숨습니다.
-    rare_names = [k for k in agg if biome_matches(rare, k)]
+    # **카운트 대상은 스스로 유지됩니다.** 새 바이옴은 기록되는 순간 들어오고,
+    # 30일 동안 한 번도 안 뜬 것은 빠집니다. 게임에 바이옴이 추가·삭제돼도
+    # 사람이 목록을 손볼 일이 없어야 합니다.
+    live, dropped = active_biomes(agg)
+
+    rare_names = [k for k in live if biome_matches(rare, k)]
+    # 규칙에 적어 둔 희귀 바이옴은 활동이 없어도 **항상** 보여줍니다.
+    # 설정해 둔 것이 안 뜨고 있다는 사실 자체가 봐야 할 정보입니다.
     for name in rare:
-        if not any(biome_matches([name], k) for k in agg):
+        if not any(biome_matches([name], k) for k in rare_names):
             rare_names.append(name)
-            agg.setdefault(name, {"count": 0, "today": 0, "total": 0,
-                                  "notified": 0, "servers": set(), "last": ""})
+            agg.setdefault(name, _blank_biome())
     rare_names = sorted(dict.fromkeys(rare_names),
                         key=lambda k: (-agg[k]["count"], k))
-    others = sorted([k for k in agg if k not in rare_names],
+    others = sorted([k for k in live if k not in rare_names],
                     key=lambda k: (-agg[k]["count"], k))
 
     if rare:
@@ -3045,9 +3086,20 @@ def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
                 name="✅ 희귀 바이옴 알림",
                 value=f"이 기간에 뜬 희귀 바이옴 **{rare_now:,}회** 모두 알림이 나갔습니다.",
                 inline=False)
-        embed.set_footer(text="⭐ = 알림 규칙에 등록된 희귀 바이옴")
+        embed.set_footer(text="⭐ = 희귀 바이옴 · 🆕 = 최근 처음 등장")
     else:
         embed.set_footer(text="알림 규칙이 없어 희귀 바이옴 구분이 없습니다.")
+
+    # 조용히 빼면 왜 사라졌는지 알 수 없습니다. 숫자로 알립니다.
+    if dropped:
+        embed.add_field(
+            name="💤 카운트 대상에서 빠진 바이옴",
+            value=(f"**{len(dropped)}종**이 최근 {BIOME_ACTIVE_DAYS}일간 한 번도 "
+                   "뜨지 않아 목록에서 빠졌습니다.\n"
+                   f"-# {', '.join(f'`{n}`' for n in sorted(dropped)[:12])}"
+                   + (" …" if len(dropped) > 12 else "")
+                   + "\n-# 다시 뜨면 자동으로 돌아옵니다."),
+            inline=False)
     return embed
 
 
@@ -3165,16 +3217,20 @@ def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
     embed = discord.Embed(title="🌋 희귀 바이옴 실시간 카운터",
                           color=discord.Color.gold())
 
+    # 카운트 대상은 스스로 유지됩니다 (새 바이옴 자동 추가 / 30일 무활동 제외).
+    live, dropped = active_biomes(agg)
+
     # 규칙에 있는 희귀 바이옴은 **0회여도 항상** 보여줍니다. 빈칸이면 안 뜬
     # 건지 고장난 건지 판단할 수 없습니다.
+    rare_names = [k for k in live if biome_matches(rare, k)]
     for name in rare:
-        if not any(biome_matches([name], k) for k in agg):
-            agg[name] = {"count": 0, "today": 0, "total": 0,
-                         "notified": 0, "servers": set(), "last": ""}
+        if not any(biome_matches([name], k) for k in rare_names):
+            rare_names.append(name)
+            agg.setdefault(name, _blank_biome())
 
-    rare_names = sorted([k for k in agg if biome_matches(rare, k)],
+    rare_names = sorted(dict.fromkeys(rare_names),
                         key=lambda k: (-agg[k]["today"], -agg[k]["count"], k))
-    others = sorted([k for k in agg if k not in rare_names],
+    others = sorted([k for k in live if k not in rare_names],
                     key=lambda k: (-agg[k]["today"], -agg[k]["count"], k))
 
     def rows(names):
@@ -3183,7 +3239,8 @@ def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
             v = agg[name]
             servers = len(v["servers"]) if isinstance(v["servers"], set) else 0
             srv = f" · 서버 {servers}곳" if servers else ""
-            out.append(f"**{name}** — 오늘 **{v['today']:,}** · "
+            new = " 🆕" if is_new_biome(v) else ""
+            out.append(f"**{name}**{new} — 오늘 **{v['today']:,}** · "
                        f"30일 **{v['count']:,}** · 누적 **{v['total']:,}**{srv}")
         return out
 
@@ -3206,7 +3263,13 @@ def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
         f"오늘 **{today_total:,}회** 등장 · 누적 **{all_total:,}회**\n"
         f"-# 갱신 <t:{int(datetime.now(timezone.utc).timestamp())}:R> · "
         "**바이옴 시작 임베드 하나 = 1회** (종료는 세지 않습니다)")
-    embed.set_footer(text="이 메시지는 자동으로 갱신됩니다")
+    if dropped:
+        embed.add_field(
+            name="💤 빠진 바이옴",
+            value=f"**{len(dropped)}종**이 최근 {BIOME_ACTIVE_DAYS}일간 뜨지 않아 "
+                  "목록에서 빠졌습니다. 다시 뜨면 자동으로 돌아옵니다.",
+            inline=False)
+    embed.set_footer(text="자동 갱신 · 🆕 = 최근 처음 등장 · 목록은 스스로 유지됩니다")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
@@ -3537,11 +3600,17 @@ class LinkGuard(commands.Cog):
         #      통계는 있으면 좋은 것이고 보호는 없으면 안 되는 것입니다.
         biome_name = detect_biome_name(message)
         if biome_name:
+            # ⚠️ `bits` 는 **봇이 새로 덧붙인** 멘션만 담습니다. 원본 본문에
+            # 이미 `<@&역할>` 이나 `@everyone` 이 있으면 덧붙일 것이 없어
+            # 비지만, 그 멘션은 clean_content 에 남아 **정상적으로 울립니다.**
+            # bool(bits) 로 기록하면 알림이 갔는데도 '안 감' 으로 남아,
+            # 통계의 존재 이유인 "떴는데 알림이 안 나갔다" 판정이 거짓말이 됩니다.
+            alerted = bool(bits or message.role_mentions or message.mention_everyone)
             try:
                 await record_biome_event(
                     guild.id, biome_name,
                     link_key(all_links[0]) if all_links else "",
-                    message.channel.id, sent.id, bool(bits))
+                    message.channel.id, sent.id, alerted)
                 schedule_board_refresh(guild, settings)
             except Exception as e:
                 print(f"[LinkGuard] 바이옴 기록 실패: {type(e).__name__}: {e}", flush=True)

@@ -1756,6 +1756,20 @@ _backup_set_lock = asyncio.Lock()
 # 디스코드 첨부 한도(비부스트 25MB)에 여유를 두고, 넘으면 압축합니다.
 FULL_BACKUP_GZIP_OVER = 8 * 1024 * 1024
 
+# ⚠️ 백업에서 **제외**하는 컬렉션.
+#
+# `protected_links` 는 실측 180,212건 / 41MB 로 DB 전체(43MB)의 95% 입니다.
+# 그런데 담기는 값은 **7일 TTL 이 걸린 메시지별 행**이라 되돌릴 가치가 거의
+# 없습니다(그 메시지들은 복원 시점에 이미 사라졌거나 곧 만료됩니다).
+#
+# 문제는 크기 자체가 **무인 가동의 위험**이라는 것입니다. 서버 RAM 은 954MB
+# (여유 430MB)인데, 매일 05:00 에 이걸 전부 파이썬 객체로 올려 직렬화하고
+# 압축합니다. OOM 이 나면 아무도 없는 새벽에 봇이 죽습니다.
+#
+# 빼면 백업이 41MB → 2MB 가 되고, 압축도 필요 없어지고, 복원도 즉시 끝납니다.
+# **무엇이 빠졌는지는 `_meta.excluded` 에 남겨 복원하는 사람이 알 수 있게 합니다.**
+FULL_BACKUP_EXCLUDE = ("protected_links",)
+
 
 def _encode_bson(o):
     """ObjectId·datetime 을 타입 보존 형태로 직렬화합니다.
@@ -1785,6 +1799,8 @@ async def export_full_payload() -> dict:
         def _collect():
             out = {}
             for name in sorted(mongo_db.list_collection_names()):
+                if name in FULL_BACKUP_EXCLUDE:
+                    continue
                 out[name] = list(mongo_db[name].find())
             return out
         try:
@@ -1815,6 +1831,7 @@ async def export_full_payload() -> dict:
         "created_kst": now_kst,
         "collections": counts,
         "storage_mode": STORAGE_MODE,
+        "excluded": list(FULL_BACKUP_EXCLUDE),
         "note": "전체 덤프 — 유저 ID·포인트 포함. 공개 채널에 올리지 마세요.",
     }
     # ⚠️ 수집이 실패했으면 **반드시 표시합니다.** 예전에는 조용히 빈 dict 가

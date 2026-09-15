@@ -204,6 +204,14 @@ async def send_full_backup(bot, guild, *, reason: str = "manual") -> tuple[bool,
         value="상점 구성 · 뽑기 확률 · 인증 조건 · 링크 보호 설정 · "
               "로블록스 연동까지 **전부** 들어 있습니다.",
         inline=False)
+    excluded = meta.get("excluded") or []
+    if excluded:
+        embed.add_field(
+            name="📭 일부러 뺀 것",
+            value=("`" + "`, `".join(excluded) + "`\n"
+                   "-# 7일이면 사라지는 메시지별 임시 기록이라 되돌릴 가치가 없고, "
+                   "DB 의 95%를 차지해 백업을 40MB 넘게 부풀립니다."),
+            inline=False)
     embed.add_field(
         name="♻️ 되돌리는 법",
         value="이 파일을 받아 프로젝트 폴더에서:\n"

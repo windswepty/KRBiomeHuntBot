@@ -253,6 +253,21 @@ async def main():
     note(not ok and info == "no-channel", "채널 미설정이면 조용히 건너뜀", str(info))
 
     print("")
+    print("=== ⚠️ 휘발성 대용량 컬렉션은 백업에서 빠져야 합니다 ===")
+    # protected_links 는 실측 180,212건 / 41MB 로 DB 의 95% 입니다. 7일 TTL 이
+    # 걸린 메시지별 행이라 되돌릴 가치가 없는데, 그 크기 자체가 무인 가동의
+    # 위험입니다 — 서버 RAM 954MB 에서 매일 새벽 통째로 메모리에 올립니다.
+    await vdb.save_protected_link(GUILD.id, 55501, ["https://example.com/keep"])
+    payload = await db.export_full_payload()
+    note("protected_links" not in payload["data"],
+         "protected_links 가 백업에 담기지 않음",
+         str(list(payload["data"].keys()))[:70])
+    note("users" in payload["data"], "정작 중요한 것은 그대로 담김")
+    note(payload["_meta"].get("excluded") == ["protected_links"],
+         "무엇을 뺐는지 _meta 에 남김 (복원하는 사람이 알아야 합니다)",
+         str(payload["_meta"].get("excluded")))
+
+    print("")
     print("=== ⚠️ 실제로 올라가는 형식(gzip)을 복원 도구가 읽어야 합니다 ===")
     # 실 DB 는 40MB 대라 **매일 .json.gz 로 올라갑니다.** 여기서 못 읽으면
     # 백업은 있는데 되돌릴 수 없는 상태가 됩니다(2026-09-15 에 실제로 그랬습니다).

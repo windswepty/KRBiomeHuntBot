@@ -249,6 +249,79 @@ async def main():
     note("누적" in blob, "누적 표시가 있음")
     note("3회" in blob or "**3**" in blob, "같은 링크 3번이 3회로 셈", blob[:90])
 
+    print("=== 7-2. ⚠️ 카운트 대상이 스스로 유지되어야 ===")
+    # 게임에 바이옴이 추가·삭제돼도 사람이 목록을 손볼 일이 없어야 합니다.
+    await setup()
+
+    async def put(biome, days_ago, count=1, notified=False):
+        day = (datetime.datetime.now(vdb.KST)
+               - datetime.timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        await vdb._db(vdb.biome_col.update_one,
+                      {"_id": vdb._biome_bucket_id(GUILD.id, biome, day)},
+                      {"$set": {"guild_id": str(GUILD.id), "kind": "day",
+                                "biome": biome, "day": day,
+                                "updated": datetime.datetime.now(datetime.timezone.utc)},
+                       "$inc": {"count": count,
+                                "notified_count": count if notified else 0}},
+                      upsert=True)
+
+    await put("현역바이옴", 2, 5)
+    await put("죽은바이옴", 45, 9)        # 45일 전 이후로 소식 없음
+    await put("경계바이옴", 29, 3)        # 아직 30일 안쪽
+    await put("새바이옴", 0, 2)           # 오늘 처음
+
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    agg = LG.summarize_biomes(rows, 30)
+    live, dropped = LG.active_biomes(agg)
+    note("현역바이옴" in live, "최근에 뜬 것은 대상에 남음")
+    note("경계바이옴" in live, "29일 전은 아직 대상 (경계)")
+    note("죽은바이옴" in dropped, "45일간 안 뜬 것은 자동 제외", str(dropped))
+    note("새바이옴" in live, "새로 감지된 바이옴은 자동 추가됨")
+
+    print("")
+    print("  화면에서도 빠지고, **왜 빠졌는지** 알려야 합니다")
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
+    blob = " ".join((f.name or "") + (f.value or "") for f in embed.fields)
+    note("현역바이옴" in blob, "현역은 표시됨")
+    note("새바이옴" in blob, "신규도 표시됨")
+    drop_field = next((f.value for f in embed.fields if "빠진" in (f.name or "")), "")
+    note(bool(drop_field), "빠진 바이옴 칸이 있음 (조용히 지우지 않음)")
+    note("죽은바이옴" in drop_field, "무엇이 빠졌는지 이름을 밝힘", drop_field[:70])
+    note("다시 뜨면" in drop_field, "돌아온다는 것을 알려줌")
+
+    print("")
+    print("  🆕 는 최근 처음 등장한 것에만 붙어야 합니다")
+    note(LG.is_new_biome(agg["새바이옴"]), "오늘 처음 등장 → 🆕")
+    note(not LG.is_new_biome(agg["경계바이옴"]), "29일 전부터 있던 것은 🆕 아님")
+    note("🆕" in blob, "화면에 🆕 가 보임")
+
+    print("")
+    print("  ⚠️ 규칙에 적어 둔 희귀 바이옴은 한 달을 쉬어도 남아야 합니다")
+    # 설정해 둔 것이 안 뜨고 있다는 사실 자체가 봐야 할 정보입니다.
+    await setup()
+    await put("DREAMSPACE", 60, 1)        # 두 달 전 이후 소식 없음
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
+    rare_f = next((f.value for f in embed.fields if "희귀" in (f.name or "")), "")
+    for name in RARE:
+        note(name in rare_f, f"{name} 은 활동이 없어도 계속 표시", rare_f[:60])
+
+    print("")
+    print("  다시 뜨면 자동으로 돌아와야 합니다")
+    await setup()
+    await put("부활바이옴", 50, 3)
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    live, dropped = LG.active_biomes(LG.summarize_biomes(rows, 30))
+    note("부활바이옴" in dropped, "일단 빠져 있음")
+    await put("부활바이옴", 0, 1)
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    agg2 = LG.summarize_biomes(rows, 30)
+    live, dropped = LG.active_biomes(agg2)
+    note("부활바이옴" in live, "다시 뜨자 자동으로 돌아옴")
+    note(agg2["부활바이옴"]["total"] == 4, "누적은 옛 기록까지 합산",
+         str(agg2["부활바이옴"]["total"]))
+
+    print("")
     print("=== 8. 기록이 없으면 '없음'을 설명해야 ===")
     # 빈 화면에 0 만 띄우면 "고장난 건가" 를 판단할 수 없습니다.
     embed = LG.build_biome_stats_embed(GUILD, [], settings, 1)

@@ -167,7 +167,15 @@ def summarize_results(results: list[dict]) -> list[tuple[str, int]]:
 
 class GachaPlayView(discord.ui.View):
     def __init__(self, is_out_of_stock: bool = False, settings: dict | None = None):
-        super().__init__(timeout=180)
+        # ⚠️ **영구 View 입니다** (`timeout=None` + `setup()` 의 `bot.add_view`).
+        # 예전에는 `timeout=180` 이라 유저가 확률표를 3분 넘게 읽고 누르면
+        # 아무 핸들러에도 닿지 않아 "적시에 응답하지 않았어요" 만 떴습니다.
+        # ephemeral 패널이라 새로고침할 방법도 없어 명령어를 다시 쳐야 했습니다.
+        #
+        # 영구 View 는 **인스턴스 하나를 모두가 공유**하므로 self 의 버튼
+        # 속성을 바꾸면 남의 화면까지 오염됩니다. 상태를 바꿔야 할 때는
+        # 새 인스턴스를 만들어 `response.edit_message` 로 교체하세요.
+        super().__init__(timeout=None)
 
         if settings is not None:
             saving = bulk_discount(settings)
@@ -188,14 +196,6 @@ class GachaPlayView(discord.ui.View):
     def _sold_out_all(self, items: list[dict]) -> bool:
         return not [i for i in items if i.get("stock", -1) != 0]
 
-    def _mark_sold_out(self) -> None:
-        for btn in (self.roll_gacha, self.roll_gacha_10):
-            btn.disabled = True
-            btn.style = discord.ButtonStyle.secondary
-            btn.emoji = "🚫"
-        self.roll_gacha.label = "🚫 모든 상품 품절 (재고 없음)"
-        self.roll_gacha_10.label = "🚫 품절"
-
     async def _precheck(self, interaction: discord.Interaction, settings: dict):
         """뽑기를 진행할 수 있는 상태인지 봅니다. 문제가 있으면 응답까지 마칩니다.
 
@@ -215,17 +215,24 @@ class GachaPlayView(discord.ui.View):
             return False
 
         if self._sold_out_all(items):
-            self._mark_sold_out()
+            # ⚠️ ephemeral 메시지는 `interaction.message.edit()` 으로 **수정할 수
+            # 없습니다** (봇 토큰 PATCH 가 아니라 상호작용 토큰으로만 됩니다).
+            # 예전 코드는 그걸 `except: pass` 로 삼켜서, 품절 잠금이 **한 번도
+            # 화면에 반영된 적이 없고 로그도 남지 않았습니다.**
+            # 컴포넌트 상호작용은 자기 메시지를 `response.edit_message` 로
+            # 고칠 수 있으므로 그쪽을 씁니다.
+            locked = GachaPlayView(is_out_of_stock=True, settings=settings)
+            embed = discord.Embed(
+                title="⚠️ 모든 뽑기 상품 품절",
+                description="현재 남아있는 모든 뽑기 상품의 재고가 소진(품절)되었습니다.",
+                color=discord.Color.red())
             try:
-                await interaction.message.edit(view=self)
-            except Exception:
-                pass
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="⚠️ 모든 뽑기 상품 품절",
-                    description="현재 남아있는 모든 뽑기 상품의 재고가 소진(품절)되었습니다.",
-                    color=discord.Color.red()),
-                ephemeral=True)
+                await interaction.response.edit_message(embed=embed, view=locked)
+            except Exception as e:
+                # 여기까지 실패하면 조용히 넘어가지 않고 알립니다.
+                print(f"[Gacha] 품절 패널 갱신 실패: {type(e).__name__}: {e}", flush=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
             return False
 
         if not is_valid_100_percent(items):
@@ -273,21 +280,12 @@ class GachaPlayView(discord.ui.View):
                                 f"💰 차감된 **{total_price:,} P**는 **전액 환불**되었습니다.",
                     color=discord.Color.orange()),
                 ephemeral=True)
-            self._mark_sold_out()
-            try:
-                await interaction.message.edit(view=self)
-            except Exception:
-                pass
             return
 
-        # 남은 재고가 없으면 버튼을 잠급니다
-        if self._sold_out_all(outcome["items"]):
-            self._mark_sold_out()
-            try:
-                await interaction.message.edit(view=self)
-            except Exception:
-                pass
-
+        # 뽑은 뒤 품절이 됐어도 **패널을 고치지 않습니다.** 이미 defer 로
+        # 응답을 시작해서 그 메시지를 되돌아가 고칠 방법이 없고, 다음 클릭은
+        # `_precheck` 가 차감 전에 막아 줍니다. 되지도 않는 수정을 시도하며
+        # 예외를 삼키는 코드는 "동작하는 줄 알았다" 를 만들 뿐입니다.
         await self._send_result(interaction, settings, outcome, count, total_price)
 
     async def _send_result(self, interaction, settings, outcome, count, total_price):
@@ -1002,3 +1000,6 @@ class Gacha(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(Gacha(bot))
+    # 봇 재시작 후에도, 그리고 패널을 띄워 둔 지 3분이 지나도 버튼이
+    # 동작해야 합니다. custom_id 가 고정값이라 등록만 하면 됩니다.
+    bot.add_view(GachaPlayView())

@@ -33,11 +33,19 @@ def link(code):
     return f"https://www.roblox.com/games/1234567/Test?privateServerLinkCode={code}"
 
 
-def macro(channel, title, url, author="Macro", footer="MultiScope v2.0.5"):
+def macro(channel, title, url, author="Macro", footer="MultiScope v2.0.5",
+          body=None):
+    """매크로 임베드 한 건. `body` 를 주면 **본문 앞에** 붙습니다.
+
+    Coteab v2.2.0 · maxstellar v2.3 은 제목에 시각을 넣고 본문에
+    `> ## Biome Started - SNOWY` 를 쓰기 때문에, 그 형태를 흉내 낼 수
+    있어야 합니다.
+    """
     _mid[0] += 1
     m = Msg(_mid[0], channel, Member(3, "Macro", guild=GUILD))
     m.guild, m.webhook_id, m.content = GUILD, 12345, ""
-    e = discord.Embed(title=title, description=url)
+    e = discord.Embed(title=title,
+                      description=(body + "\n" + url) if body else url)
     e.set_author(name=author)
     e.set_footer(text=footer)
     m.embeds = [e]
@@ -102,6 +110,23 @@ async def main():
         ("BIOME ENDED - HELL Found", None),
         ("오늘의 공지", None),
         ("", None),
+        # ── 형식 ②: 이름이 **앞**에 오는 매크로 (MultiScope v0.9.8) ──
+        # 이 형식을 못 읽던 동안 `BLOOD RAIN` 은 통계에 아예 없었습니다.
+        ("🌀 WINDY Biome Started", "WINDY"),
+        ("🩸 BLOOD RAIN Biome Started", "BLOOD RAIN"),
+        ("🎃 PUMPKIN MOON Biome Started", "PUMPKIN MOON"),
+        ("🪦 GRAVEYARD Biome Started", "GRAVEYARD"),
+        ("SNOWY Biome Started", "SNOWY"),
+        ("🔥 HELL Biome Ended", None),   # 이 형식도 종료는 세지 않습니다
+        ("❄️ SNOWY Biome Ended", None),
+        # 매크로의 다른 알림이 바이옴으로 둔갑하면 안 됩니다
+        ("MultiScope Started", None),
+        ("MultiScope Stopped", None),
+        (":green_circle: Macro Started!", None),
+        (":joystick: Biome Randomizer was used.", None),
+        ("Aura Equipped - Raft", None),
+        ("MARI HAS ARRIVED! Found", None),
+        ("== 🌟 Macro Status 🌟 ==", None),
     ]
     for title, want in cases:
         m = type("M", (), {"embeds": [discord.Embed(title=title)]})()
@@ -109,13 +134,55 @@ async def main():
         note(got == want, f"{title[:32]!r:36} -> {want!r}", repr(got))
 
     print("")
-    print("  ⚠️ 제목만 봅니다 — 본문·작성자·바닥글은 보지 않습니다")
-    e = discord.Embed(title="공지입니다", description="Biome Started - DREAMSPACE")
+    print("  ⚠️ 같은 바이옴이 **형식 차이로 갈라지면** 안 됩니다")
+    # 한 서버에 매크로가 여러 종류 돌아갑니다. `WINDY` 와 `🌀 WINDY` 가
+    # 서로 다른 칸으로 세어지면 숫자가 절반씩 쪼개져 둘 다 틀립니다.
+    for a, b in [("Biome Started - WINDY", "🌀 WINDY Biome Started"),
+                 ("BIOME STARTED - HELL Found", "🔥 HELL Biome Started"),
+                 ("Biome Started - SNOWY", "❄️ SNOWY Biome Started")]:
+        ma = type("M", (), {"embeds": [discord.Embed(title=a)]})()
+        mb = type("M", (), {"embeds": [discord.Embed(title=b)]})()
+        ga, gb = LG.detect_biome_name(ma), LG.detect_biome_name(mb)
+        note(ga == gb and ga is not None,
+             f"{a[:28]!r} 와 {b[:28]!r} 가 같은 이름", f"{ga!r} / {gb!r}")
+
+    print("")
+    print("  ⚠️ 작성자·바닥글은 **보지 않습니다** (매크로 이름이 들어갑니다)")
+    # 섞으면 이름에 바이옴이 든 매크로의 모든 메시지가 바이옴이 됩니다.
+    e = discord.Embed(title="공지입니다")
     e.set_author(name="Biome Started - CYBERSPACE")
     e.set_footer(text="Biome Started - GLITCHED")
     m = type("M", (), {"embeds": [e]})()
     note(LG.detect_biome_name(m) is None,
-         "제목 밖의 문구로는 기록되지 않음", repr(LG.detect_biome_name(m)))
+         "작성자·바닥글의 문구로는 기록되지 않음", repr(LG.detect_biome_name(m)))
+
+    print("")
+    print("  ── 형식 ③: 제목은 시각, **본문**에 이름 (Coteab · maxstellar) ──")
+    # 이 형식을 못 읽던 동안 두 매크로의 바이옴은 한 건도 세어지지 않았습니다.
+    body_cases = [
+        ("[12:10:40]", "> ## Biome Started - SNOWY", "SNOWY"),
+        ("<t:1788524808:F> (<t:1788524808:R>)",
+         "> ## Biome Started - WINDY \n> ### **[Join Server](https://x)**", "WINDY"),
+        ("[17:56:05]", "> ## Biome Ended - WINDY\n`🔒 인증된 유저만`", None),
+        ("[16:41:59]", "> ## Biome Started - BLAZING SUN\n`🔒 인증된 유저만`",
+         "BLAZING SUN"),
+        # 본문에 바이옴 얘기가 없으면 여전히 None
+        ("[09:00:00]", "**Account:** `Someone`\n**Status:** Active ✅", None),
+    ]
+    for title, body, want in body_cases:
+        e = discord.Embed(title=title, description=body)
+        e.set_footer(text="maxstellar's Biome Macro | v2.3")
+        m = type("M", (), {"embeds": [e]})()
+        got = LG.detect_biome_name(m)
+        note(got == want, f"{title[:22]!r:26} + 본문 -> {want!r}", repr(got))
+
+    print("")
+    print("  ⚠️ 제목이 우선입니다 (본문에 다른 문장이 섞일 수 있습니다)")
+    e = discord.Embed(title="Biome Started - DREAMSPACE",
+                      description="> ## Biome Started - SNOWY")
+    m = type("M", (), {"embeds": [e]})()
+    note(LG.detect_biome_name(m) == "DREAMSPACE",
+         "제목의 이름을 씁니다", repr(LG.detect_biome_name(m)))
 
     print("")
     print("=== 2. 보호할 때 기록이 남아야 ===")
@@ -319,6 +386,83 @@ async def main():
     note("부활바이옴" in live, "다시 뜨자 자동으로 돌아옴")
     note(agg2["부활바이옴"]["total"] == 4, "누적은 옛 기록까지 합산",
          str(agg2["부활바이옴"]["total"]))
+
+    print("")
+    print("=== 7-3. ⚠️ 못 읽은 제목은 **드러나야** 합니다 ===")
+    # 매크로는 판올림하면서 제목 배치를 바꿉니다. 못 읽은 것을 조용히 버리면
+    # 그 매크로의 바이옴이 통계에서 통째로 빠지는데, **빠졌다는 사실조차
+    # 아무도 모릅니다.** 그래서 개수를 세고 표본 제목을 남깁니다.
+    await setup()
+    LG._unparsed_seen.clear()
+
+    await run(macro(ch, "Biome Started - DREAMSPACE", link("u1")))
+    await run(macro(ch, "🌀 WINDY Biome Started", link("u2")))
+    await run(macro(ch, "[12:10:40]", link("u3"),
+                    body="> ## Biome Started - SNOWY"))
+    up = await vdb.get_biome_unparsed(GUILD.id, 7)
+    note(up["count"] == 0, "읽히는 형식은 미인식으로 세지 않음", str(up))
+
+    print("")
+    print("  ⚠️ **종료 알림은 못 읽은 것이 아닙니다** (읽고 나서 안 세는 것)")
+    # 이걸 세면 바이옴이 뜨고 끝날 때마다 경고가 올라 늘 켜져 있게 됩니다.
+    await run(macro(ch, "[17:56:05]", link("u4"),
+                    body="> ## Biome Ended - WINDY"))
+    await run(macro(ch, "🔥 HELL Biome Ended", link("u5")))
+    up = await vdb.get_biome_unparsed(GUILD.id, 7)
+    note(up["count"] == 0, "종료 알림은 경고하지 않음", str(up))
+
+    print("")
+    print("  ⚠️ 바이옴 알림이 **아닌 것**도 세지 않습니다")
+    # 매크로 시작/정지·NPC 등장까지 세면 경고가 소음이 됩니다(실측 25%).
+    for t in ("MultiScope Started", "MultiScope Stopped",
+              "MARI HAS ARRIVED! Found", "Aura Equipped - Raft"):
+        await run(macro(ch, t, link("n" + t[:3])))
+    up = await vdb.get_biome_unparsed(GUILD.id, 7)
+    note(up["count"] == 0, "바이옴 얘기가 없는 알림은 조용함", str(up))
+
+    print("")
+    print("  모르는 형식이 들어오면 **그때는 반드시** 알려야 합니다")
+    await run(macro(ch, "[06:24:02]", link("u6"),
+                    body="> ## Biome Spotted!! WINDY"))
+    await run(macro(ch, "[06:24:02]", link("u7"),
+                    body="> ## Biome Spotted!! WINDY"))
+    await run(macro(ch, "🌟 새 형식 Biome Appeared", link("u8")))
+    up = await vdb.get_biome_unparsed(GUILD.id, 7)
+    note(up["count"] == 3, "못 읽은 것은 빠짐없이 셈", str(up["count"]))
+    note("[06:24:02]" in up["titles"], "표본 제목이 남음", str(up["titles"]))
+    note(len(up["titles"]) == 2, "같은 제목은 한 번만", str(up["titles"]))
+
+    print("")
+    print("  집계에 섞이면 안 됩니다 (`kind` 가 다릅니다)")
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    note(all(r.get("kind") == "day" for r in rows),
+         "버킷 조회에 미인식 문서가 섞이지 않음", str([r.get("kind") for r in rows]))
+    agg = LG.summarize_biomes(rows, 30)
+    note("?" not in agg, "이름 모르는 칸이 통계에 생기지 않음", str(list(agg)))
+
+    print("")
+    print("  화면이 **그만큼 빠졌다**고 말해야 합니다")
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1, up)
+    blob = " ".join((f.name or "") + (f.value or "") for f in embed.fields)
+    note("못 읽은" in blob, "미인식 칸이 보임")
+    note("3" in blob and "빠져" in blob, "몇 건이 빠졌는지 밝힘")
+    note("[06:24:02]" in blob, "어떤 제목인지 보여 줌")
+
+    print("")
+    print("  미인식이 없으면 그 칸도 없어야 합니다 (늘 켜진 경고는 무시됩니다)")
+    embed2 = LG.build_biome_stats_embed(GUILD, rows, settings, 1,
+                                        {"count": 0, "titles": []})
+    blob2 = " ".join((f.name or "") + (f.value or "") for f in embed2.fields)
+    note("못 읽은" not in blob2, "0건이면 칸이 뜨지 않음")
+
+    print("")
+    print("  표본은 프로세스마다 상한이 있어야 합니다 (배열 무한 증가 방지)")
+    LG._unparsed_seen.clear()
+    taken = sum(1 for i in range(50)
+                if LG._take_unparsed_sample(GUILD.id, f"제목{i}"))
+    note(taken == LG.UNPARSED_SAMPLE_CAP,
+         f"표본은 {LG.UNPARSED_SAMPLE_CAP}개까지만", str(taken))
+    note(not LG._take_unparsed_sample(GUILD.id, "제목0"), "같은 제목은 다시 안 보냄")
 
     print("")
     print("=== 8. 기록이 없으면 '없음'을 설명해야 ===")

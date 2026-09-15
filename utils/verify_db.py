@@ -1470,6 +1470,91 @@ async def record_biome_event(guild_id: int, biome: str, link_key_str: str,
         _write_json(BIOME_FILE, all_rows)
 
 
+# 하루에 기억할 '못 읽은 제목' 표본 수. 몇 개만 있으면 어떤 형식인지
+# 알아보기 충분하고, 개수는 따로 세므로 표본을 늘릴 이유가 없습니다.
+BIOME_UNPARSED_SAMPLES = 12
+
+
+def _biome_unparsed_id(guild_id: int, day: str) -> str:
+    return f"{guild_id}:__unparsed__:{day}"
+
+
+async def record_biome_unparsed(guild_id: int, title: str) -> None:
+    """보호는 했는데 **바이옴 이름을 못 읽은** 임베드를 셉니다.
+
+    보호까지 온 메시지는 개인서버 링크가 든 매크로 알림입니다. 그런데
+    이름을 못 뽑았다면 우리가 모르는 제목 형식이 들어온 것이고, 그때부터
+    그 매크로가 올리는 바이옴은 **통계에서 통째로 빠집니다.** 조용히
+    버리지 않고 세어 두어야 `/바이옴통계` 가 그 사실을 말해 줍니다.
+
+    `kind: "unparsed"` 라 `get_biome_buckets()` 의 집계에는 섞이지
+    않습니다 — 섞이면 숫자가 조용히 틀어집니다.
+    """
+    now = datetime.now(timezone.utc)
+    day = _biome_day()
+    key = _biome_unparsed_id(guild_id, day)
+    sample = str(title or "")[:80]
+
+    if biome_col is not None:
+        try:
+            upd = {"$set": {"updated": now},
+                   "$inc": {"count": 1},
+                   "$setOnInsert": {"guild_id": str(guild_id), "kind": "unparsed",
+                                    "day": day, "first_seen": now}}
+            if sample:
+                upd["$addToSet"] = {"titles": sample}
+            await _db(biome_col.update_one, {"_id": key}, upd, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB record_biome_unparsed error: {e}, using local file.", flush=True)
+
+    async with _biome_lock:
+        all_rows = _read_json(BIOME_FILE)
+        row = all_rows.get(key) or {"guild_id": str(guild_id), "kind": "unparsed",
+                                    "day": day, "first_seen": now.isoformat(),
+                                    "count": 0, "titles": []}
+        row["count"] = int(row.get("count", 0)) + 1
+        if sample and sample not in row.get("titles", []) \
+                and len(row.get("titles", [])) < BIOME_UNPARSED_SAMPLES:
+            row.setdefault("titles", []).append(sample)
+        row["updated"] = now.isoformat()
+        all_rows[key] = row
+        _write_json(BIOME_FILE, all_rows)
+
+
+async def get_biome_unparsed(guild_id: int, since_days: int = 7) -> dict:
+    """기간 안에 못 읽은 제목의 개수와 표본을 모읍니다."""
+    days = max(1, int(since_days))
+    cutoff_day = (datetime.now(KST) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    out = {"count": 0, "titles": []}
+
+    rows = []
+    if biome_col is not None:
+        try:
+            def _fetch():
+                return list(biome_col.find(
+                    {"guild_id": str(guild_id), "kind": "unparsed",
+                     "day": {"$gte": cutoff_day}}).sort("day", -1).limit(400))
+            rows = await _db(_fetch)
+        except Exception as e:
+            print(f"MongoDB get_biome_unparsed error: {e}, using local file.", flush=True)
+            rows = []
+    if not rows:
+        async with _biome_lock:
+            all_rows = _read_json(BIOME_FILE)
+        rows = [r for r in all_rows.values()
+                if str(r.get("guild_id")) == str(guild_id)
+                and r.get("kind") == "unparsed"
+                and str(r.get("day", "")) >= cutoff_day]
+
+    for r in rows:
+        out["count"] += int(r.get("count", 0) or 0)
+        for t in (r.get("titles") or []):
+            if t not in out["titles"] and len(out["titles"]) < BIOME_UNPARSED_SAMPLES:
+                out["titles"].append(t)
+    return out
+
+
 async def get_biome_buckets(guild_id: int, since_days: int = 30) -> list[dict]:
     """기간 안의 날짜 버킷을 돌려줍니다 (최근 날짜 순).
 

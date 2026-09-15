@@ -26,6 +26,7 @@ from utils.verify_db import (
     register_guarded_keys, get_guarded_keys,
     record_link_usage, get_link_usage, find_issued_to,
     record_biome_event, get_biome_buckets,
+    record_biome_unparsed, get_biome_unparsed,
     save_log_reference, get_log_reference, get_log_reference_by_protected,
     get_roblox_names,
 )
@@ -450,34 +451,126 @@ def extract_embed_mentions(message) -> tuple[list[int], bool, bool]:
     return role_ids, everyone, here
 
 
-# 매크로 7종이 전부 제목을 `Biome Started - <이름>` 형식으로 씁니다
-# (`BIOME STARTED - HELL Found`, `BIOME  STARTED :: glitched_biome` 포함).
-# 구분자와 대소문자만 제각각이라 하나의 정규식으로 덮입니다.
+# 매크로가 쓰는 제목은 **두 갈래**입니다. 이름이 뒤에 오는 형식만 보던
+# 동안, 앞에 오는 형식으로 뜬 바이옴은 **한 건도 세어지지 않았습니다.**
+#
+#   ① `Biome Started - DREAMSPACE` · `BIOME STARTED :: HELL Found`
+#   ② `🌀 WINDY Biome Started` · `🩸 BLOOD RAIN Biome Started`
+#
+# ② 은 MultiScope v0.9.8-Stable 이 쓰는 형식입니다. 2026-09-15 실측(감시
+# 채널 244곳 / 메시지 23,482건)에서 `BLOOD RAIN` 은 이 형식으로만 올라와
+# **통계에 아예 존재하지 않았습니다.** 매크로는 판올림하면서 제목 배치를
+# 바꿉니다 — **하나에서 확인하고 "된다"고 하지 마세요.**
 BIOME_TITLE_RE = re.compile(
     r"biome\s*(started|ended)\s*[-\u2013\u2014:]+\s*(.+?)\s*(?:found)?\s*$",
-    re.IGNORECASE)
+    re.IGNORECASE | re.MULTILINE)
+BIOME_TITLE_TAIL_RE = re.compile(
+    r"^(.+?)\s*biome\s*(started|ended)\s*$",
+    re.IGNORECASE | re.MULTILINE)
+
+# '바이옴' 이라고 적혀 있는가 — **계측 대상을 가르는 기준**입니다.
+# 매크로 시작·정지나 NPC 등장까지 '못 읽음' 으로 세면 경고가 늘 켜져
+# 있게 됩니다. 실측으로 보호본의 25%가 그런 것이었습니다.
+BIOME_WORD_RE = re.compile(r"biome", re.IGNORECASE)
+
+# 이름 앞뒤의 이모지·기호를 떼어냅니다 (`🌀 WINDY` → `WINDY`).
+# 떼지 않으면 같은 바이옴이 이모지 유무로 **두 칸으로 갈라져** 집계됩니다.
+BIOME_TRIM_RE = re.compile(r"^[^0-9A-Za-z가-힣]+|[^0-9A-Za-z가-힣]+$")
+
+
+def _biome_from_text(raw: str):
+    """한 덩이의 글에서 (종류, 이름) 을 뽑습니다. 못 찾으면 None."""
+    m = BIOME_TITLE_RE.search(raw)
+    if m:
+        return m.group(1), m.group(2)
+    m = BIOME_TITLE_TAIL_RE.search(raw)
+    if m:
+        return m.group(2), m.group(1)
+    return None
 
 
 def detect_biome_name(message) -> str | None:
-    """임베드 **제목**에서 바이옴 이름을 뽑습니다. 시작 알림만 셉니다.
+    """임베드에서 바이옴 이름을 뽑습니다. **시작 알림만** 셉니다.
 
-    ⚠️ 제목만 봅니다. 본문·작성자·바닥글까지 훑으면 매크로 이름이나 채팅에
-    든 글자가 바이옴으로 잡힙니다(알림 판정에서 이미 겪은 문제입니다).
+    보는 곳은 **제목과 본문뿐**입니다. 작성자·바닥글을 섞으면 매크로
+    이름이 바이옴으로 잡힙니다(알림 판정에서 이미 겪은 문제입니다).
     형식이 맞지 않으면 **`None` 을 돌려주고 아무것도 기록하지 않습니다** —
     이름을 모르는 채로 '?' 를 쌓으면 통계가 쓰레기가 됩니다.
+    (대신 못 읽은 것은 `unparsed_biome_title()` 로 **드러냅니다.**)
+
+    **제목만 보면 안 됩니다.** Coteab v2.2.0 과 maxstellar v2.3 은 제목에
+    시각(`[12:10:40]`, `<t:…:F>`)을 넣고 본문에 `> ## Biome Started - SNOWY`
+    를 씁니다. 제목만 보던 동안 이 두 매크로의 바이옴은 **한 건도 세어지지
+    않았습니다.** 그래서 제목에서 못 찾으면 본문까지 내려갑니다.
+
+    **바이옴 이름은 어디에도 박아 두지 않습니다.** 이 게임은 이벤트마다
+    바이옴을 1~3종 넣었다 빼므로, 목록을 코드에 적으면 이벤트가 열릴
+    때마다 사람이 손봐야 합니다. 형식만 알면 이름은 뭐든 읽습니다.
     """
     for embed in getattr(message, "embeds", None) or []:
         try:
-            title = (embed.to_dict() or {}).get("title") or ""
+            data = embed.to_dict() or {}
         except Exception:
             continue
-        m = BIOME_TITLE_RE.search(str(title))
-        if not m:
+        # 제목이 먼저입니다 — 본문에는 다른 문장이 섞일 수 있습니다.
+        for key in ("title", "description"):
+            hit = _biome_from_text(str(data.get(key) or ""))
+            if not hit:
+                continue
+            kind, name = hit
+            if kind.lower() != "started":
+                return None        # 종료 알림은 '등장' 이 아닙니다
+            name = BIOME_TRIM_RE.sub("", name.strip(" -:_").strip())
+            return name[:60] or None
+    return None
+
+
+# 표본 제목은 **프로세스마다 몇 개만** 올려 보냅니다. 개수는 어차피 DB 에서
+# 따로 세므로, 같은 제목을 매번 올려 쓰기를 늘릴 이유가 없습니다.
+# (지우고 다시 채우지 않습니다 — 지우면 같은 제목이 계속 다시 올라가
+#  배열이 끝없이 자랍니다.)
+UNPARSED_SAMPLE_CAP = 12
+_unparsed_seen: dict[int, set[str]] = {}
+
+
+def _take_unparsed_sample(guild_id: int, title: str) -> bool:
+    seen = _unparsed_seen.setdefault(guild_id, set())
+    if title in seen or len(seen) >= UNPARSED_SAMPLE_CAP:
+        return False
+    seen.add(title)
+    return True
+
+
+def unparsed_biome_title(message) -> str | None:
+    """**바이옴 알림인데** 이름을 못 읽은 것만 돌려줍니다 (계측용).
+
+    매크로가 판올림하며 형식을 바꾸면 그 매크로의 바이옴이 통계에서 통째로
+    빠지는데, 세어 두지 않으면 **비어 있다는 사실조차 아무도 모릅니다.**
+
+    ⚠️ **'바이옴' 이라고 적힌 것만 셉니다.** 매크로 시작·정지(`MultiScope
+    Started`)나 NPC 등장(`MARI HAS ARRIVED!`)까지 세면 이 경고가 늘 켜져
+    있게 되고, **늘 켜진 경고는 없는 것보다 나쁩니다** — 익숙해져서 진짜
+    신호를 놓칩니다. 실측으로 보호본의 25%가 그런 것이었습니다.
+    """
+    for embed in getattr(message, "embeds", None) or []:
+        try:
+            data = embed.to_dict() or {}
+        except Exception:
             continue
-        if m.group(1).lower() != "started":
-            return None            # 종료 알림은 '등장' 이 아닙니다
-        name = m.group(2).strip(" -:_").strip()
-        return name[:60] or None
+        title = str(data.get("title") or "").strip()
+        body = str(data.get("description") or "")
+        if not BIOME_WORD_RE.search(title + " " + body):
+            continue
+        # ⚠️ 읽힌 것은 경고하지 않습니다. **종료 알림은 읽고 나서
+        # 일부러 안 세는 것**이지 못 읽은 것이 아닙니다. 이걸 섮으면
+        # 바이옴이 떠고 끝날 때마다 경고가 올라 늘 켜져 있게 됩니다.
+        if any(_biome_from_text(str(data.get(k) or ""))
+               for k in ("title", "description")):
+            continue
+        # 제목이 비었으면 본문 첫 줄을 보여 줍니다 — 어떤 형식인지
+        # 알아볼 수 있어야 인식 범위를 넓힐 수 있습니다.
+        head = title or next((x.strip() for x in body.splitlines() if x.strip()), "")
+        return head[:80] or None
     return None
 
 
@@ -3014,7 +3107,8 @@ def _biome_lines(agg: dict, rare: list[str], names: list[str]) -> list[str]:
 
 
 def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
-                            settings: dict, days: int) -> discord.Embed:
+                            settings: dict, days: int,
+                            unparsed: dict | None = None) -> discord.Embed:
     label = next((n for n, d in BIOME_PERIODS if d == days), f"{days}일")
     rare = rare_biome_names(settings)
     agg = summarize_biomes(buckets, days)
@@ -3086,6 +3180,20 @@ def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
     else:
         embed.set_footer(text="알림 규칙이 없어 희귀 바이옴 구분이 없습니다.")
 
+    # **못 읽은 제목이 있으면 반드시 말합니다.** 이 칸이 비어 있어야만
+    # 위의 숫자를 믿을 수 있습니다 — 안 보이면 "0회" 와 "못 셌음" 을
+    # 구분할 방법이 없습니다.
+    if unparsed and unparsed.get("count"):
+        samples = unparsed.get("titles") or []
+        embed.add_field(
+            name="❓ 이름을 못 읽은 임베드",
+            value=(f"**{unparsed['count']:,}건**의 보호 임베드에서 바이옴 이름을 "
+                   "읽지 못했습니다. 그만큼은 위 숫자에 **빠져 있습니다.**\n"
+                   + ("".join(f"-# `{t}`\n" for t in samples[:5]) if samples else "")
+                   + "-# 매크로가 판올림하며 제목 형식을 바꿨을 수 있습니다. "
+                     "이 제목들을 알려 주시면 인식 범위를 넓히겠습니다."),
+            inline=False)
+
     # 조용히 빼면 왜 사라졌는지 알 수 없습니다. 숫자로 알립니다.
     if dropped:
         embed.add_field(
@@ -3119,9 +3227,10 @@ class BiomeStatsButton(discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         buckets = await get_biome_buckets(interaction.guild.id, 90)
         settings = await get_linkguard_settings(interaction.guild.id)
+        unparsed = await get_biome_unparsed(interaction.guild.id, self._days)
         await interaction.followup.send(
             embed=build_biome_stats_embed(interaction.guild, buckets,
-                                          settings, self._days),
+                                          settings, self._days, unparsed),
             view=BiomeStatsView(self._days), ephemeral=True)
 
 
@@ -3610,6 +3719,21 @@ class LinkGuard(commands.Cog):
                 schedule_board_refresh(guild, settings)
             except Exception as e:
                 print(f"[LinkGuard] 바이옴 기록 실패: {type(e).__name__}: {e}", flush=True)
+        else:
+            # **못 읽은 제목을 그냥 버리지 않습니다.** 여기까지 왔다는 것은
+            # 개인서버 링크가 든 매크로 알림이라는 뜻인데 이름을 못 뽑았다면,
+            # 그 매크로가 올리는 바이옴은 그때부터 통계에서 통째로 빠집니다.
+            # 세어 두지 않으면 **비어 있다는 사실조차 아무도 모릅니다**
+            # (MultiScope v0.9.8 이 제목 배치를 바꿔 실제로 그랬습니다).
+            unknown = unparsed_biome_title(message)
+            if unknown:
+                try:
+                    await record_biome_unparsed(
+                        guild.id,
+                        unknown if _take_unparsed_sample(guild.id, unknown) else "")
+                except Exception as e:
+                    print(f"[LinkGuard] 미인식 제목 기록 실패: "
+                          f"{type(e).__name__}: {e}", flush=True)
 
         # 7. 유출 감시 색인에 등록 (이 링크가 서버 어딘가에 다시 뜨면 잡아냅니다)
         await register_guarded_keys(guild.id, [k for k in (link_key(u) for u in all_links) if k])
@@ -3900,8 +4024,10 @@ class LinkGuard(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         buckets = await get_biome_buckets(interaction.guild.id, 90)
         settings = await get_linkguard_settings(interaction.guild.id)
+        unparsed = await get_biome_unparsed(interaction.guild.id, 1)
         await interaction.followup.send(
-            embed=build_biome_stats_embed(interaction.guild, buckets, settings, 1),
+            embed=build_biome_stats_embed(interaction.guild, buckets, settings, 1,
+                                          unparsed),
             view=BiomeStatsView(1), ephemeral=True)
 
     @app_commands.command(name="링크보호설정", description="[관리자 전용] 웹훅 임베드의 링크를 인증 유저 전용으로 보호합니다.")

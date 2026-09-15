@@ -25,7 +25,6 @@ _gacha_lock = asyncio.Lock()
 _logs_lock = asyncio.Lock()
 _blacklist_lock = asyncio.Lock()
 _boost_lock = asyncio.Lock()
-_lotto_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
 # 퀘스트 진행도는 유저×날짜라 계속 늘어납니다. **양쪽 경로 모두에** 상한을
@@ -33,17 +32,6 @@ KST = timezone(timedelta(hours=9))
 # ⚠️ 이 상수는 아래 인덱스 생성보다 **먼저** 정의돼야 합니다. 뒤에 두면
 #    NameError 가 try/except 에 삼켜져 TTL 이 조용히 안 걸립니다.
 QUEST_PROGRESS_TTL_DAYS = 21
-
-# 복권 상수. ⚠️ **인덱스 생성보다 먼저** 있어야 합니다 — 아래에 두면
-# create_index 가 NameError 를 내고, 그게 try/except 에 삼켜져 TTL 이
-# 조용히 안 걸립니다 (위 퀘스트 상수와 같은 이유입니다).
-LOTTO_PICK = 5             # 고르는 개수
-LOTTO_MAX_NUMBER = 25      # 번호 범위 (1 ~ 이 값)
-LOTTO_MAX_TICKETS = 5      # 한 사람이 한 회차에 살 수 있는 표
-LOTTO_DRAW_WEEKDAY = 5     # 토요일 (월=0)
-LOTTO_DRAW_HOUR = 20       # 20:00 KST
-LOTTO_DRAW_TTL_DAYS = 180  # 지난 회차 보관 기간
-
 
 # pymongo 의 ReturnDocument.AFTER. `if MONGO_URI:` 블록 안에서만 정의하면
 # 폴백 모드에서 NameError 가 납니다. 항상 존재하도록 미리 둡니다.
@@ -81,9 +69,6 @@ quest_set_col = None
 quest_prog_col = None
 quest_state_col = None
 event_col = None
-lotto_set_col = None
-lotto_ticket_col = None
-lotto_draw_col = None
 
 if MONGO_URI:
     try:
@@ -106,9 +91,6 @@ if MONGO_URI:
         quest_prog_col = mongo_db["quest_progress"]
         quest_state_col = mongo_db["quest_state"]
         event_col = mongo_db["quest_events"]
-        lotto_set_col = mongo_db["lotto_settings"]
-        lotto_ticket_col = mongo_db["lotto_tickets"]
-        lotto_draw_col = mongo_db["lotto_draws"]
         from pymongo import ReturnDocument as _ReturnDocument, UpdateOne as _UpdateOne
         _AFTER = _ReturnDocument.AFTER
 
@@ -127,15 +109,6 @@ if MONGO_URI:
             # 서버가 지우도록 TTL 을 겁니다 (JSON 폴백에는 별도 trim 이 있습니다).
             quest_prog_col.create_index("created", name="quest_prog_ttl",
                                         expireAfterSeconds=QUEST_PROGRESS_TTL_DAYS * 86400)
-            # 회차별 참가자 조회(list_lotto_entrants)가 풀스캔하지 않도록.
-            lotto_ticket_col.create_index([("guild_id", 1), ("round", 1)],
-                                          name="lotto_by_round")
-            # 지난 회차는 스스로 사라집니다. `updated` 는 모든 쓰기 경로가
-            # 채웁니다 — 안 채우면 TTL 은 **영원히 일어나지 않습니다.**
-            lotto_ticket_col.create_index("updated", name="lotto_ticket_ttl",
-                                          expireAfterSeconds=LOTTO_DRAW_TTL_DAYS * 86400)
-            lotto_draw_col.create_index("updated", name="lotto_draw_ttl",
-                                        expireAfterSeconds=LOTTO_DRAW_TTL_DAYS * 86400)
             quest_state_col.create_index("created", name="quest_state_ttl",
                                          expireAfterSeconds=QUEST_PROGRESS_TTL_DAYS * 86400)
         except Exception as e:
@@ -171,9 +144,6 @@ if MONGO_URI:
         quest_prog_col = None
         quest_state_col = None
         event_col = None
-        lotto_set_col = None
-        lotto_ticket_col = None
-        lotto_draw_col = None
 
 async def _db(fn, *args, **kwargs):
     """동기 드라이버(pymongo) 호출을 워커 스레드에서 실행합니다.
@@ -3076,326 +3046,3 @@ def event_status(ev: dict, progress: dict) -> dict:
             "reward_claimed": f"e:{eid}:all" in claimed,
             "points": int(reward.get("points", 0) or 0),
             "role_id": reward.get("role_id")}
-
-
-# ── 복권 (1~25 중 5개) ──────────────────────────────────────────────
-#
-# **사행행위가 되지 않게 하는 선은 설계에 있습니다.** 포인트는 살 수 없고,
-# 상금도 포인트뿐이며, **참가비를 모아 당첨자에게 몰아주지 않습니다**
-# (그 구조가 사행행위규제법 제2조의 정의 그대로입니다). 참가비는 소각되고
-# 상금은 서버가 고정액으로 지급합니다. 이 세 가지를 바꾸지 마세요.
-#
-# 회차는 **토요일 20:00(KST)** 하나로 식별합니다. 그 시각 전에 산 표는
-# 그 회차, 이후에 산 표는 다음 주 회차입니다.
-
-def _read_json(path: str) -> dict:
-    """작은 JSON 파일을 읽습니다 (없거나 깨졌으면 빈 dict)."""
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
-
-
-def _write_json(path: str, payload: dict) -> None:
-    """쓰다 죽어도 원본이 남도록 **임시 파일에 쓴 뒤 교체**합니다."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-    os.replace(tmp, path)
-
-
-LOTTO_SET_FILE = os.path.join(DATA_DIR, "lotto_settings.json")
-LOTTO_TICKET_FILE = os.path.join(DATA_DIR, "lotto_tickets.json")
-LOTTO_DRAW_FILE = os.path.join(DATA_DIR, "lotto_draws.json")
-
-DEFAULT_LOTTO_SETTINGS = {
-    "enabled": False,
-    "price": 500,
-    # 등수 = 맞춘 개수. 1등 5개 … 5등 1개.
-    # 기본값은 **환수율 75%** 가 되도록 잡았습니다(실제 로또는 50%).
-    "prize_1": 1000000,
-    "prize_2": 50000,
-    "prize_3": 3000,
-    "prize_4": 500,
-    "prize_5": 100,
-    "announce_channel_id": None,
-}
-
-
-def lotto_round_key(now=None) -> str:
-    """이 시점에 산 표가 속하는 회차(다음 추첨 시각)를 돌려줍니다.
-
-    **경계가 중요합니다.** 토요일 20:00 **정각부터**는 이미 그 회차의
-    추첨이 시작되므로 다음 주 회차로 넘깁니다 — 안 그러면 당첨 번호가
-    공개된 뒤에 표를 살 수 있습니다.
-    """
-    return lotto_draw_at(now).strftime("%Y-%m-%d")
-
-
-def lotto_draw_at(now=None) -> datetime:
-    """이 시점 기준 **다음 추첨 시각**(토요일 20:00 KST)."""
-    now = (now or datetime.now(KST)).astimezone(KST)
-    ahead = (LOTTO_DRAW_WEEKDAY - now.weekday()) % 7
-    draw = (now + timedelta(days=ahead)).replace(
-        hour=LOTTO_DRAW_HOUR, minute=0, second=0, microsecond=0)
-    if draw <= now:
-        draw += timedelta(days=7)
-    return draw
-
-
-def lotto_prev_round_key(now=None) -> str:
-    """직전(가장 최근에 끝난) 회차."""
-    return (lotto_draw_at(now) - timedelta(days=7)).strftime("%Y-%m-%d")
-
-
-def lotto_payout(settings: dict, matched: int) -> int:
-    """맞춘 개수에 대한 상금. 0개는 꽝입니다."""
-    if matched < 1 or matched > LOTTO_PICK:
-        return 0
-    rank = LOTTO_PICK - matched + 1          # 5개 맞춤 = 1등
-    return max(0, int(settings.get(f"prize_{rank}", 0) or 0))
-
-
-def lotto_odds() -> dict:
-    """맞춘 개수별 경우의 수. 환수율을 계산해 보여주기 위한 것입니다."""
-    from math import comb
-    total = comb(LOTTO_MAX_NUMBER, LOTTO_PICK)
-    rest = LOTTO_MAX_NUMBER - LOTTO_PICK
-    return {m: comb(LOTTO_PICK, m) * comb(rest, LOTTO_PICK - m)
-            for m in range(LOTTO_PICK + 1)} | {"total": total}
-
-
-def lotto_return_rate(settings: dict) -> float:
-    """기대 환수율. **100%를 넘으면 포인트가 무한히 불어납니다.**
-
-    운영진이 5개 상금을 손으로 정하는데, 1개만 맞아도 5등이라
-    표의 45.6%가 당첨입니다. 숫자 감이 안 오는 자리라 화면에 띄웁니다.
-    """
-    odds = lotto_odds()
-    price = max(1, int(settings.get("price", 0) or 0))
-    ev = sum(odds[m] * lotto_payout(settings, m) for m in range(1, LOTTO_PICK + 1))
-    return ev / odds["total"] / price
-
-
-async def get_lotto_settings(guild_id: int) -> dict:
-    res = dict(DEFAULT_LOTTO_SETTINGS)
-    if lotto_set_col is not None:
-        try:
-            doc = await _db(lotto_set_col.find_one, {"_id": str(guild_id)})
-            if doc:
-                res.update({k: v for k, v in doc.items() if k != "_id"})
-            return res
-        except Exception as e:
-            print(f"MongoDB get_lotto_settings error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_SET_FILE)
-    res.update(rows.get(str(guild_id)) or {})
-    return res
-
-
-async def save_lotto_settings(guild_id: int, settings: dict) -> None:
-    """**바뀐 키만 넘기세요.** 통째로 넘기면 다른 설정을 덮어씁니다."""
-    if lotto_set_col is not None:
-        try:
-            await _db(lotto_set_col.update_one, {"_id": str(guild_id)},
-                      {"$set": settings}, upsert=True)
-            return
-        except Exception as e:
-            print(f"MongoDB save_lotto_settings error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_SET_FILE)
-        cur = rows.get(str(guild_id)) or {}
-        cur.update(settings)
-        rows[str(guild_id)] = cur
-        _write_json(LOTTO_SET_FILE, rows)
-
-
-def _lotto_ticket_id(guild_id: int, rnd: str, user_id: int) -> str:
-    return f"{guild_id}:{rnd}:{user_id}"
-
-
-async def get_lotto_tickets(guild_id: int, user_id: int, rnd: str) -> dict:
-    key = _lotto_ticket_id(guild_id, rnd, user_id)
-    blank = {"_id": key, "count": 0, "tickets": [], "paid": False}
-    if lotto_ticket_col is not None:
-        try:
-            return await _db(lotto_ticket_col.find_one, {"_id": key}) or blank
-        except Exception as e:
-            print(f"MongoDB get_lotto_tickets error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_TICKET_FILE)
-    return rows.get(key) or blank
-
-
-async def reserve_lotto_ticket(guild_id: int, user_id: int, rnd: str,
-                               numbers: list[int]) -> dict | None:
-    """표 한 장을 **자리부터 잡습니다.** 한도를 넘으면 None.
-
-    ⚠️ 포인트보다 자리를 먼저 잡습니다. 반대로 하면 한도 초과로 되돌릴 때
-    이미 빠진 포인트를 다시 넣어야 하는데, 그 사이에 봇이 죽으면 **유저가
-    돈만 잃습니다.** 이 순서면 최악이라도 공짜 표 한 장이 남을 뿐입니다.
-    """
-    key = _lotto_ticket_id(guild_id, rnd, user_id)
-    now = datetime.now(timezone.utc)
-    ticket = {"id": f"{int(now.timestamp() * 1000)}:{user_id}",
-              "numbers": sorted(int(n) for n in numbers),
-              "at": now}
-
-    if lotto_ticket_col is not None:
-        try:
-            # 문서를 먼저 있게 만들고(멱등), 그다음 **조건부**로 늘립니다.
-            # upsert 로 한 번에 하면 한도 초과 시 중복 키가 나서, 진짜 장애와
-            # 구분하기 어려워집니다.
-            await _db(lotto_ticket_col.update_one, {"_id": key},
-                      {"$setOnInsert": {"guild_id": str(guild_id),
-                                        "user_id": str(user_id), "round": rnd,
-                                        "count": 0, "tickets": [], "paid": False,
-                                        "created": now, "updated": now}},
-                      upsert=True)
-            doc = await _db(lotto_ticket_col.find_one_and_update,
-                            {"_id": key, "count": {"$lt": LOTTO_MAX_TICKETS}},
-                            {"$inc": {"count": 1}, "$push": {"tickets": ticket},
-                             "$set": {"updated": now}},
-                            return_document=_AFTER)
-            return {"ticket": ticket, "count": doc["count"]} if doc else None
-        except Exception as e:
-            print(f"MongoDB reserve_lotto_ticket error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_TICKET_FILE)
-        row = rows.get(key) or {"guild_id": str(guild_id), "user_id": str(user_id),
-                                "round": rnd, "count": 0, "tickets": [],
-                                "paid": False, "created": now.isoformat()}
-        if int(row.get("count", 0)) >= LOTTO_MAX_TICKETS:
-            return None
-        t = dict(ticket, at=now.isoformat())
-        row["count"] = int(row.get("count", 0)) + 1
-        row.setdefault("tickets", []).append(t)
-        row["updated"] = now.isoformat()
-        rows[key] = row
-        _write_json(LOTTO_TICKET_FILE, rows)
-        return {"ticket": t, "count": row["count"]}
-
-
-async def release_lotto_ticket(guild_id: int, user_id: int, rnd: str,
-                               ticket_id: str) -> None:
-    """포인트 차감이 실패했을 때 잡아 둔 자리를 되돌립니다."""
-    key = _lotto_ticket_id(guild_id, rnd, user_id)
-    if lotto_ticket_col is not None:
-        try:
-            await _db(lotto_ticket_col.update_one, {"_id": key},
-                      {"$inc": {"count": -1},
-                       "$pull": {"tickets": {"id": ticket_id}}})
-            return
-        except Exception as e:
-            print(f"MongoDB release_lotto_ticket error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_TICKET_FILE)
-        row = rows.get(key)
-        if not row:
-            return
-        row["tickets"] = [t for t in row.get("tickets", []) if t.get("id") != ticket_id]
-        row["count"] = max(0, int(row.get("count", 0)) - 1)
-        rows[key] = row
-        _write_json(LOTTO_TICKET_FILE, rows)
-
-
-async def get_lotto_draw(guild_id: int, rnd: str) -> dict | None:
-    key = f"{guild_id}:{rnd}"
-    if lotto_draw_col is not None:
-        try:
-            return await _db(lotto_draw_col.find_one, {"_id": key})
-        except Exception as e:
-            print(f"MongoDB get_lotto_draw error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_DRAW_FILE)
-    return rows.get(key)
-
-
-async def record_lotto_draw(guild_id: int, rnd: str, numbers: list[int]) -> dict:
-    """회차의 당첨 번호를 **한 번만** 확정합니다.
-
-    `$setOnInsert` 라 이미 있으면 그대로 둡니다. 재시작이나 루프 중복
-    실행으로 번호가 **다시 뽑히면 이미 발표된 결과가 바뀝니다** — 그건
-    되돌릴 수 없는 사고입니다. 그래서 쓰고 나서 **읽어 온 값**을 씁니다.
-    """
-    key = f"{guild_id}:{rnd}"
-    now = datetime.now(timezone.utc)
-    doc = {"guild_id": str(guild_id), "round": rnd,
-           "numbers": sorted(int(n) for n in numbers),
-           "drawn_at": now, "updated": now}
-
-    if lotto_draw_col is not None:
-        try:
-            await _db(lotto_draw_col.update_one, {"_id": key},
-                      {"$setOnInsert": doc}, upsert=True)
-            return await _db(lotto_draw_col.find_one, {"_id": key}) or doc
-        except Exception as e:
-            print(f"MongoDB record_lotto_draw error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_DRAW_FILE)
-        if key not in rows:
-            rows[key] = dict(doc, drawn_at=now.isoformat(), updated=now.isoformat())
-            _write_json(LOTTO_DRAW_FILE, rows)
-        return rows[key]
-
-
-async def list_lotto_entrants(guild_id: int, rnd: str) -> list[dict]:
-    """그 회차에 표를 산 사람들의 문서."""
-    if lotto_ticket_col is not None:
-        try:
-            def _fetch():
-                return list(lotto_ticket_col.find(
-                    {"guild_id": str(guild_id), "round": rnd}).limit(20000))
-            return await _db(_fetch)
-        except Exception as e:
-            print(f"MongoDB list_lotto_entrants error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_TICKET_FILE)
-    return [r for r in rows.values()
-            if str(r.get("guild_id")) == str(guild_id) and r.get("round") == rnd]
-
-
-async def claim_lotto_payout(guild_id: int, user_id: int, rnd: str,
-                             results: list[dict], total: int) -> bool:
-    """정산을 **이 호출이 맡았는지** 알려줍니다 (이미 됐으면 False).
-
-    `paid` 를 필터에 넣어 서버 측에서 판정하므로, 루프가 두 번 돌아도
-    상금이 두 번 나가지 않습니다. 포인트 지급은 **True 를 받은 쪽만** 합니다.
-    """
-    key = _lotto_ticket_id(guild_id, rnd, user_id)
-    now = datetime.now(timezone.utc)
-    if lotto_ticket_col is not None:
-        try:
-            doc = await _db(lotto_ticket_col.find_one_and_update,
-                            {"_id": key, "paid": {"$ne": True}},
-                            {"$set": {"paid": True, "results": results,
-                                      "won": int(total), "paid_at": now,
-                                      "updated": now}},
-                            return_document=_AFTER)
-            return doc is not None
-        except Exception as e:
-            print(f"MongoDB claim_lotto_payout error: {e}, using local file.", flush=True)
-
-    async with _lotto_lock:
-        rows = _read_json(LOTTO_TICKET_FILE)
-        row = rows.get(key)
-        if not row or row.get("paid"):
-            return False
-        row.update({"paid": True, "results": results, "won": int(total),
-                    "paid_at": now.isoformat(), "updated": now.isoformat()})
-        rows[key] = row
-        _write_json(LOTTO_TICKET_FILE, rows)
-        return True

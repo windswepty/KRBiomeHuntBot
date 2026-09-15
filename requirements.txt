@@ -3,3 +3,4 @@ python-dotenv>=1.0.0
 Flask>=3.0.0
 pymongo>=4.0.0
 dnspython>=2.0.0
+itsdangerous>=2.0.0

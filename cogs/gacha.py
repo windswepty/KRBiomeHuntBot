@@ -5,6 +5,7 @@ from discord.ext import commands
 from discord import app_commands
 from utils.database import (
     get_gacha_settings, save_gacha_settings,
+    add_gacha_item, remove_gacha_item, set_gacha_item_stock,
     get_user_points, deduct_user_points, add_user_points, add_activity_log,
     bump_quest_progress, bump_event_progress,
     consume_gacha_stock
@@ -387,8 +388,9 @@ class SetGachaTitleModal(discord.ui.Modal, title="🏷️ 뽑기 이름/제목 �
                 return
 
             settings = await get_gacha_settings(interaction.guild.id)
-            settings["title"] = new_title
-            await save_gacha_settings(interaction.guild.id, settings)
+            # 바뀐 키만 저장합니다. settings 전체를 넘기면 items 가 덮여
+            # 진행 중인 뽑기가 깎은 재고가 되살아납니다.
+            await save_gacha_settings(interaction.guild.id, {"title": new_title})
 
             embed = discord.Embed(
                 title="🏷️ 뽑기 이름 변경 완료",
@@ -413,8 +415,7 @@ class SetGachaDescriptionModal(discord.ui.Modal, title="📝 뽑기 설명/안�
         try:
             new_desc = self.desc_input.value.strip()
             settings = await get_gacha_settings(interaction.guild.id)
-            settings["description"] = new_desc
-            await save_gacha_settings(interaction.guild.id, settings)
+            await save_gacha_settings(interaction.guild.id, {"description": new_desc})
 
             desc_preview = f"**{new_desc}**" if new_desc else "*설정 안 함 (삭제됨)*"
             embed = discord.Embed(
@@ -447,8 +448,7 @@ class SetGachaPriceModal(discord.ui.Modal, title="💰 1회 뽑기 가격 설정
             return
 
         settings = await get_gacha_settings(interaction.guild.id)
-        settings["price"] = price
-        await save_gacha_settings(interaction.guild.id, settings)
+        await save_gacha_settings(interaction.guild.id, {"price": price})
 
         embed = discord.Embed(
             title="💰 뽑기 가격 변경 완료",
@@ -494,8 +494,8 @@ class SetGachaBulkPriceModal(discord.ui.Modal, title="🎰 10회 뽑기 가격 �
             notice = ""
             color = discord.Color.green()
 
-        settings["price_10"] = price
-        await save_gacha_settings(interaction.guild.id, settings)
+        settings["price_10"] = price          # 아래 안내 문구 계산용 (저장은 부분)
+        await save_gacha_settings(interaction.guild.id, {"price_10": price})
 
         effective = bulk_price(settings)
         saving = bulk_discount(settings)
@@ -573,9 +573,8 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
             "reward_points": reward_pts,
             "description": ""
         }
-        items.append(new_item)
-        settings["items"] = items
-        await save_gacha_settings(interaction.guild.id, settings)
+        await add_gacha_item(interaction.guild.id, new_item)
+        items.append(new_item)                # 아래 확률 합계 계산용
 
         current_total = get_total_percent(items)
         status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다! (뽑기 플레이 가능)" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{current_total:.2f}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
@@ -616,8 +615,7 @@ class DeleteGachaItemSelect(discord.ui.Select):
         deleted_item = next((item for item in items if item.get("id") == target_id), None)
         new_items = [item for item in items if item.get("id") != target_id]
 
-        settings["items"] = new_items
-        await save_gacha_settings(interaction.guild.id, settings)
+        await remove_gacha_item(interaction.guild.id, target_id)
 
         item_name = deleted_item["name"] if deleted_item else "선택 항목"
         current_total = get_total_percent(new_items)
@@ -676,8 +674,10 @@ class SetGachaItemStockModal(discord.ui.Modal, title="📦 뽑기 항목 재고 
             await interaction.response.send_message("⚠️ 대상 항목을 찾을 수 없습니다.", ephemeral=True)
             return
 
-        settings["items"] = items
-        await save_gacha_settings(interaction.guild.id, settings)
+        if not await set_gacha_item_stock(interaction.guild.id, self.item_id, new_stock):
+            await interaction.response.send_message(
+                "⚠️ 대상 항목을 찾을 수 없습니다.", ephemeral=True)
+            return
 
         stock_str = format_stock_str(new_stock)
         embed = discord.Embed(

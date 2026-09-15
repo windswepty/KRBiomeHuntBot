@@ -864,7 +864,77 @@ async def get_gacha_settings(guild_id: int) -> dict:
             pass
     return dict(DEFAULT_GACHA_SETTINGS)
 
+async def set_gacha_item_stock(guild_id: int, item_id, stock: int) -> bool:
+    """항목 하나의 재고만 **원자적으로** 씁니다.
+
+    ⚠️ 설정 전체를 `$set` 하면 items 배열이 통째로 덮여, 그 사이 뽑기가
+    `consume_gacha_stock()` 으로 깎아 둔 **다른 항목의 재고까지 되살아납니다.**
+    관리자는 보통 재고가 떨어질 때 충전하는데, 그때가 바로 사람들이 뽑고
+    있는 순간입니다.
+    """
+    str_gid = str(guild_id)
+    if gacha_col is not None:
+        try:
+            res = await _db(gacha_col.update_one,
+                            {"_id": str_gid, "items": {"$elemMatch": {"id": item_id}}},
+                            {"$set": {"items.$.stock": int(stock)}})
+            return res.matched_count > 0
+        except Exception as e:
+            print(f"MongoDB set_gacha_item_stock error: {e}, using local file.", flush=True)
+
+    async with _gacha_lock:
+        all_gacha = _read_json(GACHA_FILE)
+        items = (all_gacha.get(str_gid) or {}).get("items") or []
+        for item in items:
+            if item.get("id") == item_id:
+                item["stock"] = int(stock)
+                all_gacha.setdefault(str_gid, {})["items"] = items
+                _write_json(GACHA_FILE, all_gacha)
+                return True
+    return False
+
+
+async def add_gacha_item(guild_id: int, item: dict) -> None:
+    """항목 하나를 **덧붙입니다** (배열 전체를 다시 쓰지 않습니다)."""
+    str_gid = str(guild_id)
+    if gacha_col is not None:
+        try:
+            await _db(gacha_col.update_one, {"_id": str_gid},
+                      {"$push": {"items": item}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB add_gacha_item error: {e}, using local file.", flush=True)
+
+    async with _gacha_lock:
+        all_gacha = _read_json(GACHA_FILE)
+        all_gacha.setdefault(str_gid, {}).setdefault("items", []).append(item)
+        _write_json(GACHA_FILE, all_gacha)
+
+
+async def remove_gacha_item(guild_id: int, item_id) -> None:
+    """항목 하나만 **빼냅니다** (배열 전체를 다시 쓰지 않습니다)."""
+    str_gid = str(guild_id)
+    if gacha_col is not None:
+        try:
+            await _db(gacha_col.update_one, {"_id": str_gid},
+                      {"$pull": {"items": {"id": item_id}}})
+            return
+        except Exception as e:
+            print(f"MongoDB remove_gacha_item error: {e}, using local file.", flush=True)
+
+    async with _gacha_lock:
+        all_gacha = _read_json(GACHA_FILE)
+        items = (all_gacha.get(str_gid) or {}).get("items") or []
+        all_gacha.setdefault(str_gid, {})["items"] = [
+            i for i in items if i.get("id") != item_id]
+        _write_json(GACHA_FILE, all_gacha)
+
+
 async def save_gacha_settings(guild_id: int, settings: dict) -> None:
+    """⚠️ 넘긴 키만 `$set` 합니다. **items 를 넣지 마세요** — 배열이 통째로
+    덮여 진행 중인 뽑기가 깎은 재고가 되살아납니다. 항목 변경은
+    `add_gacha_item` / `remove_gacha_item` / `set_gacha_item_stock` 을 쓰세요.
+    """
     str_gid = str(guild_id)
 
     if gacha_col is not None:

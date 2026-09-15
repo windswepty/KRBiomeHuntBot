@@ -198,6 +198,30 @@ def _apply_update(doc, update, query, upserted):
                 else:
                     arr.append(v)
                 _set_path(doc, k, arr)
+        elif op == "$pull":
+            # 없으면 조용히 폴백으로 새서 Mongo 경로를 검증하지 못합니다.
+            for k, v in body.items():
+                cur, _ = _get(doc, k)
+                arr = list(cur or [])
+                if isinstance(v, dict):
+                    arr = [x for x in arr
+                           if not (isinstance(x, dict) and _match(x, v))]
+                else:
+                    arr = [x for x in arr if x != v]
+                _set_path(doc, k, arr)
+        elif op == "$addToSet":
+            # 없으면 조용히 폴백으로 새서 **Mongo 경로를 한 줄도 검증하지
+            # 못합니다.** 연산자 하나가 빠지면 테스트가 거짓 통과합니다.
+            for k, v in body.items():
+                cur, _ = _get(doc, k)
+                arr = list(cur or [])
+                vals = v["$each"] if isinstance(v, dict) and "$each" in v else [v]
+                if isinstance(v, dict) and set(v) - {"$each"}:
+                    raise UnknownOperator(f"$addToSet 하위 미구현: {set(v) - {'$each'}}")
+                for item in vals:
+                    if item not in arr:
+                        arr.append(item)
+                _set_path(doc, k, arr)
         elif op == "$unset":
             for k in body:
                 parts = k.split(".")

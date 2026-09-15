@@ -92,13 +92,21 @@ async def main():
         await asyncio.sleep(seconds)
         await drain()
 
-    async def seed(biome, code, when=None, notified=True):
-        await vdb.record_biome_event(GUILD.id, biome, f"ps:{code}",
-                                     guard_ch.id, 1, notified)
-        if when is not None:
-            key = vdb._biome_event_id(GUILD.id, biome, f"ps:{code}")
-            await vdb._db(vdb.biome_col.update_one, {"_id": key},
-                          {"$set": {"updated": when}})
+    async def seed(biome, code, when=None, notified=True, times=1):
+        """시작 임베드 `times` 번을 집계에 넣습니다."""
+        if when is None:
+            for _ in range(times):
+                await vdb.record_biome_event(GUILD.id, biome, f"ps:{code}",
+                                             guard_ch.id, 1, notified)
+            return
+        day = when.astimezone(vdb.KST).strftime("%Y-%m-%d")
+        key = vdb._biome_bucket_id(GUILD.id, biome, day)
+        await vdb._db(vdb.biome_col.update_one, {"_id": key},
+                      {"$set": {"guild_id": str(GUILD.id), "kind": "day",
+                                "biome": biome, "day": day, "updated": when},
+                       "$inc": {"count": times,
+                                "notified_count": times if notified else 0},
+                       "$addToSet": {"links": f"ps:{code}"}}, upsert=True)
 
     print("=== 1. 집계가 오늘 · 7일 · 30일로 갈려야 ===")
     await setup()
@@ -108,19 +116,24 @@ async def main():
     await seed("DREAMSPACE", "a3", now - datetime.timedelta(days=20))
     await seed("SNOWY", "b1")
 
-    rows = await vdb.get_biome_events(GUILD.id, 24 * 30)
-    agg = LG.summarize_biome_board(rows)
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    agg = LG.summarize_biomes(rows, 30)
     d = agg.get("DREAMSPACE", {})
-    note(d.get("month") == 3, "30일 3회", str(d.get("month")))
-    note(d.get("week") == 2, "7일 2회", str(d.get("week")))
+    note(d.get("count") == 3, "30일 3회", str(d.get("count")))
     note(d.get("today") == 1, "오늘 1회", str(d.get("today")))
+    note(d.get("total") == 3, "누적 3회", str(d.get("total")))
     note(agg.get("SNOWY", {}).get("today") == 1, "흔한 바이옴도 집계됨")
+
+    week = LG.summarize_biomes(rows, 7)
+    note(week.get("DREAMSPACE", {}).get("count") == 2, "7일 2회",
+         str(week.get("DREAMSPACE", {}).get("count")))
+    note(week.get("DREAMSPACE", {}).get("total") == 3,
+         "누적은 기간과 무관하게 전체", str(week.get("DREAMSPACE", {}).get("total")))
 
     print("")
     print("  '오늘' 은 KST 기준이어야 합니다")
-    # UTC 기준으로 자르면 한국 시간 오전 0~9시에 어제로 밀립니다.
-    note(LG._kst_today_start().tzinfo is not None, "KST 기준 시각을 씀")
-    note(LG._kst_today_start().hour == 0, "자정 기준")
+    note(LG._biome_today() == datetime.datetime.now(vdb.KST).strftime("%Y-%m-%d"),
+         "오늘 날짜를 KST 로 구함", LG._biome_today())
 
     print("")
     print("=== 2. 보드 임베드 ===")
@@ -131,7 +144,8 @@ async def main():
     for name in RARE:
         note(name in blob, f"{name} 이 항상 보임 (0회여도)")
     note("SNOWY" in blob, "그 밖의 바이옴 칸에 흔한 것이 보임")
-    note("오늘" in blob and "7일" in blob and "30일" in blob, "세 기간 전부 표시")
+    note("오늘" in blob and "30일" in blob and "누적" in blob,
+         "오늘 · 30일 · 누적 이 전부 표시됨")
 
     print("")
     print("  규칙에 GLITCH 로 적어 뒀어도 기록이 GLITCHED 면 세야 합니다")
@@ -141,12 +155,12 @@ async def main():
                                "biomes": ["GLITCH"], "mention": "everyone",
                                "role_ids": []}])
     await seed("GLITCHED", "g1")
-    rows = await vdb.get_biome_events(GUILD.id, 24 * 30)
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
     settings = await vdb.get_linkguard_settings(GUILD.id)
     embed = LG.build_biome_board_embed(GUILD, rows, settings)
     rare_field = next((f.value for f in embed.fields if "희귀" in (f.name or "")), "")
-    note("오늘 **1**" in rare_field, "GLITCH 칸이 GLITCHED 기록을 셈",
-         rare_field[:70])
+    note("GLITCHED" in rare_field and "오늘 **1**" in rare_field,
+         "GLITCH 규칙 칸에 GLITCHED 기록이 잡힘", rare_field[:80])
 
     print("")
     print("=== 3. 보드는 처음에 올리고 그 뒤로는 수정해야 ===")

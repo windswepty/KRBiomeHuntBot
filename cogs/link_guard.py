@@ -25,7 +25,7 @@ from utils.verify_db import (
     make_watermark_code, save_watermark, get_watermark,
     register_guarded_keys, get_guarded_keys,
     record_link_usage, get_link_usage, find_issued_to,
-    record_biome_event, get_biome_events,
+    record_biome_event, get_biome_buckets,
     save_log_reference, get_log_reference, get_log_reference_by_protected,
     get_roblox_names,
 )
@@ -2883,8 +2883,13 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
 
 
 # ── 바이옴 등장 통계 ─────────────────────────────────────────────────
+#
+# **세는 단위는 '바이옴 시작 임베드 하나' 입니다.** 종료 임베드는 세지 않고
+# (`detect_biome_name` 이 None 을 돌려줍니다), 같은 링크가 몇 번 올라오든
+# 올라온 만큼 셉니다 — 개인서버 링크는 매 임베드마다 바꿀 수 없어서, 링크로
+# 묶으면 같은 서버에서 나중에 다시 뜬 바이옴이 통째로 묻힙니다.
 
-BIOME_PERIODS = [("24시간", 24), ("7일", 24 * 7), ("30일", 24 * 30)]
+BIOME_PERIODS = [("오늘", 1), ("7일", 7), ("30일", 30)]
 
 
 def rare_biome_names(settings: dict) -> list[str]:
@@ -2898,93 +2903,178 @@ def rare_biome_names(settings: dict) -> list[str]:
     return names
 
 
-def build_biome_stats_embed(guild: discord.Guild, rows: list[dict],
-                            settings: dict, hours: int) -> discord.Embed:
-    label = next((n for n, h in BIOME_PERIODS if h == hours), f"{hours}시간")
+def summarize_biomes(buckets: list[dict], days: int) -> dict[str, dict]:
+    """날짜 버킷을 바이옴별로 접습니다.
+
+    `total` 은 보관 기간(90일) 전체의 종합 등장 횟수이고, `count` 는 고른
+    기간 안의 것입니다. 둘을 함께 보여줘야 "오늘은 조용한데 원래 흔한
+    바이옴인지" 를 알 수 있습니다.
+    """
+    today = _biome_today()
+    cutoff = _biome_day_str(days)
+
+    out: dict[str, dict] = {}
+    for b in buckets:
+        name = str(b.get("biome") or "?")
+        day = str(b.get("day") or "")
+        cur = out.setdefault(name, {"count": 0, "today": 0, "total": 0,
+                                    "notified": 0, "servers": set(), "last": ""})
+        n = int(b.get("count", 0) or 0)
+        cur["total"] += n
+        if day >= cutoff:
+            cur["count"] += n
+            cur["notified"] += int(b.get("notified_count", 0) or 0)
+            for lk in (b.get("links") or []):
+                cur["servers"].add(lk)
+        if day == today:
+            cur["today"] += n
+        if day > cur["last"]:
+            cur["last"] = day
+    return out
+
+
+def _biome_today() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def _biome_day_str(days_back: int) -> str:
+    return (datetime.now(KST) - timedelta(days=max(1, days_back) - 1)).strftime("%Y-%m-%d")
+
+
+def _chunk_field(embed: discord.Embed, name: str, lines: list[str]) -> None:
+    """한 칸에 안 들어가면 나눠 담습니다.
+
+    디스코드 임베드 필드는 1024자 한도입니다. 넘으면 **전송 자체가 실패**해
+    보드가 통째로 안 올라갑니다. 바이옴을 전부 보여주기로 한 이상 줄 수가
+    늘어날 수 있으므로 잘라내지 말고 나눠 담습니다.
+    """
+    if not lines:
+        embed.add_field(name=name, value="없음", inline=False)
+        return
+    buf, part = [], 0
+    for line in lines:
+        cand = "\n".join(buf + [line])
+        if len(cand) > 1024 and buf:
+            embed.add_field(name=name if part == 0 else f"{name} (이어서)",
+                            value="\n".join(buf), inline=False)
+            buf, part = [line], part + 1
+        else:
+            buf.append(line)
+    if buf:
+        embed.add_field(name=name if part == 0 else f"{name} (이어서)",
+                        value="\n".join(buf), inline=False)
+
+
+def _biome_lines(agg: dict, rare: list[str], names: list[str]) -> list[str]:
+    out = []
+    for name in names:
+        v = agg.get(name) or {"count": 0, "today": 0, "total": 0,
+                              "notified": 0, "servers": set(), "last": ""}
+        is_rare = biome_matches(rare, name) is not None
+        mark = "⭐" if is_rare else "•"
+        servers = len(v["servers"]) if isinstance(v["servers"], set) else 0
+        bell = ""
+        if is_rare:
+            bell = f" · 🔔{v['notified']}" if v["notified"] else " · 🔕"
+        srv = f" · 서버 {servers}곳" if servers else ""
+        out.append(f"{mark} **{name}** — {v['count']:,}회{srv}{bell}\n"
+                   f"　누적 {v['total']:,}회 · 마지막 {v['last'] or '-'}")
+    return out
+
+
+def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
+                            settings: dict, days: int) -> discord.Embed:
+    label = next((n for n, d in BIOME_PERIODS if d == days), f"{days}일")
     rare = rare_biome_names(settings)
+    agg = summarize_biomes(buckets, days)
 
-    # 같은 바이옴끼리 묶습니다. 한 건 = 고유 링크 하나이므로 **등장 횟수**이고,
-    # reposts 는 매크로가 같은 링크를 몇 번 다시 올렸는지입니다.
-    agg: dict[str, dict] = {}
-    for row in rows:
-        name = str(row.get("biome") or "?")
-        cur = agg.setdefault(name, {"seen": 0, "reposts": 0, "notified": 0,
-                                    "last": None})
-        cur["seen"] += 1
-        cur["reposts"] += int(row.get("reposts", 0) or 0)
-        if row.get("notified"):
-            cur["notified"] += 1
-        when = row.get("updated")
-        if when is not None and (cur["last"] is None or when > cur["last"]):
-            cur["last"] = when
-
-    total_seen = sum(v["seen"] for v in agg.values())
-    total_notified = sum(v["notified"] for v in agg.values())
-    rare_seen = sum(v["seen"] for k, v in agg.items()
-                    if biome_matches(rare, k) is not None)
-
-    embed = discord.Embed(
-        title=f"📊 바이옴 등장 통계 · 최근 {label}",
-        color=discord.Color.blurple()
-    )
+    embed = discord.Embed(title=f"📊 바이옴 등장 통계 · 최근 {label}",
+                          color=discord.Color.blurple())
 
     if not agg:
         embed.description = (
             "이 기간에 기록된 바이옴이 없습니다.\n\n"
-            "-# 기록은 **링크 보호가 동작한 시점부터** 쌓입니다. 기능을 방금 "
-            "넣었다면 아직 비어 있는 것이 정상입니다.\n"
+            "-# 기록은 **링크 보호가 동작한 시점부터** 쌓입니다.\n"
             "-# 매크로 임베드 제목이 `Biome Started - <이름>` 형식이 아니면 "
-            "이름을 알 수 없어 기록하지 않습니다."
-        )
+            "이름을 알 수 없어 세지 않습니다.")
         return embed
 
+    total_now = sum(v["count"] for v in agg.values())
+    total_all = sum(v["total"] for v in agg.values())
+    notified = sum(v["notified"] for v in agg.values())
+    rare_now = sum(v["count"] for k, v in agg.items() if biome_matches(rare, k))
+
     embed.description = (
-        f"🌍 **등장 {total_seen:,}회** (서로 다른 개인서버 기준)\n"
-        f"🔔 **알림 발송 {total_notified:,}회**"
-        + (f" · 희귀 바이옴 **{rare_seen:,}회**" if rare else "")
-        + "\n-# 매크로가 같은 링크를 여러 번 올려도 **1회로 셉니다.**"
-    )
+        f"🌍 **{total_now:,}회 등장** · 누적 **{total_all:,}회**\n"
+        f"🔔 알림 **{notified:,}회**"
+        + (f" · 희귀 바이옴 **{rare_now:,}회**" if rare else "")
+        + "\n-# **바이옴 시작 임베드 하나 = 1회.** 종료 임베드는 세지 않습니다.")
 
-    ordered = sorted(agg.items(), key=lambda kv: (-kv[1]["seen"], kv[0]))
-    lines = []
-    for name, v in ordered[:20]:
-        is_rare = biome_matches(rare, name) is not None
-        mark = "⭐" if is_rare else "•"
-        bell = f" 🔔{v['notified']}" if v["notified"] else (" 🔕" if is_rare else "")
-        when = v["last"]
-        ago = f" · <t:{int(when.timestamp())}:R>" if hasattr(when, "timestamp") else ""
-        lines.append(f"{mark} **{name}** — {v['seen']:,}회{bell}{ago}")
-    if len(ordered) > 20:
-        lines.append(f"-# 외 {len(ordered) - 20}종")
-
-    embed.add_field(name="🌋 바이옴별 등장", value="\n".join(lines)[:1024],
-                    inline=False)
+    # 희귀한 것을 먼저, 그다음 많이 뜬 순서. **전부 보여줍니다** — '외 N종'
+    # 으로 접으면 정작 궁금한 바이옴이 그 안에 숨습니다.
+    rare_names = [k for k in agg if biome_matches(rare, k)]
+    for name in rare:
+        if not any(biome_matches([name], k) for k in agg):
+            rare_names.append(name)
+            agg.setdefault(name, {"count": 0, "today": 0, "total": 0,
+                                  "notified": 0, "servers": set(), "last": ""})
+    rare_names = sorted(dict.fromkeys(rare_names),
+                        key=lambda k: (-agg[k]["count"], k))
+    others = sorted([k for k in agg if k not in rare_names],
+                    key=lambda k: (-agg[k]["count"], k))
 
     if rare:
-        # 희귀인데 알림이 한 번도 안 나갔으면 **설정이 잘못된 것**입니다.
-        # 통계의 존재 이유가 이걸 잡는 것입니다.
-        silent = [k for k, v in agg.items()
-                  if biome_matches(rare, k) is not None and v["notified"] == 0]
+        _chunk_field(embed, "⭐ 희귀 바이옴", _biome_lines(agg, rare, rare_names))
+    if others:
+        _chunk_field(embed, "🌍 그 밖의 바이옴", _biome_lines(agg, rare, others))
+
+    if rare:
+        silent = [k for k in rare_names if agg[k]["count"] and not agg[k]["notified"]]
         if silent:
             embed.add_field(
                 name="⚠️ 떴는데 알림이 안 나간 희귀 바이옴",
-                value=(", ".join(f"`{n}`" for n in silent[:10])
+                value=(", ".join(f"`{n}`" for n in silent[:15])
                        + "\n-# 해당 채널이 알림 규칙 범위에 없거나, 봇에게 "
                          "`@everyone, @here, 모든 역할 멘션` 권한이 없습니다.\n"
-                         "-# `/링크보호설정` → 📊 현재 설정 및 권한 점검 에서 "
-                         "확인하세요."),
+                         "-# `/링크보호설정` → 📊 현재 설정 및 권한 점검 에서 확인하세요."),
                 inline=False)
-        else:
+        elif rare_now:
+            # 문제가 없을 때도 **명시적으로** 말해 줘야 합니다. 아무 칸도
+            # 없으면 검사를 한 것인지 안 한 것인지 알 수 없습니다.
             embed.add_field(
                 name="✅ 희귀 바이옴 알림",
-                value=f"이 기간에 뜬 희귀 바이옴 **{rare_seen:,}회** 모두 알림이 "
-                      "나갔습니다.",
+                value=f"이 기간에 뜬 희귀 바이옴 **{rare_now:,}회** 모두 알림이 나갔습니다.",
                 inline=False)
         embed.set_footer(text="⭐ = 알림 규칙에 등록된 희귀 바이옴")
     else:
         embed.set_footer(text="알림 규칙이 없어 희귀 바이옴 구분이 없습니다.")
-
     return embed
+
+
+class BiomeStatsView(discord.ui.View):
+    def __init__(self, days: int = 1):
+        super().__init__(timeout=180)
+        for name, d in BIOME_PERIODS:
+            self.add_item(BiomeStatsButton(name, d, active=(d == days)))
+
+
+class BiomeStatsButton(discord.ui.Button):
+    def __init__(self, label: str, days: int, active: bool = False):
+        super().__init__(
+            label=f"최근 {label}",
+            style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+            emoji="📊", disabled=active)
+        self._days = days
+
+    async def callback(self, interaction: discord.Interaction):
+        # 기간이 길면 버킷을 수천 건 읽습니다. defer 없이는 3초를 넘깁니다.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        buckets = await get_biome_buckets(interaction.guild.id, 90)
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await interaction.followup.send(
+            embed=build_biome_stats_embed(interaction.guild, buckets,
+                                          settings, self._days),
+            view=BiomeStatsView(self._days), ephemeral=True)
 
 
 class BiomeBoardSelect(discord.ui.ChannelSelect):
@@ -3056,38 +3146,6 @@ class BiomeBoardView(discord.ui.View):
             ephemeral=True)
 
 
-class BiomeStatsView(discord.ui.View):
-    def __init__(self, hours: int = 24):
-        super().__init__(timeout=180)
-        for name, h in BIOME_PERIODS:
-            self.add_item(BiomeStatsButton(name, h, active=(h == hours)))
-
-
-class BiomeStatsButton(discord.ui.Button):
-    def __init__(self, label: str, hours: int, active: bool = False):
-        super().__init__(
-            label=f"최근 {label}",
-            style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
-            emoji="📊", disabled=active)
-        self._hours = hours
-
-    async def callback(self, interaction: discord.Interaction):
-        # 기간이 길면 문서를 수천 건 읽습니다. 먼저 defer 하지 않으면
-        # 3초 제한에 걸립니다.
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        rows = await get_biome_events(interaction.guild.id, self._hours)
-        settings = await get_linkguard_settings(interaction.guild.id)
-        await interaction.followup.send(
-            embed=build_biome_stats_embed(interaction.guild, rows,
-                                          settings, self._hours),
-            view=BiomeStatsView(self._hours), ephemeral=True)
-
-
-# ── 희귀 바이옴 실시간 카운터 보드 ───────────────────────────────────
-#
-# 채널 하나를 정해 **메시지 하나를 계속 수정**합니다. 매번 새로 보내면
-# 도배가 되어 정작 중요한 신호가 묻힙니다(봇 상태 임베드와 같은 이유).
-
 KST = timezone(timedelta(hours=9))
 
 # 보드 갱신 빈도 제한. 보호는 시간당 수백 건이라 매번 고치면 디스코드
@@ -3099,70 +3157,38 @@ _board_trailing: dict[int, asyncio.Task] = {}
 _board_locks: dict[int, asyncio.Lock] = {}
 
 
-def _kst_today_start():
-    now = datetime.now(KST)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def summarize_biome_board(rows: list[dict]) -> dict[str, dict]:
-    """한 번 읽은 기록으로 오늘 · 7일 · 30일을 **한꺼번에** 집계합니다.
-
-    기간마다 따로 조회하면 같은 문서를 세 번 읽습니다.
-    """
-    today = _kst_today_start()
-    now = datetime.now(timezone.utc)
-    week = now - timedelta(days=7)
-    month = now - timedelta(days=30)
-
-    out: dict[str, dict] = {}
-    for row in rows:
-        when = row.get("updated")
-        if not hasattr(when, "timestamp"):
-            continue
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
-        name = str(row.get("biome") or "?")
-        cur = out.setdefault(name, {"today": 0, "week": 0, "month": 0,
-                                    "last": None, "notified": 0})
-        if when >= month:
-            cur["month"] += 1
-        if when >= week:
-            cur["week"] += 1
-        if when.astimezone(KST) >= today:
-            cur["today"] += 1
-        if row.get("notified"):
-            cur["notified"] += 1
-        if cur["last"] is None or when > cur["last"]:
-            cur["last"] = when
-    return out
-
-
-def build_biome_board_embed(guild: discord.Guild, rows: list[dict],
+def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
                             settings: dict) -> discord.Embed:
-    agg = summarize_biome_board(rows)
     rare = rare_biome_names(settings)
+    agg = summarize_biomes(buckets, 30)
 
-    embed = discord.Embed(
-        title="🌋 희귀 바이옴 실시간 카운터",
-        color=discord.Color.gold()
-    )
+    embed = discord.Embed(title="🌋 희귀 바이옴 실시간 카운터",
+                          color=discord.Color.gold())
+
+    # 규칙에 있는 희귀 바이옴은 **0회여도 항상** 보여줍니다. 빈칸이면 안 뜬
+    # 건지 고장난 건지 판단할 수 없습니다.
+    for name in rare:
+        if not any(biome_matches([name], k) for k in agg):
+            agg[name] = {"count": 0, "today": 0, "total": 0,
+                         "notified": 0, "servers": set(), "last": ""}
+
+    rare_names = sorted([k for k in agg if biome_matches(rare, k)],
+                        key=lambda k: (-agg[k]["today"], -agg[k]["count"], k))
+    others = sorted([k for k in agg if k not in rare_names],
+                    key=lambda k: (-agg[k]["today"], -agg[k]["count"], k))
+
+    def rows(names):
+        out = []
+        for name in names:
+            v = agg[name]
+            servers = len(v["servers"]) if isinstance(v["servers"], set) else 0
+            srv = f" · 서버 {servers}곳" if servers else ""
+            out.append(f"**{name}** — 오늘 **{v['today']:,}** · "
+                       f"30일 **{v['count']:,}** · 누적 **{v['total']:,}**{srv}")
+        return out
 
     if rare:
-        lines = []
-        for name in rare:
-            # 설정한 이름과 실제 기록된 이름이 다를 수 있습니다
-            # (`GLITCH` 로 적어 뒀는데 기록은 `GLITCHED`). 그래서 같은
-            # '들어있는지' 비교로 묶습니다 — 안 그러면 뜬 것이 0 으로 보입니다.
-            hits = [v for k, v in agg.items() if biome_matches([name], k)]
-            today = sum(h["today"] for h in hits)
-            week = sum(h["week"] for h in hits)
-            month = sum(h["month"] for h in hits)
-            last = max((h["last"] for h in hits if h["last"]), default=None)
-            when = f" · 마지막 <t:{int(last.timestamp())}:R>" if last else ""
-            lines.append(f"**{name}**\n"
-                         f"　오늘 **{today}** · 7일 **{week}** · 30일 **{month}**{when}")
-        embed.add_field(name="⭐ 희귀 바이옴", value="\n".join(lines)[:1024],
-                        inline=False)
+        _chunk_field(embed, "⭐ 희귀 바이옴", rows(rare_names))
     else:
         embed.add_field(
             name="⭐ 희귀 바이옴",
@@ -3170,23 +3196,16 @@ def build_biome_board_embed(guild: discord.Guild, rows: list[dict],
                   "-# `/링크보호설정` → 🔔 바이옴 알림 멘션 에서 지정하세요.",
             inline=False)
 
-    others = sorted(
-        ((k, v) for k, v in agg.items() if not biome_matches(rare, k)),
-        key=lambda kv: (-kv[1]["today"], -kv[1]["week"], kv[0]))
+    # **전부 보여줍니다.** '외 N종' 으로 접으면 정작 궁금한 것이 그 안에 숨습니다.
     if others:
-        body = [f"• **{k}** — 오늘 {v['today']} · 7일 {v['week']}"
-                for k, v in others[:8]]
-        if len(others) > 8:
-            body.append(f"-# 외 {len(others) - 8}종")
-        embed.add_field(name="🌍 그 밖의 바이옴", value="\n".join(body)[:1024],
-                        inline=False)
+        _chunk_field(embed, "🌍 그 밖의 바이옴", rows(others))
 
-    total_today = sum(v["today"] for v in agg.values())
+    today_total = sum(v["today"] for v in agg.values())
+    all_total = sum(v["total"] for v in agg.values())
     embed.description = (
-        f"오늘 **{total_today}회** 등장 (서로 다른 개인서버 기준)\n"
+        f"오늘 **{today_total:,}회** 등장 · 누적 **{all_total:,}회**\n"
         f"-# 갱신 <t:{int(datetime.now(timezone.utc).timestamp())}:R> · "
-        "매크로가 같은 링크를 여러 번 올려도 1회로 셉니다."
-    )
+        "**바이옴 시작 임베드 하나 = 1회** (종료는 세지 않습니다)")
     embed.set_footer(text="이 메시지는 자동으로 갱신됩니다")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
@@ -3209,8 +3228,8 @@ async def _apply_board_refresh(guild: discord.Guild, settings: dict) -> None:
               "('메시지 보내기' · '링크 첨부' 확인).", flush=True)
         return
 
-    rows = await get_biome_events(guild.id, 24 * 30)
-    embed = build_biome_board_embed(guild, rows, settings)
+    buckets = await get_biome_buckets(guild.id, 90)
+    embed = build_biome_board_embed(guild, buckets, settings)
 
     lock = _board_locks.setdefault(guild.id, asyncio.Lock())
     async with lock:
@@ -3814,11 +3833,11 @@ class LinkGuard(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def biome_stats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        rows = await get_biome_events(interaction.guild.id, 24)
+        buckets = await get_biome_buckets(interaction.guild.id, 90)
         settings = await get_linkguard_settings(interaction.guild.id)
         await interaction.followup.send(
-            embed=build_biome_stats_embed(interaction.guild, rows, settings, 24),
-            view=BiomeStatsView(24), ephemeral=True)
+            embed=build_biome_stats_embed(interaction.guild, buckets, settings, 1),
+            view=BiomeStatsView(1), ephemeral=True)
 
     @app_commands.command(name="링크보호설정", description="[관리자 전용] 웹훅 임베드의 링크를 인증 유저 전용으로 보호합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.

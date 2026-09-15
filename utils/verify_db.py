@@ -114,7 +114,7 @@ if MONGO_URI:
             # 바이옴 등장 기록. 통계 화면이 기간으로 잘라 보므로 시간 인덱스가
             # 필요합니다(없으면 풀스캔).
             biome_col.create_index(
-                [("guild_id", 1), ("updated", -1)], name="biome_recent"
+                [("guild_id", 1), ("kind", 1), ("day", -1)], name="biome_by_day"
             )
             # 90일. 통계는 '지난달 대비' 를 보고 싶어지므로 조사용(30일)보다
             # 넉넉히 둡니다. 한 건이 200바이트 남짓이라 부담이 없습니다.
@@ -1390,89 +1390,114 @@ async def search_roblox_links(guild_id: int, query: str, limit: int = 10) -> lis
 # ── 바이옴 등장 기록 (통계용) ─────────────────────────────────────────
 #
 # 지금까지 어디에도 **바이옴 이름이 남지 않았습니다.** `link_usage` 는 누가
-# 눌렀는지만, `protected_links` 는 어떤 링크였는지만 압니다. 그래서
-# "이번 주에 DREAMSPACE 가 몇 번 떴나" 를 아무도 답할 수 없었습니다.
+# 눌렀는지만, `protected_links` 는 어떤 링크인지만 압니다.
 #
-# 보호할 때마다 한 건씩 남깁니다. 매크로가 같은 링크를 몇백 번 다시 올리므로
-# **같은 링크 + 같은 바이옴은 한 건으로 묶습니다**(`_id` 를 그렇게 잡습니다).
-# 묶지 않으면 21,227건짜리 컬렉션이 되고 통계도 등장 횟수가 아니라
-# 재게시 횟수를 세게 됩니다.
+# **세는 단위는 '바이옴 시작 임베드 하나' 입니다.** 예전에는 같은 링크를 한
+# 건으로 묶었는데, 개인서버 링크는 매 임베드마다 바꿀 수 없어서 **같은 서버에서
+# 나중에 다시 뜬 바이옴이 통째로 묻혔습니다.** (알림 쿨타임을 걷어낸 것과 같은
+# 이유입니다 — 링크는 바이옴 사건의 신원이 아닙니다.)
+#
+# 대신 **날짜 버킷**에 모읍니다. 등장마다 문서를 하나씩 만들면 하루 3,000건씩
+# 쌓여 백업까지 부풀지만(실측: 3일에 재게시 9,990건), 버킷은
+# `바이옴 × 날짜` 라 90일 보관해도 문서 수천 개입니다.
+#   _id = "<길드>:<바이옴>:<KST 날짜>"
+# `updated`(그날 마지막 활동)에 TTL 이 걸려 있어 90일 뒤 스스로 사라집니다.
 
 BIOME_FILE = os.path.join(DATA_DIR, "biome_events.json")
 
+# 하루·한 바이옴에 기억할 고유 링크 수 상한. 고유 서버 수를 보여주기 위한
+# 것이라 정확할 필요는 없고, 배열이 무한히 자라는 것만 막으면 됩니다.
+BIOME_LINKS_PER_DAY = 300
 
-def _biome_event_id(guild_id: int, biome: str, link_key_str: str) -> str:
-    return f"{guild_id}:{(biome or '?')[:60]}:{link_key_str or '-'}"
+
+def _biome_day(now=None) -> str:
+    """KST 기준 날짜 문자열. 자정 경계는 한국 시간으로 갈라야 합니다."""
+    return (now or datetime.now(KST)).astimezone(KST).strftime("%Y-%m-%d")
+
+
+def _biome_bucket_id(guild_id: int, biome: str, day: str) -> str:
+    return f"{guild_id}:{(biome or '?')[:60]}:{day}"
 
 
 async def record_biome_event(guild_id: int, biome: str, link_key_str: str,
                              channel_id: int, message_id: int,
                              notified: bool) -> None:
-    """바이옴 등장을 한 건 남깁니다 (같은 링크·같은 바이옴은 한 건).
+    """바이옴 시작 임베드 하나를 집계에 더합니다.
 
-    `notified` 는 **봇이 실제로 멘션을 붙였는지**입니다. 나중에 "알림이 안
-    왔다" 는 제보가 들어왔을 때, 설정이 문제였는지 그 바이옴이 아예 안 떴는지를
-    가릅니다.
+    `notified` 는 그 등장에서 **알림이 실제로 나갔는지**입니다. "희귀 바이옴이
+    떴는데 알림이 안 왔다" 를 가려내는 것이 통계의 존재 이유라, 나간 횟수도
+    함께 셉니다.
     """
-    key = _biome_event_id(guild_id, biome, link_key_str)
     now = datetime.now(timezone.utc)
+    day = _biome_day()
+    key = _biome_bucket_id(guild_id, biome, day)
+    link = (link_key_str or "")[:80]
 
     if biome_col is not None:
         try:
-            await _db(biome_col.update_one, {"_id": key},
-                      {"$set": {"updated": now, "notified_last": bool(notified),
-                                "channel_id": int(channel_id),
-                                "message_id": int(message_id)},
-                       "$inc": {"reposts": 1},
-                       "$setOnInsert": {"guild_id": str(guild_id),
-                                        "biome": biome or "?",
-                                        "first_seen": now,
-                                        "notified": bool(notified)}},
-                      upsert=True)
+            upd = {"$set": {"updated": now, "channel_id": int(channel_id),
+                            "message_id": int(message_id)},
+                   "$inc": {"count": 1, "notified_count": 1 if notified else 0},
+                   "$setOnInsert": {"guild_id": str(guild_id), "kind": "day",
+                                    "biome": biome or "?", "day": day,
+                                    "first_seen": now}}
+            if link:
+                # 고유 서버 수를 보여주기 위한 것입니다. **읽고 나서 쓰지
+                # 않습니다** — 보호는 시간당 1,000건이라 왕복을 하나 더 넣으면
+                # 그만큼 핫패스가 느려집니다. 실측상 하루 고유 링크는 수십 개라
+                # 배열이 문제될 크기로 자라지 않습니다.
+                upd["$addToSet"] = {"links": link}
+            await _db(biome_col.update_one, {"_id": key}, upd, upsert=True)
             return
         except Exception as e:
             print(f"MongoDB record_biome_event error: {e}, using local file.", flush=True)
 
     async with _biome_lock:
         all_rows = _read_json(BIOME_FILE)
-        row = all_rows.get(key) or {"guild_id": str(guild_id), "biome": biome or "?",
+        row = all_rows.get(key) or {"guild_id": str(guild_id), "kind": "day",
+                                    "biome": biome or "?", "day": day,
                                     "first_seen": now.isoformat(),
-                                    "notified": bool(notified), "reposts": 0}
-        row["reposts"] = int(row.get("reposts", 0)) + 1
+                                    "count": 0, "notified_count": 0, "links": []}
+        row["count"] = int(row.get("count", 0)) + 1
+        if notified:
+            row["notified_count"] = int(row.get("notified_count", 0)) + 1
+        if link and link not in row.get("links", []) and len(row.get("links", [])) < BIOME_LINKS_PER_DAY:
+            row.setdefault("links", []).append(link)
         row["updated"] = now.isoformat()
-        row["notified_last"] = bool(notified)
         row["channel_id"] = int(channel_id)
         row["message_id"] = int(message_id)
         all_rows[key] = row
         _write_json(BIOME_FILE, all_rows)
 
 
-async def get_biome_events(guild_id: int, since_hours: int = 24) -> list[dict]:
-    """기간 안의 바이옴 등장 기록을 돌려줍니다 (최근 순)."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(since_hours)))
+async def get_biome_buckets(guild_id: int, since_days: int = 30) -> list[dict]:
+    """기간 안의 날짜 버킷을 돌려줍니다 (최근 날짜 순).
+
+    `kind: "day"` 로 거릅니다 — 옛 형식(링크별 문서)이 섞여 들어오면 집계
+    기준이 두 가지가 되어 숫자가 조용히 틀어집니다.
+    """
+    days = max(1, int(since_days))
+    cutoff_day = (datetime.now(KST) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
 
     if biome_col is not None:
         try:
             def _fetch():
                 # 커서는 **스레드 안에서 리스트로** 만들어 돌려줍니다.
                 return list(biome_col.find(
-                    {"guild_id": str(guild_id), "updated": {"$gte": cutoff}}
-                ).sort("updated", -1).limit(3000))
+                    {"guild_id": str(guild_id), "kind": "day",
+                     "day": {"$gte": cutoff_day}}
+                ).sort("day", -1).limit(5000))
             return await _db(_fetch)
         except Exception as e:
-            print(f"MongoDB get_biome_events error: {e}, using local file.", flush=True)
+            print(f"MongoDB get_biome_buckets error: {e}, using local file.", flush=True)
 
     async with _biome_lock:
         all_rows = _read_json(BIOME_FILE)
     out = []
     for row in all_rows.values():
-        if str(row.get("guild_id")) != str(guild_id):
+        if str(row.get("guild_id")) != str(guild_id) or row.get("kind") != "day":
             continue
-        try:
-            when = datetime.fromisoformat(row.get("updated"))
-        except (TypeError, ValueError):
-            continue
-        if when >= cutoff:
-            out.append({**row, "updated": when})
-    out.sort(key=lambda r: r.get("updated"), reverse=True)
+        if str(row.get("day", "")) >= cutoff_day:
+            out.append(dict(row))
+    out.sort(key=lambda r: r.get("day", ""), reverse=True)
     return out

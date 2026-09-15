@@ -121,50 +121,53 @@ async def main():
     print("=== 2. 보호할 때 기록이 남아야 ===")
     await setup()
     await run(macro(ch, "Biome Started - DREAMSPACE", link("s1")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
-    note(len(rows) == 1, "한 건 기록됨", str(len(rows)))
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    note(len(rows) == 1, "버킷 한 건", str(len(rows)))
     note(rows and rows[0].get("biome") == "DREAMSPACE", "바이옴 이름이 맞음",
          str(rows and rows[0].get("biome")))
-    note(rows and rows[0].get("notified") is True,
-         "알림이 나갔다고 기록됨", str(rows and rows[0].get("notified")))
+    note(rows and rows[0].get("count") == 1, "1회로 셈", str(rows and rows[0].get("count")))
+    note(rows and rows[0].get("notified_count") == 1,
+         "알림 나간 횟수도 셈", str(rows and rows[0].get("notified_count")))
 
     print("")
-    print("=== 3. 같은 링크를 다시 올려도 1회로 세야 ===")
-    # 매크로는 같은 링크를 상태 갱신마다 다시 올립니다(평균 145번).
-    # 재게시마다 한 건씩 쌓으면 통계가 '등장 횟수' 가 아니라 '재게시 횟수'가 됩니다.
+    print("=== 3. ⚠️ 같은 링크라도 시작 임베드마다 세야 ===")
+    # 개인서버 링크는 **매 임베드마다 바꿀 수 없습니다.** 링크로 묶으면
+    # 같은 서버에서 나중에 다시 뜬 바이옴이 통째로 묻힙니다.
+    # (실측: 같은 링크+바이옴이 최대 175번까지 다시 올라옵니다)
     for _ in range(5):
         await run(macro(ch, "Biome Started - DREAMSPACE", link("s1")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
     same = [r for r in rows if r.get("biome") == "DREAMSPACE"]
-    note(len(same) == 1, "여섯 번 올라와도 한 건", str(len(same)))
-    note(same and same[0].get("reposts") == 6, "재게시 횟수는 따로 셈",
-         str(same and same[0].get("reposts")))
+    note(len(same) == 1, "버킷은 바이옴×날짜로 하나", str(len(same)))
+    note(same and same[0].get("count") == 6, "여섯 번 올라오면 6회",
+         str(same and same[0].get("count")))
 
     print("")
-    print("  링크가 다르면 별개의 등장입니다")
+    print("  고유 서버 수는 따로 셉니다")
     await run(macro(ch, "Biome Started - DREAMSPACE", link("s2")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
-    note(len([r for r in rows if r.get("biome") == "DREAMSPACE"]) == 2,
-         "다른 개인서버는 2회로 셈")
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    same = [r for r in rows if r.get("biome") == "DREAMSPACE"]
+    note(same and same[0].get("count") == 7, "7회", str(same and same[0].get("count")))
+    note(same and len(same[0].get("links") or []) == 2, "서버는 2곳",
+         str(same and same[0].get("links")))
 
     print("")
     print("=== 4. 종료 임베드는 기록하지 않아야 ===")
     await setup()
     ended = macro(ch, "Biome Ended - DREAMSPACE", link("e1"))
     await run(ended)
-    rows = await vdb.get_biome_events(GUILD.id, 24)
-    note(not [r for r in rows if "e1" in str(r.get("_id", ""))],
-         "종료는 등장으로 세지 않음")
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    note(not rows, "종료는 등장으로 세지 않음", str(len(rows)))
 
     print("")
     print("=== 5. 흔한 바이옴도 기록되지만 알림은 안 나감 ===")
     await setup()
     await run(macro(ch, "Biome Started - SNOWY", link("c1")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
     snowy = [r for r in rows if r.get("biome") == "SNOWY"]
     note(len(snowy) == 1, "흔한 바이옴도 기록됨")
-    note(snowy and snowy[0].get("notified") is False,
-         "알림은 안 나갔다고 기록", str(snowy and snowy[0].get("notified")))
+    note(snowy and snowy[0].get("notified_count") == 0,
+         "알림 나간 횟수는 0", str(snowy and snowy[0].get("notified_count")))
 
     print("")
     print("=== 6. ⚠️ 떴는데 알림이 안 나간 희귀 바이옴을 잡아야 ===")
@@ -172,9 +175,9 @@ async def main():
     # 보호는 되지만 아무도 모릅니다 — 화면이 그걸 짚어 줘야 합니다.
     await setup()
     await run(macro(other, "Biome Started - CYBERSPACE", link("x1")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
     settings = await vdb.get_linkguard_settings(GUILD.id)
-    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 24)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
     blob = (embed.description or "") + " ".join(
         (f.name or "") + (f.value or "") for f in embed.fields)
     note("알림이 안 나간" in blob, "경고 칸이 뜸")
@@ -185,27 +188,70 @@ async def main():
     print("  전부 알림이 나갔으면 초록으로 확인해 줍니다")
     await setup()
     await run(macro(ch, "Biome Started - DREAMSPACE", link("y1")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
-    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 24)
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
     blob = " ".join((f.name or "") + (f.value or "") for f in embed.fields)
     note("✅" in blob and "알림이 안 나간" not in blob,
          "모두 정상이면 경고 대신 확인 표시")
 
     print("")
-    print("=== 7. 희귀 바이옴은 별표로 구분되어야 ===")
+    print("=== 7. 희귀 바이옴은 별도 칸으로 구분되어야 ===")
     await setup()
     await run(macro(ch, "Biome Started - DREAMSPACE", link("r1")))
     await run(macro(ch, "Biome Started - SNOWY", link("r2")))
-    rows = await vdb.get_biome_events(GUILD.id, 24)
-    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 24)
-    body = next((f.value for f in embed.fields if "등장" in (f.name or "")), "")
-    note("⭐ **DREAMSPACE**" in body, "희귀는 ⭐", body[:60])
-    note("• **SNOWY**" in body, "흔한 것은 •", body[:60])
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
+    rare_f = next((f.value for f in embed.fields if "희귀" in (f.name or "")), "")
+    other_f = next((f.value for f in embed.fields if "그 밖" in (f.name or "")), "")
+    note("DREAMSPACE" in rare_f, "희귀는 희귀 칸에", rare_f[:50])
+    note("SNOWY" in other_f, "흔한 것은 그 밖의 칸에", other_f[:50])
+    note("SNOWY" not in rare_f, "흔한 것이 희귀 칸에 섞이지 않음")
 
     print("")
+    print("  ⚠️ 규칙에 있는 희귀 바이옴은 0회여도 보여야 합니다")
+    # 빈칸이면 안 뜬 건지 고장난 건지 판단할 수 없습니다.
+    note("CYBERSPACE" in rare_f, "0회인 희귀 바이옴도 표시", rare_f[:70])
+
+    print("")
+    print("  ⚠️ '외 N종' 으로 접지 않고 전부 보여야 합니다")
+    await setup()
+    for i in range(14):
+        await run(macro(ch, f"Biome Started - BIOME{i:02}", link(f"m{i}")))
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
+    blob = " ".join((f.name or "") + (f.value or "") for f in embed.fields)
+    missing = [f"BIOME{i:02}" for i in range(14) if f"BIOME{i:02}" not in blob]
+    note(not missing, "14종 전부 표시됨", f"누락 {missing}")
+    note("외 " not in blob, "'외 N종' 으로 접지 않음")
+
+    print("")
+    print("  ⚠️ 칸 하나가 1024자를 넘으면 나눠 담아야 합니다 (넘으면 전송 실패)")
+    await setup()
+    for i in range(40):
+        await run(macro(ch, f"Biome Started - VERYLONGBIOMENAME{i:03}", link(f"L{i}")))
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
+    over = [f.name for f in embed.fields if len(f.value or "") > 1024]
+    note(not over, "1024자를 넘는 칸이 없음", str(over))
+    note(len(embed) <= 6000, "임베드 전체가 6000자 이내", str(len(embed)))
+    blob = " ".join((f.name or "") + (f.value or "") for f in embed.fields)
+    note("VERYLONGBIOMENAME039" in blob, "마지막 바이옴까지 살아 있음")
+
+    print("")
+    print("  누적(종합) 등장 횟수가 보여야 합니다")
+    await setup()
+    for _ in range(3):
+        await run(macro(ch, "Biome Started - DREAMSPACE", link("t1")))
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    embed = LG.build_biome_stats_embed(GUILD, rows, settings, 1)
+    blob = (embed.description or "") + " ".join(
+        (f.name or "") + (f.value or "") for f in embed.fields)
+    note("누적" in blob, "누적 표시가 있음")
+    note("3회" in blob or "**3**" in blob, "같은 링크 3번이 3회로 셈", blob[:90])
+
     print("=== 8. 기록이 없으면 '없음'을 설명해야 ===")
     # 빈 화면에 0 만 띄우면 "고장난 건가" 를 판단할 수 없습니다.
-    embed = LG.build_biome_stats_embed(GUILD, [], settings, 24)
+    embed = LG.build_biome_stats_embed(GUILD, [], settings, 1)
     note("기록된 바이옴이 없습니다" in (embed.description or ""), "빈 상태 안내")
     note("보호가 동작한 시점부터" in (embed.description or ""),
          "왜 비어 있을 수 있는지 설명함")
@@ -214,21 +260,34 @@ async def main():
     print("=== 9. 기간이 지난 기록은 빠져야 ===")
     await setup()
     await run(macro(ch, "Biome Started - DREAMSPACE", link("old1")))
-    rows_1h = await vdb.get_biome_events(GUILD.id, 1)
-    note(len(rows_1h) >= 1, "방금 것은 1시간 안에 들어옴")
+    note(len(await vdb.get_biome_buckets(GUILD.id, 1)) >= 1, "오늘 것은 1일 조회에 들어옴")
 
-    old_key = vdb._biome_event_id(GUILD.id, "OLDBIOME", "ps:zzz")
-    long_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=40)
+    old_day = (datetime.datetime.now(vdb.KST) - datetime.timedelta(days=40)).strftime("%Y-%m-%d")
+    old_key = vdb._biome_bucket_id(GUILD.id, "OLDBIOME", old_day)
     await vdb._db(vdb.biome_col.update_one, {"_id": old_key},
-                  {"$set": {"guild_id": str(GUILD.id), "biome": "OLDBIOME",
-                            "updated": long_ago, "reposts": 1, "notified": True}},
+                  {"$set": {"guild_id": str(GUILD.id), "kind": "day",
+                            "biome": "OLDBIOME", "day": old_day, "count": 1,
+                            "notified_count": 1,
+                            "updated": datetime.datetime.now(datetime.timezone.utc)}},
                   upsert=True)
-    rows_7d = await vdb.get_biome_events(GUILD.id, 24 * 7)
-    rows_90d = await vdb.get_biome_events(GUILD.id, 24 * 90)
+    rows_7d = await vdb.get_biome_buckets(GUILD.id, 7)
+    rows_90d = await vdb.get_biome_buckets(GUILD.id, 90)
     note(not [r for r in rows_7d if r.get("biome") == "OLDBIOME"],
-         "40일 전 기록은 7일 조회에 안 나옴")
+         "40일 전 버킷은 7일 조회에 안 나옴")
     note([r for r in rows_90d if r.get("biome") == "OLDBIOME"],
          "90일 조회에는 나옴")
+
+    print("")
+    print("  옛 형식(링크별 문서)이 섞여 있어도 집계에 끼면 안 됩니다")
+    # 기준이 바뀌었으므로 옛 문서를 세면 숫자가 조용히 틀어집니다.
+    await vdb._db(vdb.biome_col.update_one, {"_id": f"{GUILD.id}:LEGACY:ps:old"},
+                  {"$set": {"guild_id": str(GUILD.id), "biome": "LEGACY",
+                            "reposts": 99,
+                            "updated": datetime.datetime.now(datetime.timezone.utc)}},
+                  upsert=True)
+    rows = await vdb.get_biome_buckets(GUILD.id, 90)
+    note(not [r for r in rows if r.get("biome") == "LEGACY"],
+         "kind 가 없는 옛 문서는 제외됨")
 
     print("")
     print("=== 10. 기록 실패가 보호를 멈추면 안 됩니다 ===")
@@ -252,9 +311,8 @@ async def main():
     finally:
         LG.record_biome_event = real
 
-    rows = await vdb.get_biome_events(GUILD.id, 24)
-    note(not [r for r in rows if "boom" in str(r.get("_id", ""))],
-         "실패한 기록은 남지 않음 (있는 척하지 않습니다)")
+    rows = await vdb.get_biome_buckets(GUILD.id, 30)
+    note(not rows, "실패한 기록은 남지 않음 (있는 척하지 않습니다)", str(len(rows)))
 
     print("")
     print("=== 11. 명령어와 버튼이 실제로 동작해야 ===")
@@ -269,9 +327,9 @@ async def main():
     note(sent and sent[0].get("ephemeral"), "ephemeral 로 응답")
     note(sent and sent[0].get("embed") is not None, "임베드를 보냄")
 
-    for label, hours in LG.BIOME_PERIODS:
+    for label, days in LG.BIOME_PERIODS:
         it = Inter()
-        btn = LG.BiomeStatsButton(label, hours)
+        btn = LG.BiomeStatsButton(label, days)
         try:
             await btn.callback(it)
             await drain()
@@ -283,7 +341,7 @@ async def main():
             note(False, f"[최근 {label}] 버튼 예외", f"{type(e).__name__}: {e}")
             traceback.print_exc(limit=3)
 
-    view = LG.BiomeStatsView(24)
+    view = LG.BiomeStatsView(1)
     actives = [b for b in view.children if getattr(b, "disabled", False)]
     note(len(actives) == 1, "보고 있는 기간 버튼만 비활성", str(len(actives)))
 

@@ -215,6 +215,65 @@ async def main():
              f"{m.name}: 받은 만큼만 냄", f"{o['spent']}P / {o['filled']}개")
 
     print("")
+    print("=== 11-2. ⚠️ 관리자 저장이 진행 중인 뽑기의 재고를 되살리면 안 됩니다 ===")
+    # `save_gacha_settings(settings)` 는 `{\"$set\": settings}` 라 items 배열을
+    # 통째로 덮습니다. 관리자가 가격만 바꿔도 그 사이 뽑기가 깎아 둔 재고가
+    # 읽었던 시점으로 되돌아가, **한정 상품이 무한정 나갑니다.**
+    s = await setup_gacha(items(("한정", 100.0, 30, 0, 0)), price=100)
+    await set_points(5000)
+    await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    note(await stock_of(1) == 20, "10연차로 재고 30 → 20", str(await stock_of(1)))
+
+    for label, coro in (
+        ("가격", db.save_gacha_settings(GUILD.id, {"price": 200})),
+        ("이름", db.save_gacha_settings(GUILD.id, {"title": "새 이름"})),
+    ):
+        await coro
+        note(await stock_of(1) == 20, f"{label} 저장 후에도 재고가 20 그대로",
+             str(await stock_of(1)))
+
+    print("")
+    print("  관리자 저장과 뽑기가 **동시에** 일어나도 마찬가지여야 합니다")
+    s = await setup_gacha(items(("한정", 100.0, 30, 0, 0)), price=100)
+    await set_points(5000)
+    await asyncio.gather(
+        G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s)),
+        db.save_gacha_settings(GUILD.id, {"price": 300}),
+    )
+    note(await stock_of(1) == 20, "동시 실행에서도 재고 20", str(await stock_of(1)))
+
+    print("")
+    print("  재고 충전은 그 항목만 바꿔야 합니다 (다른 항목을 되감지 않게)")
+    s = await setup_gacha(items(("A", 50.0, 10, 0, 0), ("B", 50.0, 10, 0, 0)), price=10)
+    await set_points(5000)
+    await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    a_before, b_before = await stock_of(1), await stock_of(2)
+    note(a_before + b_before == 10, "합쳐서 10개 소모됨", f"A{a_before}/B{b_before}")
+
+    await db.set_gacha_item_stock(GUILD.id, 1, 99)
+    note(await stock_of(1) == 99, "A 재고만 99 로 설정됨", str(await stock_of(1)))
+    note(await stock_of(2) == b_before, "B 재고는 건드리지 않음",
+         f"{await stock_of(2)} (기대 {b_before})")
+
+    print("")
+    print("  항목 추가·삭제도 배열을 통째로 덮지 않아야 합니다")
+    s = await setup_gacha(items(("한정", 100.0, 30, 0, 0)), price=100)
+    await set_points(5000)
+    await G.perform_rolls(GUILD, member, s, G.BULK_COUNT, G.bulk_price(s))
+    await db.add_gacha_item(GUILD.id, {"id": 9, "name": "새항목", "percent": 0.0,
+                                       "weight": 0.0, "stock": -1,
+                                       "reward_role_id": 0, "reward_points": 0,
+                                       "description": ""})
+    note(await stock_of(1) == 20, "항목 추가 후에도 재고 20", str(await stock_of(1)))
+    after = await db.get_gacha_settings(GUILD.id)
+    note(len(after["items"]) == 2, "항목이 2개가 됨", str(len(after["items"])))
+
+    await db.remove_gacha_item(GUILD.id, 9)
+    after = await db.get_gacha_settings(GUILD.id)
+    note(len(after["items"]) == 1, "삭제하면 1개로 돌아옴", str(len(after["items"])))
+    note(await stock_of(1) == 20, "삭제 후에도 재고 20", str(await stock_of(1)))
+
+    print("")
     print("=== 12. ⚠️ 잔액보다 많이 쓸 수 없어야 (연타) ===")
     s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
     c = Member(5003, "C", False, guild=GUILD)

@@ -76,7 +76,12 @@ async def main():
     print("  ⚠️ 위조·변조한 쿠키는 통하면 안 됩니다")
     bad = [
         ("빈 값", ""), ("None", None), ("아무 문자열", "not-a-cookie"),
-        ("한 글자 바꾼 것", cookie[:-1] + ("A" if cookie[-1] != "A" else "B")),
+        # 끝이 아니라 **가운데**를 바꿉니다 (위 state 와 같은 이유 —
+        # base64 끝 글자는 여러 값이 같은 것으로 디코딩됩니다).
+        ("한 글자 바꾼 것",
+         cookie[:len(cookie) // 2]
+         + ("A" if cookie[len(cookie) // 2] != "A" else "B")
+         + cookie[len(cookie) // 2 + 1:]),
         ("앞을 자른 것", cookie[3:]), ("뒤를 자른 것", cookie[:-4]),
         ("서명만 뗀 것", cookie.split(".")[0]),
     ]
@@ -120,7 +125,15 @@ async def main():
     note(G.read_state(st) == "토큰abc", "왕복이 됨", repr(G.read_state(st)))
     note(G.read_state(None) is None, "빈 값 거부")
     note(G.read_state("위조") is None, "위조 거부")
-    note(G.read_state(st[:-1] + "Z") is None, "변조 거부")
+    # ⚠️ **마지막 글자를 바꾸는 방식은 쓰지 마세요.** base64 의 끝 글자에는
+    #    쓰이지 않는 비트가 남아 있어서, 서로 다른 글자 여러 개가 **같은
+    #    값으로 디코딩**됩니다. 실측으로 500회 중 29회가 "변조했는데도
+    #    통과" 했습니다 — 검증이 간헐적으로 실패하는 원인이었습니다.
+    #    가운데를 바꾸면 그런 애매함이 없습니다 (500회 중 0회).
+    i = len(st) // 2
+    flipped = st[:i] + ("Z" if st[i] != "Z" else "Y") + st[i + 1:]
+    note(flipped != st, "정말로 바꿨는지 먼저 확인")
+    note(G.read_state(flipped) is None, "변조 거부", flipped[:24])
     note(G.STATE_MAX_AGE <= 900,
          f"state 수명이 짧음 ({G.STATE_MAX_AGE}초)", str(G.STATE_MAX_AGE))
     note(G.COOKIE_MAX_AGE > G.STATE_MAX_AGE, "쿠키가 state 보다 오래 삶")

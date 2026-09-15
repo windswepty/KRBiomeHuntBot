@@ -1158,12 +1158,16 @@ class Verify(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def system_power(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         verify_settings = await get_verify_settings(interaction.guild.id)
         guard_settings = await get_linkguard_settings(interaction.guild.id)
 
         embed = build_power_embed(verify_settings, guard_settings, interaction.guild)
         view = SystemPowerView(verify_settings, guard_settings)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="인증설정", description="[관리자 전용] 서버 인증 역할, 인증 패널 및 문구를 관리합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -1173,8 +1177,12 @@ class Verify(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def verify_settings(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_verify_settings(interaction.guild.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=build_settings_panel(settings, interaction.guild),
             view=VerifySettingsView(settings, interaction.guild),
             ephemeral=True)

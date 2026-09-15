@@ -4038,6 +4038,10 @@ class LinkGuard(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def linkguard_settings(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_linkguard_settings(interaction.guild.id)
         category_count = len(settings.get("category_ids", []))
         channel_count = len(settings.get("channel_ids", []))
@@ -4057,7 +4061,7 @@ class LinkGuard(commands.Cog):
         )
         embed.set_footer(text="웹훅이 보낸 임베드만 감지합니다")
         view = GuardSettingsView(settings)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 def _make_member_gate(bot):

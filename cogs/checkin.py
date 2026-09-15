@@ -300,6 +300,10 @@ class CheckIn(commands.Cog):
     @app_commands.guild_only()
     async def check_in(self, interaction: discord.Interaction):
         # 블랙리스트 유저 확인
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         if await is_user_blacklisted(interaction.guild.id, interaction.user.id):
             embed = discord.Embed(
                 title="🚫 출석체크 불가",
@@ -307,7 +311,7 @@ class CheckIn(commands.Cog):
                             "이유 및 상세 문의는 서버 관리자에게 요청해 주세요.",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         result = await checkin_user(interaction.guild.id, interaction.user.id)
@@ -388,7 +392,7 @@ class CheckIn(commands.Cog):
                             value=f"**{total_points:,} P**", inline=True)
 
         # ephemeral=True makes the response visible ONLY to the user!
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트확인", description="현재 내가 보유한 총 포인트를 확인합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -396,13 +400,17 @@ class CheckIn(commands.Cog):
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
     async def view_points(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         total_points = await get_user_points(interaction.guild.id, interaction.user.id)
         embed = discord.Embed(
             title="💳 내 포인트 정보",
             description=f"💰 **현재 총 보유 포인트**: **{total_points:,}** P",
             color=discord.Color.blue()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트랭킹", description="서버의 포인트 보유 순위 TOP 10을 확인합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -410,6 +418,10 @@ class CheckIn(commands.Cog):
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
     async def point_ranking(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         top_users = await get_top_users(interaction.guild.id, limit=10)
         my_rank, my_points = await get_user_rank(interaction.guild.id, interaction.user.id)
 
@@ -419,7 +431,7 @@ class CheckIn(commands.Cog):
                 description="아직 등록된 포인트 랭킹 정보가 없습니다.",
                 color=discord.Color.gold()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -465,7 +477,7 @@ class CheckIn(commands.Cog):
         )
 
         embed.set_footer(text="포인트 랭킹은 시각/활동에 따라 실시간으로 갱신됩니다.")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="포인트얻는법", description="포인트를 획득하는 다양한 방법과 도움말을 확인합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -519,8 +531,12 @@ class CheckIn(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def take_points(self, interaction: discord.Interaction, member: discord.Member, amount: int):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         if amount <= 0:
-            await interaction.response.send_message("⚠️ 회수할 포인트는 1 P 이상이어야 합니다.", ephemeral=True)
+            await interaction.followup.send("⚠️ 회수할 포인트는 1 P 이상이어야 합니다.", ephemeral=True)
             return
 
         current_pts = await get_user_points(interaction.guild.id, member.id)
@@ -530,12 +546,12 @@ class CheckIn(commands.Cog):
                 description=f"{member.mention} 유저의 현재 보유 포인트(**{current_pts:,} P**)가 회수 요청 수량(**{amount:,} P**)보다 적습니다.",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         success, new_total = await deduct_user_points(interaction.guild.id, member.id, amount)
         if not success:
-            await interaction.response.send_message("⚠️ 포인트 회수에 실패하였습니다.", ephemeral=True)
+            await interaction.followup.send("⚠️ 포인트 회수에 실패하였습니다.", ephemeral=True)
             return
 
         await add_activity_log(
@@ -549,7 +565,7 @@ class CheckIn(commands.Cog):
                         f"💰 **해당 유저의 현재 총 포인트**: **{new_total:,} P**",
             color=discord.Color.orange()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="출석설정",
@@ -562,8 +578,12 @@ class CheckIn(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def checkin_settings(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_checkin_settings(interaction.guild.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=_build_checkin_panel(settings),
             view=CheckinSettingsView(settings), ephemeral=True)
 

@@ -137,6 +137,10 @@ class Logs(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def view_logs(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         guild_id = interaction.guild.id
         log_type = "all"
         # 5페이지 분량 (최대 50개) 로드
@@ -144,7 +148,7 @@ class Logs(commands.Cog):
 
         embed = build_log_embed(log_type, logs, page=0)
         view = LogPaginationView(logs=logs, log_type=log_type, current_page=0)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 async def setup(bot):

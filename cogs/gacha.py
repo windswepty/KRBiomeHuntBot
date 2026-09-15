@@ -914,12 +914,16 @@ class Gacha(commands.Cog):
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
     async def roll(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_gacha_settings(interaction.guild.id)
         is_enabled = settings.get("enabled", True)
         is_admin = interaction.user.guild_permissions.administrator
 
         if not is_enabled and not is_admin:
-            await interaction.response.send_message("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            await interaction.followup.send("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
             return
 
         gacha_title = settings.get("title", "한바헌 럭키 뽑기")
@@ -935,7 +939,7 @@ class Gacha(commands.Cog):
                 description=f"현재 준비된 뽑기 항목이 없습니다!\n\n💰 **내 보유 포인트**: **{user_points:,} P**",
                 color=discord.Color.gold() if is_enabled else discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         total_pct = get_total_percent(items)
@@ -989,7 +993,7 @@ class Gacha(commands.Cog):
         embed.set_footer(text="당첨된 역할이나 포인트는 계정에 즉시 지급됩니다.")
 
         view = GachaPlayView(is_out_of_stock=is_all_sold_out, settings=settings)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 이름, 설명, 가격, 당첨 항목, 확률(총합 100%), 재고, 역할을 관리합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -999,6 +1003,10 @@ class Gacha(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def gacha_settings(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_gacha_settings(interaction.guild.id)
         enabled_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
         gacha_title = settings.get("title", "한바헌 럭키 뽑기")
@@ -1023,7 +1031,7 @@ class Gacha(commands.Cog):
             color=discord.Color.dark_gold()
         )
         view = GachaSettingsView(settings)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 async def setup(bot):

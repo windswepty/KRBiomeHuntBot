@@ -488,12 +488,16 @@ class Shop(commands.Cog):
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
     async def point_shop(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_shop_settings(interaction.guild.id)
         is_enabled = settings.get("enabled", True)
         is_admin = interaction.user.guild_permissions.administrator
 
         if not is_enabled and not is_admin:
-            await interaction.response.send_message("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            await interaction.followup.send("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다. 관리자에게 문의해 주세요.", ephemeral=True)
             return
 
         shop_title = settings.get("title", "한바헌 포인트 상점")
@@ -508,7 +512,7 @@ class Shop(commands.Cog):
                 description=f"현재 준비된 상점 상품이 없습니다!\n\n💰 **내 보유 포인트**: **{user_points:,} P**",
                 color=discord.Color.purple() if is_enabled else discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -539,7 +543,7 @@ class Shop(commands.Cog):
         embed.set_footer(text=f"선택 메뉴에서 항목을 고르면 포인트를 사용하여 즉시 구매하실 수 있습니다.")
 
         view = ShopView(items)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 이름, 상품, 가격, 재고, 역할을 관리합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -549,6 +553,10 @@ class Shop(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def shop_settings(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         settings = await get_shop_settings(interaction.guild.id)
         enabled_text = "✅ 활성화" if settings.get("enabled", True) else "❌ 비활성화"
         shop_title = settings.get("title", "한바헌 포인트 상점")
@@ -562,7 +570,7 @@ class Shop(commands.Cog):
             color=discord.Color.dark_purple()
         )
         view = ShopSettingsView(settings)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 async def setup(bot):

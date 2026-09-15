@@ -11,6 +11,7 @@
   ⑤ 포인트를 절대값으로 덮어쓰지 않기 ($inc 만)
   ⑥ 슬래시 명령어는 전부 guild_only (DM 에서 guild 가 None)
   ⑦ 비밀이 담기는 파일이 .gitignore 에 잡히는가
+  ⑧ DB 를 읽는 슬래시 명령어는 defer 를 먼저 부르는가 (3초 제한)
 """
 import sys, os, ast, io, pathlib
 
@@ -311,6 +312,73 @@ def check_secrets_ignored():
 
 
 
+# ── ⑧ DB 를 만지는 명령어는 defer 가 먼저 ─────────────────────────
+#
+# 디스코드 상호작용은 **3초 안에 첫 응답**이 가야 합니다. `defer()` 를 먼저
+# 부르면 그 자리에서 응답한 것이 되어 15분까지 여유가 생깁니다. 안 부르고
+# DB 왕복을 하면 몰리는 순간 10062(Unknown interaction)로 명령어가 통째로
+# 죽고, 유저 화면에는 "앗! 문제가 발생했어요" 만 뜹니다.
+#
+# 2026-09-15 실측: `/포인트랭킹` 이 이 이유로 실패했고, 유저가 10초 뒤
+# 다시 눌러도 또 실패했습니다. 로그를 뒤지기 전까지 아무도 몰랐습니다.
+DB_AWAITS = {
+    "get_user_points", "get_user_rank", "get_top_users", "load_data",
+    "get_shop_settings", "get_gacha_settings", "get_checkin_settings",
+    "get_quest_settings", "get_activity_logs", "get_blacklist",
+    "get_verify_settings", "get_linkguard_settings", "get_roblox_link",
+    "list_point_snapshots", "get_biome_buckets", "get_backup_settings",
+    "get_quest_progress", "get_boost", "_db",
+}
+
+# 규칙을 어기는 것이 **맞는** 자리 (모달은 첫 응답이어야 해서 defer 불가 등).
+# 숨기지 말고 이유와 함께 적으세요.
+DEFER_EXCEPTIONS: dict[str, str] = {}
+
+
+def check_defer():
+    """DB 를 읽고 나서 응답하는데 defer 가 없는 명령어를 찾습니다."""
+    bad = []
+    for p in FILES:
+        if "/cogs/" not in rel(p) and not rel(p).startswith("cogs/"):
+            continue
+        tree, _ = parse(p)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            if not any("app_commands" in ast.dump(d) and "command" in ast.dump(d)
+                       for d in node.decorator_list):
+                continue
+            if f"{rel(p)}:{node.name}" in DEFER_EXCEPTIONS:
+                continue
+
+            names = []
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call):
+                    f = n.func
+                    nm = (f.attr if isinstance(f, ast.Attribute)
+                          else f.id if isinstance(f, ast.Name) else "")
+                    names.append((nm, getattr(n, "lineno", 0)))
+
+            defer_ln = next((ln for nm, ln in names if nm == "defer"), None)
+            send_ln = next((ln for nm, ln in names
+                            if nm in ("send_message", "send_modal")), None)
+            if send_ln is None:
+                continue
+            # 모달은 첫 응답이어야 하므로 defer 를 걸 수 없습니다
+            if any(nm == "send_modal" for nm, _ in names):
+                continue
+            hits = sorted({nm for nm, ln in names
+                           if nm in DB_AWAITS and ln < send_ln
+                           and (defer_ln is None or ln < defer_ln)})
+            if defer_ln is None and hits:
+                bad.append(f"{rel(p)}:{node.lineno} {node.name}() "
+                           f"— {', '.join(hits)}")
+
+    note(not bad,
+         f"DB 를 읽는 명령어는 defer 를 먼저 부름 ({len(bad)}건 위반)",
+         " / ".join(bad[:4]) if bad else "")
+
+
 def check_docs_budget():
     """CLAUDE.md 가 다시 부풀지 않는지 봅니다.
 
@@ -341,6 +409,7 @@ check_custom_id()
 check_points()
 check_guild_only()
 check_secrets_ignored()
+check_defer()
 check_docs_budget()
 
 print(f"\n  실패 {len(FAILS)}건 / 성공 {len(OKS)}건")

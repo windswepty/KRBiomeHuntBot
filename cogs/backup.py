@@ -936,6 +936,10 @@ class PointBackup(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def backup_settings(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         snapshots = await list_point_snapshots(interaction.guild.id, limit=25)
         latest = snapshots[0]["created_kst"] if snapshots else "없음"
 
@@ -954,7 +958,7 @@ class PointBackup(commands.Cog):
                       "`MONGO_URI` 설정을 즉시 확인하세요.",
                 inline=False)
         embed.set_footer(text="매일 새벽 5시 자동 백업 · 최근 30개 보관")
-        await interaction.response.send_message(embed=embed, view=BackupView(), ephemeral=True)
+        await interaction.followup.send(embed=embed, view=BackupView(), ephemeral=True)
 
 
 async def setup(bot):

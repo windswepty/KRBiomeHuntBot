@@ -650,6 +650,10 @@ class RobloxLink(commands.Cog):
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
     async def roblox_link(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         if guild is None:
             return
@@ -660,7 +664,7 @@ class RobloxLink(commands.Cog):
                 description="관리자가 설정을 마치면 이용하실 수 있습니다.",
                 color=discord.Color.orange()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         existing = await get_roblox_link(guild.id, interaction.user.id)
@@ -688,7 +692,7 @@ class RobloxLink(commands.Cog):
                 value="지금 계정이 맞다면 **[취소]** 를 누르시면 됩니다.\n"
                       "다시 연동해도 이 계정이면 달라지는 것은 없습니다.",
                 inline=False)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=embed,
                 view=RelinkConfirmView(guild.id, interaction.user.id, existing),
                 ephemeral=True)
@@ -703,7 +707,7 @@ class RobloxLink(commands.Cog):
         except Exception as e:
             print(f"[RobloxLink] 로그인 링크 생성 실패: {type(e).__name__}: {e}",
                   flush=True)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ 로그인 링크를 만들지 못했습니다. 잠시 후 다시 시도해 주세요.",
                 ephemeral=True)
             return
@@ -714,7 +718,7 @@ class RobloxLink(commands.Cog):
             value="개인서버 링크를 누가 받아갔는지 **로블록스 아이디로도** 남기기 "
                   "위해서입니다. 링크가 외부로 새어나갔을 때 확인하는 데 쓰입니다.",
             inline=False)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(
         name="내연동정보",
@@ -725,6 +729,10 @@ class RobloxLink(commands.Cog):
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
     @app_commands.guild_only()
     async def my_link(self, interaction: discord.Interaction):
+        # 3초 제한을 넘기지 않도록 **먼저 응답을 예약**합니다. 아래에서 DB 를
+        # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
+        # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         link = await get_roblox_link(interaction.guild.id, interaction.user.id)
         if not link:
             embed = discord.Embed(
@@ -744,7 +752,7 @@ class RobloxLink(commands.Cog):
             embed.add_field(
                 name="🕒 연동 시각",
                 value=f"`{link.get('linked_at', '?')}`", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── 관리자용 ──────────────────────────────────────────────────────
 

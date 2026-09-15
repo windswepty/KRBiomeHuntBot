@@ -222,6 +222,13 @@ def _apply_update(doc, update, query, upserted):
                     if item not in arr:
                         arr.append(item)
                 _set_path(doc, k, arr)
+        elif op == "$max":
+            # 없으면 UnknownOperator 로 터져 폴백으로 새고, 그러면 id 발급의
+            # Mongo 경로를 한 줄도 검증하지 못합니다.
+            for k, v in body.items():
+                cur, present = _get(doc, k)
+                if not present or cur is None or v > cur:
+                    _set_path(doc, k, v)
         elif op == "$unset":
             for k in body:
                 parts = k.split(".")

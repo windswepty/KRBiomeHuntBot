@@ -894,6 +894,42 @@ async def set_gacha_item_stock(guild_id: int, item_id, stock: int) -> bool:
     return False
 
 
+async def next_gacha_item_id(guild_id: int) -> int:
+    """항목 id 를 **서버에서 원자적으로** 발급합니다.
+
+    `max(id)+1` 은 읽고 나서 쓰는 사이에 다른 관리자가 끼어들면 **같은 id 가
+    두 번 나옵니다.** id 가 겹치면 위치 연산자(`items.$.stock`)가 먼저 걸린
+    항목만 고치고, `remove_gacha_item` 은 **둘 다 지웁니다.**
+
+    기존 항목이 이미 1..N 을 쓰고 있으므로, 먼저 `$max` 로 카운터를 그보다
+    낮지 않게 올린 뒤 `$inc` 합니다. `$max` 는 올리기만 해서 몇 번 돌려도
+    안전하고, `$inc` 의 반환값은 동시 호출끼리 절대 겹치지 않습니다.
+    """
+    str_gid = str(guild_id)
+    if gacha_col is not None:
+        try:
+            doc = await _db(gacha_col.find_one, {"_id": str_gid}) or {}
+            base = max([int(i.get("id", 0) or 0) for i in doc.get("items", [])],
+                       default=0)
+            await _db(gacha_col.update_one, {"_id": str_gid},
+                      {"$max": {"item_seq": base}}, upsert=True)
+            got = await _db(gacha_col.find_one_and_update, {"_id": str_gid},
+                            {"$inc": {"item_seq": 1}},
+                            return_document=_AFTER, upsert=True)
+            return int((got or {}).get("item_seq", base + 1))
+        except Exception as e:
+            print(f"MongoDB next_gacha_item_id error: {e}, using local file.", flush=True)
+
+    async with _gacha_lock:
+        all_gacha = _read_json(GACHA_FILE)
+        row = all_gacha.setdefault(str_gid, {})
+        base = max([int(i.get("id", 0) or 0) for i in row.get("items", [])], default=0)
+        nxt = max(int(row.get("item_seq", 0) or 0), base) + 1
+        row["item_seq"] = nxt
+        _write_json(GACHA_FILE, all_gacha)
+        return nxt
+
+
 async def add_gacha_item(guild_id: int, item: dict) -> None:
     """항목 하나를 **덧붙입니다** (배열 전체를 다시 쓰지 않습니다)."""
     str_gid = str(guild_id)

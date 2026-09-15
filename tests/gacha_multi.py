@@ -300,6 +300,98 @@ async def main():
     note(await stock_of(1) == 6, "재고 7 → 6", str(await stock_of(1)))
 
     print("")
+    print("=== 13-2. ⚠️ 이름이 같은 항목이 한 줄로 합쳐지면 안 됩니다 ===")
+    # 운영진이 `500 포인트` 를 확률만 달리해 두 개 등록하는 일은 흔합니다.
+    # 이름으로 묶으면 **남은 재고가 한쪽 것만** 보여, 유저는 자기가 뽑지
+    # 않은 항목의 재고를 보고 "아직 남았네" 하고 또 돌립니다.
+    res = [{"id": 1, "name": "500 포인트"}, {"id": 1, "name": "500 포인트"},
+           {"id": 2, "name": "500 포인트"}, {"id": 3, "name": "꽝"}]
+    summary = G.summarize_results(res)
+    by_id = {t[0]: t for t in summary}
+    note(len(summary) == 3, "id 가 다르면 줄도 따로", str(summary))
+    note(by_id[1][2] == 2 and by_id[2][2] == 1, "각자 제 횟수를 셈", str(summary))
+    note(all(len(t) == 3 for t in summary), "(id, 이름, 횟수) 로 돌려줌")
+
+    print("")
+    print("  화면의 '남은 재고' 도 항목마다 달라야 합니다")
+    s = await setup_gacha([
+        {"id": 1, "name": "500 포인트", "percent": 50.0, "stock": 9,
+         "reward_points": 0, "reward_role_id": 0, "description": ""},
+        {"id": 2, "name": "500 포인트", "percent": 50.0, "stock": 2,
+         "reward_points": 0, "reward_role_id": 0, "description": ""},
+    ], price=100)
+    stock_by_id = {i["id"]: i["stock"] for i in s["items"]}
+    note(stock_by_id[1] != stock_by_id[2],
+         "재고가 서로 다른 동명 항목을 만들었음", str(stock_by_id))
+    lines = [f"{name} 재고 {stock_by_id.get(iid)}"
+             for iid, name, _ in G.summarize_results(res[:3])]
+    note("재고 9" in " ".join(lines) and "재고 2" in " ".join(lines),
+         "두 재고가 각각 나옴", str(lines))
+
+    print("")
+    print("=== 13-3. ⚠️ 화면 전송이 실패해도 기록은 남아야 ===")
+    # 여기까지 왔다면 포인트는 이미 빠지고 재고도 이미 줄었습니다. 화면만
+    # 못 보낸 것인데 기록까지 없으면 `/로그` 로도 못 찾고, 유저가 문의해도
+    # 확인할 방법이 없습니다.
+    s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)
+    it = Inter(uid=member.id, admin=False)
+    await db.add_user_points(GUILD.id, it.user.id, 100000)
+
+    async def boom(*a, **k):
+        raise RuntimeError("일부러 낸 전송 실패")
+
+    it.followup.send = boom
+    before_logs = len((await db.get_activity_logs(GUILD.id, "gacha")) or [])
+    v = G.GachaPlayView(settings=s)
+    try:
+        await v.roll_gacha_10.callback(it)
+    except Exception as e:
+        note(False, "전송 실패가 밖으로 터져 나옴", f"{type(e).__name__}: {e}")
+    await drain()
+    after_logs = len((await db.get_activity_logs(GUILD.id, "gacha")) or [])
+    note(after_logs == before_logs + 1,
+         "전송이 터져도 활동 기록은 남음", f"{before_logs} → {after_logs}")
+
+    print("")
+    print("=== 13-4. ⚠️ 항목 id 는 동시에 발급해도 겹치면 안 됩니다 ===")
+    # `max(id)+1` 은 읽고 쓰는 사이에 끼어들면 같은 id 가 두 번 나옵니다.
+    # 겹치면 재고 수정(`items.$.stock`)이 엉뚱한 항목을 고치고,
+    # 삭제는 **둘 다** 지웁니다.
+    await setup_gacha(items(("가", 50.0, -1, 0, 0), ("나", 50.0, -1, 0, 0)))
+    ids = await asyncio.gather(*[db.next_gacha_item_id(GUILD.id) for _ in range(20)])
+    note(len(set(ids)) == 20, "동시 20회 발급이 전부 다른 값", str(sorted(ids)[:6]))
+    note(min(ids) > 2, "기존 항목 id(1,2) 와도 겹치지 않음", str(min(ids)))
+
+    print("")
+    print("  폴백 경로에서도 겹치지 않아야 합니다")
+    real = db.gacha_col
+    db.gacha_col = None
+    try:
+        ids2 = await asyncio.gather(*[db.next_gacha_item_id(GUILD.id)
+                                      for _ in range(10)])
+        note(len(set(ids2)) == 10, "JSON 폴백도 전부 다른 값", str(sorted(ids2)))
+    finally:
+        db.gacha_col = real
+
+    print("")
+    print("=== 13-5. 못 채운 회차 분기 (부분 / 전무) ===")
+    # 실제로 밟히는 분기인데 검증이 비어 있었습니다.
+    s = await setup_gacha(items(("한정", 100.0, 3, 0, 0)), price=100)
+    await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, 10, 1000)
+    note(out["filled"] == 3, "재고만큼만 채움", str(out["filled"]))
+    note(out["refund"] == 700, "못 채운 7회분 환불", str(out["refund"]))
+    note(out["spent"] == 300, "실제 소모는 3회분", str(out["spent"]))
+
+    print("")
+    s = await setup_gacha(items(("품절", 100.0, 0, 0, 0)), price=100)
+    before = await set_points(5000)
+    out = await G.perform_rolls(GUILD, member, s, 10, 1000)
+    note(out["filled"] == 0, "한 번도 못 뽑음", str(out["filled"]))
+    note(out["refund"] == 1000, "전액 환불", str(out["refund"]))
+    note(out["balance"] == before, "잔액이 그대로", f"{before} → {out['balance']}")
+
+    print("")
     print("=== 14. 버튼 콜백이 실제로 동작해야 ===")
     # cog 로드만으로는 NameError 를 잡지 못합니다.
     s = await setup_gacha(items(("보통", 100.0, -1, 0, 0)), price=100)

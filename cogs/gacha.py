@@ -7,6 +7,7 @@ from utils.database import (
     get_gacha_settings, save_gacha_settings,
     add_gacha_item, remove_gacha_item, set_gacha_item_stock,
     get_user_points, deduct_user_points, add_user_points, add_activity_log,
+    next_gacha_item_id,
     bump_quest_progress, bump_event_progress,
     consume_gacha_stock
 )
@@ -156,13 +157,23 @@ async def perform_rolls(guild, member, settings: dict, count: int,
     }
 
 
-def summarize_results(results: list[dict]) -> list[tuple[str, int]]:
-    """같은 항목끼리 묶어 (이름, 횟수) 로 돌려줍니다 (많이 나온 순)."""
-    counts: dict[str, int] = {}
+def summarize_results(results: list[dict]) -> list[tuple]:
+    """같은 **항목**끼리 묶어 `(id, 이름, 횟수)` 로 돌려줍니다 (많이 나온 순).
+
+    ⚠️ **이름이 아니라 id 로 묶습니다.** 이름이 같은 항목을 두 개 등록하는
+    일은 흔한데(`500 포인트` 를 확률만 달리해 두 번 넣는 식), 이름으로 묶으면
+    둘이 한 줄로 합쳐지고 **남은 재고는 그중 한쪽 것만** 보입니다. 유저는
+    자기가 뽑지 않은 항목의 재고를 보고 "아직 남았네" 하고 또 돌립니다.
+    """
+    counts: dict = {}
     for r in results:
-        name = r.get("name", "알 수 없음")
-        counts[name] = counts.get(name, 0) + 1
-    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        key = r.get("id")
+        if key is None:                       # id 가 없는 옛 기록 대비
+            key = ("name", r.get("name", "알 수 없음"))
+        cur = counts.setdefault(key, {"name": r.get("name", "알 수 없음"), "n": 0})
+        cur["n"] += 1
+    return sorted(((k, v["name"], v["n"]) for k, v in counts.items()),
+                  key=lambda t: (-t[2], t[1]))
 
 
 class GachaPlayView(discord.ui.View):
@@ -321,9 +332,8 @@ class GachaPlayView(discord.ui.View):
             summary = summarize_results(results)
             stock_by_id = {i.get("id"): i.get("stock", -1) for i in outcome["items"]}
             body = []
-            for name, got in summary:
-                item = next((r for r in results if r.get("name") == name), {})
-                stock_text = format_stock_str(stock_by_id.get(item.get("id"), -1))
+            for item_id, name, got in summary:
+                stock_text = format_stock_str(stock_by_id.get(item_id, -1))
                 body.append(f"• **{name}** × **{got}** (남은 재고 `{stock_text}`)")
             embed.add_field(name="🎁 당첨 내역", value="\n".join(body)[:1024], inline=False)
         else:
@@ -344,15 +354,30 @@ class GachaPlayView(discord.ui.View):
                             value="\n".join(outcome["role_failed"])[:1024], inline=False)
 
         embed.set_footer(text=f"{gacha_title} 시스템")
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
-        await add_activity_log(
-            interaction.guild.id, "gacha", interaction.user.id,
-            interaction.user.display_name,
-            (f"[{results[0]['name']}] 뽑기 당첨 (-{outcome['spent']:,}P)"
-             if count == 1 else
-             f"{filled}연차 뽑기 (-{outcome['spent']:,}P) — "
-             + ", ".join(f"{n}x{c}" for n, c in summarize_results(results))))
+        # ⚠️ **기록을 먼저 남깁니다.** 여기까지 왔다는 것은 포인트가 이미
+        # 빠졌고 재고도 이미 줄었다는 뜻입니다. 화면 전송이 실패했다고 그
+        # 사실이 없던 일이 되지 않는데, 기록이 뒤에 있으면 그때 **포인트만
+        # 사라지고 아무 기록도 없는 상태**가 됩니다 — `/로그` 로도 못 찾고
+        # 유저가 문의해도 확인할 방법이 없습니다.
+        try:
+            await add_activity_log(
+                interaction.guild.id, "gacha", interaction.user.id,
+                interaction.user.display_name,
+                (f"[{results[0]['name']}] 뽑기 당첨 (-{outcome['spent']:,}P)"
+                 if count == 1 else
+                 f"{filled}연차 뽑기 (-{outcome['spent']:,}P) — "
+                 + ", ".join(f"{n}x{c}" for _, n, c in summarize_results(results))))
+        except Exception as e:
+            print(f"[Gacha] 활동 기록 실패: {type(e).__name__}: {e}", flush=True)
+
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            # 이미 지급까지 끝난 상태라 되돌리지 않습니다. 화면만 못 본
+            # 것이므로 무엇이 일어났는지 로그에 남깁니다.
+            print(f"[Gacha] 결과 전송 실패(지급은 완료됨): "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     @discord.ui.button(label="1회 뽑기 실행", style=discord.ButtonStyle.primary,
                        emoji="🎲", custom_id="gacha_roll_btn")
@@ -559,7 +584,10 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
 
         settings = await get_gacha_settings(interaction.guild.id)
         items = settings.get("items", [])
-        new_id = max([item.get("id", 0) for item in items], default=0) + 1
+        # ⚠️ `max(id)+1` 로 만들면 **두 관리자가 동시에 추가할 때 같은 id 가
+        # 두 번 나옵니다.** 그러면 재고 수정(`items.$.stock`)이 엉뚱한 항목을
+        # 고치고 삭제는 둘 다 지웁니다. 서버에서 원자적으로 받아 옵니다.
+        new_id = await next_gacha_item_id(interaction.guild.id)
 
         new_item = {
             "id": new_id,

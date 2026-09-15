@@ -87,25 +87,9 @@ import asyncio, utils.verify_db as vdb
 (실제로 `BackupChannelView` 를 지운 채 배포해 "적시에 응답하지 않았어요"가 났습니다).
 UI 를 건드렸으면 **콜백을 실제로 호출**해 보세요.
 
-```bash
-# Select 콜백을 가짜 Interaction 으로 전부 실행 (예외가 나면 그 자리에서 잡힙니다)
-PYTHONIOENCODING=utf-8 MONGO_URI= python -c "
-import asyncio, cogs.backup as B
-class R:
-    def __init__(s): s.n=0
-    async def send_message(s,*a,**k): s.n+=1
-    async def defer(s,*a,**k): s.n+=1
-class I:
-    def __init__(s): s.guild=G(); s.response=R(); s.followup=R(); s.user=type('U',(),{'id':1})()
-class G:
-    id=1; me=object()
-    def get_channel(s,c): return None
-async def m():
-    for v in ('snap','list','file','restore','chan','sendnow','status'):
-        sel=B.BackupMenu(); sel._values=[v]; await sel.callback(I())
-        print('OK', v)
-asyncio.run(m())"
-```
+Select 은 `sel = Menu(); sel._values = ["값"]; await sel.callback(가짜Inter)`
+로 **전부 한 번씩 눌러 봅니다.** `tests/ui_all.py` `tests/modals.py` 가
+이미 그렇게 하고 있으니 새 메뉴를 만들면 거기에 값을 더하세요.
 
 ## 아키텍처
 
@@ -117,10 +101,10 @@ asyncio.run(m())"
 
 | | 포인트 이코노미 | 인증 / 링크 보호 |
 | :--- | :--- | :--- |
-| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` | `verify` `link_guard` `roblox_link` |
+| Cog | `checkin` `chat_reward` `shop` `gacha` `lotto` `report` `blacklist` `logs` `backup` `quest` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
 | 보조 모듈 | `utils/health.py`(공용) | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
-| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
+| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` `lotto_settings` `lotto_tickets` `lotto_draws` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
 
 `verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
 
@@ -246,9 +230,9 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 ### 원본에 멘션이 없는 채널이 더 많습니다 (바이옴 알림 멘션)
 
 위(원본 멘션 살리기)는 **본문에 멘션을 적어 보내는 매크로**에만 해당합니다.
-매크로 채널의 MultiScope 는 **임베드와 링크 버튼만** 보냅니다 — 멘션이
-아예 없어서 살릴 것도 없고, 그래서 희귀 바이옴이 떠도 **아무에게도 알림이
-가지 않았습니다.** 그래서 봇이 직접 붙이는 경로(`notify_rules`)가 있습니다.
+매크로 채널은 **임베드와 링크 버튼만** 보내 살릴 멘션이 아예 없었고, 그래서
+희귀 바이옴이 떠도 **아무에게도 알림이 가지 않았습니다.** 봇이 직접 붙이는
+경로(`notify_rules`)가 그래서 있습니다.
 
 ```
 ① 원본 본문의 멘션      → 그대로 둡니다 (기존 동작)
@@ -257,19 +241,18 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 ```
 
 - **바이옴 이름은 임베드 안에서만 읽습니다.** `biome_haystack()` 이
-  `message.content` 를 보지 않는 것은 실수가 아닙니다. 누군가 채팅에
+  `message.content` 를 보지 않는 것은 실수가 아닙니다 — 누군가 채팅에
   `DREAMSPACE` 라고 치는 것만으로 6,500명이 호출되면 **되돌릴 수 없습니다.**
-  `_guard_message` 가 이미 웹훅 메시지만 다루지만, 전원 호출을 그 검사
-  하나에 걸어 두지 않습니다.
+  `_guard_message` 가 이미 웹훅만 다루지만, 전원 호출을 검사 하나에
+  걸어 두지 않습니다.
 - **`@everyone` 규칙은 채널·카테고리를 반드시 지정해야 합니다.** UI 가
   범위 없는 저장을 거부하고 `match_notify_rule()` 도 그런 규칙을 건너뜁니다.
   손으로 고친 설정이 들어와도 전원 호출 통로가 되지 않게 하는 **두 겹**이니
   한 겹으로 줄이지 마세요.
-- **⚠️ 같은 링크라고 알림을 막지 마세요.** "같은 링크면 30분간 생략" 을
-  넣었다 걷어냈습니다(2026-09-12). **링크는 그대로인 채 바이옴만 바뀌므로**
-  00:10 DREAMSPACE 뒤 00:25 CYBERSPACE 가 창에 걸려 묻혔습니다. 바이옴은
-  길어야 10분이라 30분 창은 **다음 희귀 바이옴을 통째로 삼킵니다.** 도배가
-  실제로 생기면 키를 **(링크 + 바이옴)** 으로 잡고 창을 바이옴보다 짧게
+- **⚠️ 같은 링크라고 알림을 막지 마세요.** **링크는 그대로인 채 바이옴만
+  바뀌므로**, 링크 기준 쿨타임은 **다음 희귀 바이옴을 통째로 삼킵니다**
+  (30분 창을 넣었다 걷어냈습니다 — 경위는 LESSONS). 도배가 실제로 생기면
+  키를 **(링크 + 바이옴)** 으로 잡고 창을 바이옴(최대 10분)보다 짧게
   두세요 — **링크만으로는 무엇을 해도 틀립니다.**
   (`tests/notify_mention.py` 6번이 이 자리를 지킵니다)
 - 규칙은 **처음 맞는 것 하나만** 씁니다. 합치면 좁은 규칙이 넓은 규칙에 먹혀
@@ -277,19 +260,16 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
 - 이름 비교는 대소문자·공백·기호를 지우고 **들어있는지**로 봅니다.
 - **바이옴 종료 임베드에는 붙이지 않습니다**(`notify_exclude`, 기본
   `Biome End` · `바이옴 종료`). 종료에도 같은 이름이 들어 있어, 없으면 뜰 때와
-  끝날 때 두 번 울립니다. 걸리면 규칙 멘션도 임베드 끌어올림도 전부 막습니다.
-  (실제 종료 임베드에는 **링크가 없어** 여기까지 오지도 않습니다 — 안전망)
-- **매크로마다 임베드가 다릅니다.** 제목 배치도(위 참조) 링크 위치도
-  필드·본문·버튼으로 제각각입니다. **하나에서 확인하고 "된다"고 하지
-  마세요** — `tests/notify_mention.py` 에 7종을 전부 넣어 두었습니다.
-- **임베드의 유저 멘션(`<@…>`)은 끌어올리지 않습니다.** Biome Forward 가
+  끝날 때 **두 번** 울립니다. 걸리면 규칙 멘션도 끌어올림도 전부 막습니다.
+- **매크로마다 임베드가 다릅니다.** 제목 배치도 링크 위치(필드·본문·버튼)도
+  제각각이라 **하나만 보고 "된다"고 하지 마세요** —
+  `tests/notify_mention.py` 에 7종을 넣어 두었습니다.
+- **임베드의 유저 멘션(`<@…>`)은 끌어올리지 않습니다.** 어떤 매크로는
   바닥글에 제작자 연락처를 유저 멘션으로 넣는데, 올리면 **바이옴이 뜰 때마다
   그 사람에게 알림이 갑니다.** `ROLE_MENTION_RE` 가 `<@&…>` 만 잡고
   `allowed_mentions.users` 가 False 인 이유입니다.
-- **작성자·바닥글은 바이옴 판정에서 뺍니다**(`embed_texts(meta=False)`).
-  매크로 이름·버전이 들어가서, 섞으면 **이름에 바이옴이 든 매크로의 모든
-  메시지가 희귀 바이옴이 됩니다.** 반대로 멘션 수집은 **전부** 훑습니다 —
-  역할 멘션은 어디에 적혀 있든 사람에게 닿아야 합니다.
+- 바이옴 판정은 작성자·바닥글을 뺍니다(위 참조). 반대로 **멘션 수집은
+  전부** 훑습니다 — 역할 멘션은 어디에 적혀 있든 사람에게 닿아야 합니다.
 - **제외 단어를 `Ended` 처럼 짧게 두지 마세요.** 비교가 '들어있는지'라
   `Recommended` `Extended` 안에도 들어 있습니다. 그러면 **시작 알림이
   조용히 안 울립니다** — 잘못 울리는 것보다 찾기 어렵습니다.
@@ -697,6 +677,33 @@ Caddy(:80,:443) ──TLS 종료──> 봇 Flask(127.0.0.1:8080)
 - **ephemeral 메시지는 `interaction.message.edit()` 으로 못 고칩니다.**
   컴포넌트 상호작용의 `response.edit_message` 만 통합니다. 예전 코드는 이걸
   `except: pass` 로 삼켜 **품절 잠금이 한 번도 화면에 반영된 적이 없었습니다.**
+
+
+## 복권은 '사행행위가 아닌 선'을 설계로 지킵니다
+
+`/복권` — 1~25 중 5개, 매주 **토요일 20:00(KST)** 추첨, 1인 5장.
+`/복권설정` 로 가격 · 1~5등 상금 · 발표 채널을 정합니다.
+
+- **이 세 가지가 합법선입니다. 바꾸지 마세요.**
+  ① 포인트를 **돈으로 살 수 없음**(결제 경로 자체가 없습니다)
+  ② 상금은 **포인트뿐** — 현금·기프티콘·로벅스로 바꿔주지 않습니다
+  ③ **참가비를 모아 당첨자에게 몰아주지 않습니다** — 소각하고 상금은
+  서버가 고정액으로 줍니다. "여러 사람으로부터 재물을 모아 우연으로
+  득실을 결정" 이 사행행위규제법 제2조의 정의입니다.
+- **환수율을 설정 화면에 띄웁니다.** 1개만 맞아도 5등이라 표의 **45.6%가
+  당첨**입니다. 운영진이 상금 다섯 개를 손으로 정하는데 감이 오지 않아,
+  100%를 넘기면 **포인트가 무한히 불어납니다.** 100% 이상은 빨간 경고.
+- **회차 경계는 토요일 20:00 정각**입니다. 그 시각부터는 다음 회차 —
+  여기가 새면 **당첨 번호를 보고 표를 사는 구멍**이 됩니다.
+- **자리를 먼저 잡고 포인트를 뺍니다.** 반대로 하면 한도 초과를 되돌리는
+  사이에 봇이 죽었을 때 **유저가 포인트만 잃습니다.** 이 순서면 최악이라도
+  공짜 표 한 장이라, 손해가 유저 쪽으로 가지 않습니다.
+- **추첨은 몇 번 돌려도 같아야 합니다.** 번호는 `$setOnInsert` 로 한 번만
+  확정하고, 지급은 문서의 `paid` 를 필터에 넣어 서버 측에서 판정합니다.
+  이미 발표한 번호가 바뀌거나 상금이 두 번 나가면 **되돌릴 수 없습니다.**
+- 봇이 20:00 에 꺼져 있으면 그 회차는 영영 추첨되지 않으므로
+  `draw_catchup` 이 밀린 회차를 스스로 찾습니다(멱등이라 겹쳐도 안전).
+- 발표는 **당첨자만 멘션**합니다. 매주 전원을 부를 일이 아닙니다.
 
 ## 이미 밟은 지뢰 → **`docs/LESSONS.md`**
 

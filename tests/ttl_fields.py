@@ -22,7 +22,8 @@ from fakes import note
 DB_COLS = ["users_col", "settings_col", "shop_col", "gacha_col", "logs_col",
            "blacklist_col", "boost_col", "snapshot_col", "backup_set_col",
            "checkin_set_col", "quest_set_col", "quest_prog_col",
-           "quest_state_col", "event_col"]
+           "quest_state_col", "event_col",
+           "lotto_set_col", "lotto_ticket_col", "lotto_draw_col"]
 VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
             "watermark_col", "guardkey_col", "usage_col", "logref_col",
             "roblox_col", "biome_col"]

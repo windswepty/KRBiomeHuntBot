@@ -2895,9 +2895,10 @@ BIOME_PERIODS = [("오늘", 1), ("7일", 7), ("30일", 30)]
 #   · 새 바이옴이 감지되면 자동으로 들어옵니다 (기록되는 순간 목록에 뜹니다)
 #   · 이 기간 동안 한 번도 안 뜬 바이옴은 자동으로 빠집니다
 # 게임에 바이옴이 추가·삭제돼도 사람이 목록을 손볼 일이 없어야 합니다.
-BIOME_ACTIVE_DAYS = 30
-# 처음 등장한 지 이만큼 안 지난 바이옴은 🆕 로 표시합니다.
-BIOME_NEW_DAYS = 7
+#
+# 규칙에 적어 둔 **희귀 바이옴은 이 기간과 무관하게 항상** 남습니다
+# (설정한 것이 안 뜨고 있다는 사실 자체가 봐야 할 정보입니다).
+BIOME_ACTIVE_DAYS = 7
 
 
 def rare_biome_names(settings: dict) -> list[str]:
@@ -2956,10 +2957,7 @@ def active_biomes(agg: dict, days: int = BIOME_ACTIVE_DAYS) -> tuple[list[str], 
     return live, dropped
 
 
-def is_new_biome(v: dict, days: int = BIOME_NEW_DAYS) -> bool:
-    """이 기간 안에 처음 등장한 바이옴인지 (게임에 새로 추가된 것일 수 있습니다)."""
-    first = v.get("first", "")
-    return bool(first) and first != "9999-99-99" and first >= _biome_day_str(days)
+
 
 
 def _biome_today() -> str:
@@ -3005,14 +3003,12 @@ def _biome_lines(agg: dict, rare: list[str], names: list[str]) -> list[str]:
         v = agg.get(name) or _blank_biome()
         is_rare = biome_matches(rare, name) is not None
         mark = "⭐" if is_rare else "•"
-        # 게임에 새로 추가된 바이옴일 수 있으므로 눈에 띄게 표시합니다.
-        new = " 🆕" if is_new_biome(v) else ""
         servers = len(v["servers"]) if isinstance(v["servers"], set) else 0
         bell = ""
         if is_rare:
             bell = f" · 🔔{v['notified']}" if v["notified"] else " · 🔕"
-        srv = f" · 서버 {servers}곳" if servers else ""
-        out.append(f"{mark} **{name}**{new} — {v['count']:,}회{srv}{bell}\n"
+        srv = f" · 매크로 채널 {servers}곳" if servers else ""
+        out.append(f"{mark} **{name}** — {v['count']:,}회{srv}{bell}\n"
                    f"　누적 {v['total']:,}회 · 마지막 {v['last'] or '-'}")
     return out
 
@@ -3086,7 +3082,7 @@ def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
                 name="✅ 희귀 바이옴 알림",
                 value=f"이 기간에 뜬 희귀 바이옴 **{rare_now:,}회** 모두 알림이 나갔습니다.",
                 inline=False)
-        embed.set_footer(text="⭐ = 희귀 바이옴 · 🆕 = 최근 처음 등장")
+        embed.set_footer(text="⭐ = 알림 규칙에 등록된 희귀 바이옴")
     else:
         embed.set_footer(text="알림 규칙이 없어 희귀 바이옴 구분이 없습니다.")
 
@@ -3202,7 +3198,7 @@ KST = timezone(timedelta(hours=9))
 
 # 보드 갱신 빈도 제한. 보호는 시간당 수백 건이라 매번 고치면 디스코드
 # 편집 한도에 닿습니다. 창이 닫힌 뒤 **최신 값으로 한 번 더** 고칩니다.
-BOARD_REFRESH_INTERVAL = 30.0
+BOARD_REFRESH_INTERVAL = 60.0
 _last_board_refresh: dict[int, float] = {}
 _board_trailing: dict[int, asyncio.Task] = {}
 # 동시 요청이 보드를 **두 개 만들지** 않도록 하는 길드별 잠금
@@ -3212,7 +3208,7 @@ _board_locks: dict[int, asyncio.Lock] = {}
 def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
                             settings: dict) -> discord.Embed:
     rare = rare_biome_names(settings)
-    agg = summarize_biomes(buckets, 30)
+    agg = summarize_biomes(buckets, BIOME_ACTIVE_DAYS)
 
     embed = discord.Embed(title="🌋 희귀 바이옴 실시간 카운터",
                           color=discord.Color.gold())
@@ -3238,10 +3234,9 @@ def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
         for name in names:
             v = agg[name]
             servers = len(v["servers"]) if isinstance(v["servers"], set) else 0
-            srv = f" · 서버 {servers}곳" if servers else ""
-            new = " 🆕" if is_new_biome(v) else ""
-            out.append(f"**{name}**{new} — 오늘 **{v['today']:,}** · "
-                       f"30일 **{v['count']:,}** · 누적 **{v['total']:,}**{srv}")
+            srv = f" · 매크로 채널 {servers}곳" if servers else ""
+            out.append(f"**{name}** — 오늘 **{v['today']:,}** · "
+                       f"7일 **{v['count']:,}** · 누적 **{v['total']:,}**{srv}")
         return out
 
     if rare:
@@ -3261,15 +3256,14 @@ def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
     all_total = sum(v["total"] for v in agg.values())
     embed.description = (
         f"오늘 **{today_total:,}회** 등장 · 누적 **{all_total:,}회**\n"
-        f"-# 갱신 <t:{int(datetime.now(timezone.utc).timestamp())}:R> · "
-        "**바이옴 시작 임베드 하나 = 1회** (종료는 세지 않습니다)")
+        "-# 1분마다 갱신 · **바이옴 시작 임베드 하나 = 1회** (종료는 세지 않습니다)")
     if dropped:
         embed.add_field(
             name="💤 빠진 바이옴",
             value=f"**{len(dropped)}종**이 최근 {BIOME_ACTIVE_DAYS}일간 뜨지 않아 "
                   "목록에서 빠졌습니다. 다시 뜨면 자동으로 돌아옵니다.",
             inline=False)
-    embed.set_footer(text="자동 갱신 · 🆕 = 최근 처음 등장 · 목록은 스스로 유지됩니다")
+    embed.set_footer(text="1분마다 자동 갱신 · 목록은 스스로 유지됩니다")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
@@ -3379,7 +3373,9 @@ class LinkGuard(commands.Cog):
 
     # 바이옴이 안 떠도 **날짜가 바뀌면 '오늘' 이 0 이 되어야** 합니다.
     # 등장할 때만 갱신하면 자정 넘어 조용한 날 어제 숫자가 그대로 남습니다.
-    @tasks.loop(minutes=10)
+    # 화면에 "1분마다 갱신" 이라고 적혀 있으므로 주기도 1분이어야 합니다 —
+    # 문구와 실제가 어긋나면 그 자체가 거짓 정보입니다.
+    @tasks.loop(minutes=1)
     async def board_refresh(self):
         for guild in self.bot.guilds:
             try:

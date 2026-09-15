@@ -266,16 +266,16 @@ async def main():
                       upsert=True)
 
     await put("현역바이옴", 2, 5)
-    await put("죽은바이옴", 45, 9)        # 45일 전 이후로 소식 없음
-    await put("경계바이옴", 29, 3)        # 아직 30일 안쪽
+    await put("죽은바이옴", 10, 9)        # 10일 전 이후로 소식 없음
+    await put("경계바이옴", 6, 3)         # 아직 7일 안쪽
     await put("새바이옴", 0, 2)           # 오늘 처음
 
     rows = await vdb.get_biome_buckets(GUILD.id, 90)
     agg = LG.summarize_biomes(rows, 30)
     live, dropped = LG.active_biomes(agg)
     note("현역바이옴" in live, "최근에 뜬 것은 대상에 남음")
-    note("경계바이옴" in live, "29일 전은 아직 대상 (경계)")
-    note("죽은바이옴" in dropped, "45일간 안 뜬 것은 자동 제외", str(dropped))
+    note("경계바이옴" in live, "6일 전은 아직 대상 (경계)")
+    note("죽은바이옴" in dropped, "7일 넘게 안 뜬 것은 자동 제외", str(dropped))
     note("새바이옴" in live, "새로 감지된 바이옴은 자동 추가됨")
 
     print("")
@@ -290,13 +290,12 @@ async def main():
     note("다시 뜨면" in drop_field, "돌아온다는 것을 알려줌")
 
     print("")
-    print("  🆕 는 최근 처음 등장한 것에만 붙어야 합니다")
-    note(LG.is_new_biome(agg["새바이옴"]), "오늘 처음 등장 → 🆕")
-    note(not LG.is_new_biome(agg["경계바이옴"]), "29일 전부터 있던 것은 🆕 아님")
-    note("🆕" in blob, "화면에 🆕 가 보임")
+    print("  화면에 NEW 같은 표기가 붙지 않아야 합니다")
+    # 기록이 이제 막 쌓이기 시작한 시점에는 **전부** 신규라 표시가 도배됩니다.
+    note("🆕" not in blob and "NEW" not in blob, "신규 표기가 없음")
 
     print("")
-    print("  ⚠️ 규칙에 적어 둔 희귀 바이옴은 한 달을 쉬어도 남아야 합니다")
+    print("  ⚠️ 규칙에 적어 둔 희귀 바이옴은 오래 쉬어도 남아야 합니다")
     # 설정해 둔 것이 안 뜨고 있다는 사실 자체가 봐야 할 정보입니다.
     await setup()
     await put("DREAMSPACE", 60, 1)        # 두 달 전 이후 소식 없음
@@ -309,7 +308,7 @@ async def main():
     print("")
     print("  다시 뜨면 자동으로 돌아와야 합니다")
     await setup()
-    await put("부활바이옴", 50, 3)
+    await put("부활바이옴", 20, 3)
     rows = await vdb.get_biome_buckets(GUILD.id, 90)
     live, dropped = LG.active_biomes(LG.summarize_biomes(rows, 30))
     note("부활바이옴" in dropped, "일단 빠져 있음")

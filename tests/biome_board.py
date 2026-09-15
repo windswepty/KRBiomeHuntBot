@@ -144,8 +144,12 @@ async def main():
     for name in RARE:
         note(name in blob, f"{name} 이 항상 보임 (0회여도)")
     note("SNOWY" in blob, "그 밖의 바이옴 칸에 흔한 것이 보임")
-    note("오늘" in blob and "30일" in blob and "누적" in blob,
-         "오늘 · 30일 · 누적 이 전부 표시됨")
+    note("오늘" in blob and "7일" in blob and "누적" in blob,
+         "오늘 · 7일 · 누적 이 전부 표시됨")
+    note("매크로 채널" in blob, "'서버' 대신 '매크로 채널' 로 표기", blob[:60])
+    note("1분마다" in blob, "갱신 주기를 문구로 알림 (흘러가는 상대시각 아님)")
+    note("<t:" not in blob, "계속 바뀌는 상대시각을 쓰지 않음")
+    note("🆕" not in blob and "NEW" not in blob, "신규 표기가 없음")
 
     print("")
     print("  규칙에 GLITCH 로 적어 뒀어도 기록이 GLITCHED 면 세야 합니다")
@@ -339,8 +343,9 @@ async def main():
     print("=== 10. 주기 갱신 루프가 등록되어 있어야 ===")
     # 바이옴이 안 떠도 자정이 지나면 '오늘' 이 0 이 되어야 합니다.
     note(hasattr(lg, "board_refresh"), "board_refresh 루프가 있음")
-    note(lg.board_refresh.minutes == 10, "10분 주기",
-         str(lg.board_refresh.minutes))
+    # 화면에 "1분마다 갱신" 이라고 적혀 있으므로 주기도 1분이어야 합니다.
+    # 문구와 실제가 어긋나면 그 자체가 거짓 정보입니다.
+    note(lg.board_refresh.minutes == 1, "1분 주기", str(lg.board_refresh.minutes))
     note(lg.board_refresh.get_task() is not None or True, "")
     note(hasattr(lg, "board_refresh_error"),
          "예외로 멈췄을 때 되살리는 핸들러가 있음")

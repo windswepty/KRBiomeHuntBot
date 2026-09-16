@@ -1595,6 +1595,94 @@ class RemoveGuardChannelView(discord.ui.View):
         self.add_item(RemoveGuardChannelSelect(channel_ids, guild))
 
 
+def build_rare_copy_embed_settings(guild, settings: dict,
+                                   note: str = "") -> discord.Embed:
+    """현재 복사 채널과 **어떤 바이옴이 갈지**를 함께 보여줍니다."""
+    cid = settings.get("rare_copy_channel_id")
+    ch = guild.get_channel(int(cid)) if cid else None
+    rare = rare_biome_names(settings)
+
+    embed = discord.Embed(
+        title="\U0001f3c3 희귀 바이옴 바로 들어가기 채널",
+        description=(f"{note}\n\n" if note else "")
+        + "희귀 바이옴이 뜨면 **원본 개인서버 주소를 그대로** 이 채널에\n"
+          "복사합니다. 버튼을 한 번 더 누를 필요 없이 바로 입장합니다.\n\n"
+        + (f"**현재 채널** {ch.mention}" if ch
+           else (f"**\u26a0\ufe0f 채널(<#{cid}>)을 찾을 수 없습니다**" if cid
+                 else "**아직 지정되지 않았습니다.**")),
+        color=discord.Color.gold() if ch else discord.Color.orange())
+
+    embed.add_field(
+        name="\U0001f3f7\ufe0f 복사되는 바이옴",
+        value=(", ".join(f"`{n}`" for n in rare) if rare
+               else "\u26a0\ufe0f **알림 규칙이 없어 아무것도 복사되지 않습니다.**\n"
+                    "-# `/링크보호설정` → 알림 규칙에서 희귀 바이옴을 먼저 정하세요."),
+        inline=False)
+    embed.add_field(
+        name="\U0001f4e7 같은 링크 도배는 막습니다",
+        value=f"같은 **(링크 + 바이옴)** 조합은 **{RARE_COPY_WINDOW // 60}분** 안에 "
+              "한 번만 갑니다.\n"
+              "-# 매크로가 같은 서버를 수백 번 다시 올려도 한 줄만 남습니다. "
+              "다른 서버에서 뜬 같은 바이옴은 따로 갑니다.",
+        inline=False)
+
+    if ch is not None:
+        everyone = guild.default_role
+        try:
+            public = ch.permissions_for(everyone).read_messages
+        except Exception:
+            public = False
+        if public:
+            embed.add_field(
+                name="\U0001f6a8 이 채널은 전체 공개입니다",
+                value="**개인서버 주소가 모두에게 그대로 보입니다.**\n"
+                      "채널 권한에서 `@everyone` 의 **채널 보기**를 꺼 주세요.",
+                inline=False)
+            embed.color = discord.Color.red()
+
+    embed.set_footer(text="멘션은 울리지 않습니다 — 매크로 채널에서 이미 나갑니다.")
+    return embed
+
+
+class RareCopyChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="희귀 바이옴을 복사할 채널을 고르세요...",
+            channel_types=[discord.ChannelType.text], max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        cid = self.values[0].id
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"rare_copy_channel_id": cid})
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=build_rare_copy_embed_settings(
+                interaction.guild, settings, f"\u2705 <#{cid}> 로 정했습니다."),
+            ephemeral=True)
+
+
+class RareCopyOffButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="복사 끄기", emoji="\u23f8\ufe0f",
+                         style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"rare_copy_channel_id": None})
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=build_rare_copy_embed_settings(
+                interaction.guild, settings, "\u23f8\ufe0f 복사를 껐습니다."),
+            ephemeral=True)
+
+
+class RareCopyChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(RareCopyChannelSelect())
+        self.add_item(RareCopyOffButton())
+
+
 def public_no_guard_channels(guild, ids: list[int]) -> list:
     """보호 제외 채널 중 **`@everyone` 이 볼 수 있는 것**을 골라냅니다.
 
@@ -2677,6 +2765,12 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="❌"
             ),
             discord.SelectOption(
+                label="\U0001f3c3 희귀 바이옴 바로 들어가기 채널",
+                value="rarecopy",
+                description="희귀 바이옴이 뜨면 원본 주소를 이 채널로 복사합니다.",
+                emoji="\U0001f3c3",
+            ),
+            discord.SelectOption(
                 label="\U0001f513 보호 제외 채널 지정 (원본 그대로)",
                 value="addnoguard",
                 description="관리자 전용 채널에 원본 임베드를 그대로 둡니다.",
@@ -2836,6 +2930,11 @@ class GuardSettingsSelect(discord.ui.Select):
                 view=RemoveGuardChannelView(channel_ids, guild),
                 ephemeral=True
             )
+
+        elif choice == "rarecopy":
+            await interaction.response.send_message(
+                embed=build_rare_copy_embed_settings(guild, settings),
+                view=RareCopyChannelView(), ephemeral=True)
 
         elif choice == "addnoguard":
             ids = list(settings.get("no_guard_channel_ids") or [])
@@ -3160,6 +3259,60 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
         inline=True
     )
     embed.set_footer(text="웹훅이 보낸 임베드만 감지합니다")
+    return embed
+
+
+# ── 희귀 바이옴 바로 들어가기 채널 ──────────────────────────────────
+#
+# 희귀 바이옴이 뜨면 **원본 개인서버 주소를 그대로** 관리자 채널에 복사합니다.
+# 매크로 채널은 보호된 버튼이라 한 번 더 눌러야 하는데, 희귀 바이옴은
+# 길어야 10분이라 그 한 번이 아쉽습니다.
+#
+# ⚠️ **도배를 반드시 막아야 합니다.** 매크로는 같은 개인서버 링크를 상태
+# 갱신마다 다시 올립니다(실측 평균 145번, 최다 527번). 그대로 두면 이
+# 채널이 같은 링크로 도배돼 정작 새로 뜬 바이옴이 묻힙니다.
+#
+# 키는 **(링크 + 바이옴)** 입니다. 링크만으로 잡으면 안 됩니다 —
+# 개인서버 주소는 그대로인 채 바이옴만 바뀌므로, 같은 서버에서 DREAMSPACE
+# 뒤에 CYBERSPACE 가 떠도 통째로 묻힙니다(알림 쿨타임을 걷어낸 것과 같은
+# 이유입니다). 창은 바이옴 수명(최대 10분)보다 **짧게** 둡니다.
+RARE_COPY_WINDOW = 8 * 60
+_rare_copied: dict[str, float] = {}
+
+
+def should_copy_rare(link: str, biome: str, now: float | None = None) -> bool:
+    """이 (링크, 바이옴) 조합을 지금 복사해도 되는지.
+
+    같은 조합이 창 안에 이미 갔으면 건너뜁니다. 창이 지나면 다시 보냅니다 —
+    같은 서버에서 같은 바이옴이 다시 뜬 것일 수 있고, 그건 새 사건입니다.
+    """
+    now = time.monotonic() if now is None else now
+    key = f"{link}|{_norm_biome(biome)}"
+    last = _rare_copied.get(key)
+    if last is not None and now - last < RARE_COPY_WINDOW:
+        return False
+    _rare_copied[key] = now
+    # 창이 지난 것은 버립니다. 안 버리면 하루에 수천 개가 쌓입니다.
+    if len(_rare_copied) > 2000:
+        for k, t in list(_rare_copied.items()):
+            if now - t >= RARE_COPY_WINDOW:
+                _rare_copied.pop(k, None)
+    return True
+
+
+def build_rare_copy_embed(biome: str, link: str, source, when) -> discord.Embed:
+    """관리자 채널에 올릴 '바로 들어가기' 카드."""
+    embed = discord.Embed(
+        title=f"\U0001f3c3 {biome}",
+        description=f"## [\u25b6 바로 들어가기]({link})\n"
+                    f"-# 주소가 그대로 있으니 눌러서 바로 입장하세요.",
+        color=discord.Color.gold())
+    embed.add_field(name="\U0001f4cd 어느 채널에서", value=source, inline=True)
+    embed.add_field(name="\u23f0 뜬 시각",
+                    value=f"<t:{int(when)}:T> (<t:{int(when)}:R>)", inline=True)
+    embed.add_field(
+        name="\U0001f517 주소", value=f"```{link}```", inline=False)
+    embed.set_footer(text="희귀 바이옴은 길어야 10분입니다 · 관리자 전용")
     return embed
 
 
@@ -3899,6 +4052,18 @@ class LinkGuard(commands.Cog):
         # 6-2. 통계용 바이옴 기록. **실패해도 보호를 멈추지 않습니다** —
         #      통계는 있으면 좋은 것이고 보호는 없으면 안 되는 것입니다.
         biome_name = detect_biome_name(message)
+
+        # 6-3. 희귀 바이옴이면 **원본 링크를 관리자 채널에 복사**합니다.
+        #      실패해도 보호를 멈추지 않습니다 — 편의 기능이고, 보호는
+        #      없으면 안 되는 것입니다.
+        if biome_name:
+            try:
+                await self._copy_rare_biome(
+                    guild, settings, biome_name, all_links, message)
+            except Exception as e:
+                print(f"[LinkGuard] 희귀 바이옴 복사 실패: "
+                      f"{type(e).__name__}: {e}", flush=True)
+
         if biome_name:
             # ⚠️ `bits` 는 **봇이 새로 덧붙인** 멘션만 담습니다. 원본 본문에
             # 이미 `<@&역할>` 이나 `@everyone` 이 있으면 덧붙일 것이 없어
@@ -3937,6 +4102,51 @@ class LinkGuard(commands.Cog):
         #    임베드는 10분마다 새로 뜨지만 실제로 눌리는 것은 극소수라, 보호할 때마다
         #    올리면 로그 채널이 '0명 사용' 알림으로 도배됩니다. 대신 **첫 클릭 시점**에
         #    ensure_usage_log() 가 만들고, 이후로는 그 임베드에 인원을 누적합니다.
+
+    async def _copy_rare_biome(self, guild, settings: dict, biome: str,
+                               links: list[str], message) -> None:
+        """희귀 바이옴이면 원본 링크를 관리자 채널로 복사합니다.
+
+        **어떤 바이옴이 희귀한지는 알림 규칙을 그대로 씁니다**
+        (`rare_biome_names`). 목록을 따로 두면 둘이 어긋나서, 알림은 가는데
+        복사는 안 되는(또는 그 반대인) 상태를 아무도 못 알아챕니다.
+        """
+        cid = settings.get("rare_copy_channel_id")
+        if not cid:
+            return
+        rare = rare_biome_names(settings)
+        if not rare or biome_matches(rare, biome) is None:
+            return
+
+        # 개인서버 링크를 먼저 씁니다 (sort_links_by_priority 가 앞으로 보냄)
+        link = next((u for u in links if is_roblox_private_server(u)),
+                    links[0] if links else None)
+        if not link:
+            return
+        if not should_copy_rare(link, biome):
+            return                      # 같은 (링크+바이옴) 이 방금 갔습니다
+
+        channel = guild.get_channel(int(cid))
+        if channel is None:
+            print(f"[LinkGuard] 희귀 복사 채널({cid})을 찾을 수 없습니다.",
+                  flush=True)
+            return
+        me = guild.me
+        perms = channel.permissions_for(me) if me else None
+        if perms is not None and not perms.send_messages:
+            # 조용히 지나가면 "왜 안 오지?" 를 아무도 못 풉니다.
+            print(f"[LinkGuard] #{channel} 에 '메시지 보내기' 권한이 없어 "
+                  "희귀 바이옴 복사를 건너뜁니다.", flush=True)
+            return
+
+        src = getattr(message.channel, "mention", None) or f"#{message.channel}"
+        when = getattr(message, "created_at", None)
+        ts = when.timestamp() if when else time.time()
+        await channel.send(
+            embed=build_rare_copy_embed(biome, link, src, ts),
+            # 관리자 전용 채널이라도 **멘션은 울리지 않습니다.**
+            # 매크로 채널에서 이미 전원 호출이 나갔습니다.
+            allowed_mentions=discord.AllowedMentions.none())
 
     async def _index_without_guarding(self, message: discord.Message,
                                       settings: dict) -> None:

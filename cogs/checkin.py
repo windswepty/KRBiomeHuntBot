@@ -1,3 +1,4 @@
+import asyncio
 import re
 import discord
 from discord.ext import commands
@@ -8,6 +9,130 @@ from utils.database import (
     get_checkin_settings, save_checkin_settings, streak_reward, next_cycle_day,
     bump_quest_progress, take_checkin_rank, bump_event_progress,
 )
+
+# ── 포인트 랭킹 (30등까지, 10명씩 3쪽) ──────────────────────────────
+
+RANK_PAGE_SIZE = 10
+RANK_PAGES = 3
+RANK_LIMIT = RANK_PAGE_SIZE * RANK_PAGES
+RANK_MEDALS = ["🥇", "🥈", "🥉"]
+
+
+async def resolve_members(guild, ids: list[int]) -> dict:
+    """표시용 멤버를 모읍니다. **캐시에 없는 사람만 한꺼번에** 받아옵니다.
+
+    ⚠️ 예전에는 빠진 사람마다 `fetch_member` 를 **순서대로** 불렀습니다.
+    REST 왕복 하나에 100~200ms 라 10명이면 최대 2초, 30명이면 6초입니다 —
+    그 구조로 `/포인트랭킹` 이 실제로 3초 제한을 넘겨 죽었습니다.
+    한꺼번에 보내면 30명이라도 왕복 한 번 값으로 끝납니다.
+
+    대부분은 캐시에 있습니다(SERVER MEMBERS INTENT). 캐시에 없는 사람은
+    보통 **서버를 나간 사람**이라 `fetch_member` 도 실패하고, 그러면
+    '서버 퇴장' 으로 표시됩니다.
+    """
+    out = {uid: guild.get_member(uid) for uid in ids}
+    missing = [uid for uid, m in out.items() if m is None]
+    if missing:
+        got = await asyncio.gather(
+            *[guild.fetch_member(uid) for uid in missing],
+            return_exceptions=True)
+        for uid, m in zip(missing, got):
+            out[uid] = m if not isinstance(m, BaseException) else None
+    return out
+
+
+async def build_rank_page(interaction: discord.Interaction, page: int):
+    """한 쪽을 그립니다. (임베드, 전체 인원) 을 돌려줍니다.
+
+    30명을 한 번에 읽고 잘라 씁니다 — 쪽마다 따로 읽으면 그 사이 순위가
+    바뀌어 **같은 사람이 두 쪽에 나오거나 아무 쪽에도 없게** 됩니다.
+    """
+    guild = interaction.guild
+    rows = await get_top_users(guild.id, limit=RANK_LIMIT)
+    my_rank, my_points = await get_user_rank(guild.id, interaction.user.id)
+    total = len(rows)
+
+    if not rows:
+        embed = discord.Embed(
+            title="🏆 포인트 랭킹 TOP 30",
+            description="아직 등록된 포인트 랭킹 정보가 없습니다.",
+            color=discord.Color.gold())
+        return embed, 0
+
+    page = max(0, min(page, RANK_PAGES - 1))
+    start = page * RANK_PAGE_SIZE
+    chunk = rows[start:start + RANK_PAGE_SIZE]
+
+    members = await resolve_members(guild, [r["user_id"] for r in chunk])
+
+    lines = []
+    for offset, info in enumerate(chunk):
+        idx = start + offset + 1
+        member = members.get(info["user_id"])
+        who = (f"**{member.display_name}** ({member.mention})" if member
+               else "*알 수 없는 유저 (서버 퇴장)*")
+        medal = RANK_MEDALS[idx - 1] if idx <= 3 else f"`{idx}위`"
+        lines.append(f"{medal} {who} — **{info['points']:,} P**")
+
+    lo, hi = start + 1, start + len(chunk)
+    embed = discord.Embed(
+        title="🏆 한바헌 포인트 랭킹 TOP 30",
+        description=f"포인트가 가장 많은 상위 30명입니다. "
+                    f"(**{lo}~{hi}위** · {page + 1}/{RANK_PAGES}쪽)",
+        color=discord.Color.gold())
+    embed.add_field(name="📊 보유 포인트 순위", value="\n".join(lines),
+                    inline=False)
+
+    my_medal = RANK_MEDALS[my_rank - 1] if my_rank <= 3 else f"`{my_rank}위`"
+    embed.add_field(
+        name="👤 내 랭킹 정보",
+        value=f"• **현재 순위**: {my_medal} (전체 유저 중 {my_rank}위)\n"
+              f"• **내 보유 포인트**: **{my_points:,} P**",
+        inline=False)
+    embed.set_footer(text="아래 버튼으로 쪽을 넘길 수 있습니다 · "
+                          "랭킹은 활동에 따라 실시간으로 갱신됩니다.")
+    return embed, total
+
+
+class RankPageButton(discord.ui.Button):
+    """쪽 번호를 **custom_id 에 박아** 둡니다.
+
+    영구 View 는 인스턴스를 모두가 공유하므로 `self` 에 '지금 몇 쪽'을
+    들고 있으면 남의 화면까지 오염됩니다. 쪽마다 버튼을 따로 두면
+    상태를 들 필요가 없고, 재시작 뒤에도 그대로 동작합니다.
+    """
+
+    def __init__(self, page: int, active: bool = False, empty: bool = False):
+        lo = page * RANK_PAGE_SIZE + 1
+        hi = (page + 1) * RANK_PAGE_SIZE
+        super().__init__(
+            label=f"{lo}~{hi}위",
+            style=(discord.ButtonStyle.primary if active
+                   else discord.ButtonStyle.secondary),
+            # 보고 있는 쪽과 **사람이 없는 쪽**은 누를 수 없습니다.
+            disabled=active or empty,
+            custom_id=f"rank:page:{page}")
+        self._page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        # 컴포넌트 상호작용이라 `thinking` 없이 **편집을 예약**합니다.
+        # 새 메시지를 보내면 쪽을 넘길 때마다 화면이 쌓입니다.
+        await interaction.response.defer()
+        embed, total = await build_rank_page(interaction, self._page)
+        await interaction.edit_original_response(
+            embed=embed, view=RankView(self._page, total))
+
+
+class RankView(discord.ui.View):
+    """영구 View — 재시작 뒤에도 쪽 버튼이 살아 있어야 합니다."""
+
+    def __init__(self, page: int = 0, total: int = RANK_LIMIT):
+        super().__init__(timeout=None)
+        for p in range(RANK_PAGES):
+            # 그 쪽에 사람이 한 명도 없으면 눌러도 빈 화면이라 잠급니다.
+            self.add_item(RankPageButton(
+                p, active=(p == page), empty=(total <= p * RANK_PAGE_SIZE)))
+
 
 def _next_goal(streak: int, settings: dict) -> tuple[int, int] | None:
     """다음에 올 목표(주기 달성일 또는 특별 보상) 중 가장 가까운 것."""
@@ -412,7 +537,8 @@ class CheckIn(commands.Cog):
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="포인트랭킹", description="서버의 포인트 보유 순위 TOP 10을 확인합니다.")
+    @app_commands.command(name="포인트랭킹",
+                          description="서버의 포인트 보유 순위 TOP 30을 확인합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
     # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가
     # **DM 목록에 아예 띄우지 않으므로** 방어 코드를 흩뿌릴 필요가 없습니다.
@@ -422,62 +548,9 @@ class CheckIn(commands.Cog):
         # 읽는데, 몰리는 순간 그 왕복이 3초를 넘기면 10062 로 명령어가 통째로
         # 죽습니다(실측: /포인트랭킹 이 실제로 그렇게 실패했습니다).
         await interaction.response.defer(ephemeral=True, thinking=True)
-        top_users = await get_top_users(interaction.guild.id, limit=10)
-        my_rank, my_points = await get_user_rank(interaction.guild.id, interaction.user.id)
-
-        if not top_users:
-            embed = discord.Embed(
-                title="🏆 포인트 랭킹 TOP 10",
-                description="아직 등록된 포인트 랭킹 정보가 없습니다.",
-                color=discord.Color.gold()
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🏆 한바헌 포인트 랭킹 TOP 10",
-            description="서버에서 가장 많은 포인트를 보유한 상위 10명의 유저입니다!\n",
-            color=discord.Color.gold()
-        )
-
-        rank_medals = ["🥇", "🥈", "🥉"]
-
-        ranking_lines = []
-        for idx, u_info in enumerate(top_users, start=1):
-            uid = u_info["user_id"]
-            pts = u_info["points"]
-            
-            # 캐시 조회 및 API fetch 시도
-            member = interaction.guild.get_member(uid)
-            if not member:
-                try:
-                    member = await interaction.guild.fetch_member(uid)
-                except Exception:
-                    member = None
-
-            if member:
-                user_str = f"**{member.display_name}** ({member.mention})"
-            else:
-                user_str = "*알 수 없는 유저 (서버 퇴장)*"
-
-            medal = rank_medals[idx - 1] if idx <= 3 else f"`{idx}위`"
-            ranking_lines.append(f"{medal} {user_str} — **{pts:,} P**")
-
-        embed.add_field(
-            name="📊 보유 포인트 순위",
-            value="\n".join(ranking_lines),
-            inline=False
-        )
-
-        my_medal = rank_medals[my_rank - 1] if my_rank <= 3 else f"`{my_rank}위`"
-        embed.add_field(
-            name="👤 내 랭킹 정보",
-            value=f"• **현재 순위**: {my_medal} (전체 유저 중 {my_rank}위)\n• **내 보유 포인트**: **{my_points:,} P**",
-            inline=False
-        )
-
-        embed.set_footer(text="포인트 랭킹은 시각/활동에 따라 실시간으로 갱신됩니다.")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed, total = await build_rank_page(interaction, 0)
+        await interaction.followup.send(embed=embed, view=RankView(0, total),
+                                        ephemeral=True)
 
     @app_commands.command(name="포인트얻는법", description="포인트를 획득하는 다양한 방법과 도움말을 확인합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
@@ -590,4 +663,6 @@ class CheckIn(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(CheckIn(bot))
+    # 재시작 뒤에도 랭킹 쪽 버튼이 동작해야 합니다.
+    bot.add_view(RankView())
 

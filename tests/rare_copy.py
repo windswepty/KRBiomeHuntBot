@@ -77,6 +77,9 @@ async def main():
                 "no_guard_channel_ids": [], "roblox_only": True,
                 "relay_links": False, "log_channel_id": None,
                 "rare_copy_channel_id": copy_ch.id,
+                # ⚠️ `save_linkguard_settings` 는 **병합**이라, 안 적으면
+                #    앞 구간에서 켜 둔 값이 그대로 남습니다.
+                "rare_copy_dedup_minutes": 0,
                 "notify_rules": [{"channel_ids": [macro_ch.id],
                                   "category_ids": [], "biomes": RARE,
                                   "mention": "everyone", "role_ids": []}],
@@ -137,19 +140,32 @@ async def main():
     note(len(copied()) == 3, "3건 전부 복사", str(len(copied())))
 
     print("")
-    print("=== 3. ⚠️ 같은 링크 도배를 막아야 ===")
-    # 매크로는 같은 서버를 상태 갱신마다 다시 올립니다 (최다 527번).
+    print("=== 3. 기본은 **전부 보내기** ===")
+    # 실측(2026-09-16): 희귀 바이옴은 서버당 딱 1번만 올라옵니다
+    # (합계 5건 / 고유 서버 5곳). 같은 링크가 수백 번 오는 것은 흔한
+    # 바이옴 얘기였습니다(NORMAL 123.6번). 그래서 막지 않습니다.
     await setup()
-    for _ in range(30):
+    note(int((await vdb.get_linkguard_settings(GUILD.id))
+             .get("rare_copy_dedup_minutes", -1)) == 0,
+         "기본값이 0(끔)")
+    for _ in range(5):
         await run(macro(macro_ch, "DREAMSPACE", link("same1")))
+    note(len(copied()) == 5, "같은 링크라도 올라온 만큼 전부 감",
+         str(len(copied())))
+
+    print("")
+    print("=== 3-2. 켜면 다시 막아야 (도배가 생겼을 때의 탈출구) ===")
+    await setup(rare_copy_dedup_minutes=8)
+    for _ in range(30):
+        await run(macro(macro_ch, "DREAMSPACE", link("same2")))
     note(len(copied()) == 1, "30번 올라와도 한 줄만", str(len(copied())))
 
     print("")
     print("  ⚠️ **같은 서버라도 바이옴이 바뀌면 가야** 합니다")
     # 링크만으로 막으면 이게 묻힙니다 — 알림 쿨타임을 걷어낸 것과 같은 이유.
-    await run(macro(macro_ch, "CYBERSPACE", link("same1")))
+    await run(macro(macro_ch, "CYBERSPACE", link("same2")))
     note(len(copied()) == 2, "같은 링크 + 다른 바이옴은 감", str(len(copied())))
-    await run(macro(macro_ch, "GLITCHED", link("same1")))
+    await run(macro(macro_ch, "GLITCHED", link("same2")))
     note(len(copied()) == 3, "세 번째 바이옴도 감", str(len(copied())))
 
     print("")
@@ -162,29 +178,37 @@ async def main():
     print("")
     print("  창이 지나면 다시 보내야 합니다 (같은 서버에 또 뜬 것)")
     LG._rare_copied.clear()
-    ok1 = LG.should_copy_rare(link("w"), "DREAMSPACE", now=0.0)
-    ok2 = LG.should_copy_rare(link("w"), "DREAMSPACE", now=10.0)
-    ok3 = LG.should_copy_rare(link("w"), "DREAMSPACE",
-                              now=LG.RARE_COPY_WINDOW + 1.0)
+    W = 8 * 60
+    ok1 = LG.should_copy_rare(link("w"), "DREAMSPACE", W, now=0.0)
+    ok2 = LG.should_copy_rare(link("w"), "DREAMSPACE", W, now=10.0)
+    ok3 = LG.should_copy_rare(link("w"), "DREAMSPACE", W, now=W + 1.0)
     note(ok1 and not ok2 and ok3,
-         f"0초 통과 · 10초 차단 · {LG.RARE_COPY_WINDOW}초 뒤 통과",
-         f"{ok1}/{ok2}/{ok3}")
-    note(LG.RARE_COPY_WINDOW < 10 * 60,
-         "창이 바이옴 수명(10분)보다 짧음", f"{LG.RARE_COPY_WINDOW}초")
+         f"0초 통과 · 10초 차단 · {W}초 뒤 통과", f"{ok1}/{ok2}/{ok3}")
+    note(max(LG.RARE_COPY_WINDOW_CHOICES) * 60 < 10 * 60,
+         "고를 수 있는 창이 전부 바이옴 수명(10분)보다 짧음",
+         str(LG.RARE_COPY_WINDOW_CHOICES))
+
+    print("")
+    print("  창이 0 이면 무조건 보내야 합니다")
+    LG._rare_copied.clear()
+    always = [LG.should_copy_rare(link("w"), "DREAMSPACE", 0, now=float(i))
+              for i in range(5)]
+    note(all(always), "0 이면 5회 전부 통과", str(always))
+    note(not LG._rare_copied, "기억조차 남기지 않음", str(len(LG._rare_copied)))
 
     print("")
     print("  대소문자·공백이 달라도 같은 바이옴으로 봐야 합니다")
     LG._rare_copied.clear()
-    a = LG.should_copy_rare(link("z"), "DREAMSPACE", now=0.0)
-    b = LG.should_copy_rare(link("z"), "dream space", now=1.0)
+    a = LG.should_copy_rare(link("z"), "DREAMSPACE", W, now=0.0)
+    b = LG.should_copy_rare(link("z"), "dream space", W, now=1.0)
     note(a and not b, "`DREAMSPACE` 와 `dream space` 를 같게 봄", f"{a}/{b}")
 
     print("")
     print("  기억이 무한히 늘지 않아야 합니다")
     LG._rare_copied.clear()
     for i in range(2600):
-        LG.should_copy_rare(link(f"x{i}"), "DREAMSPACE",
-                            now=float(i) * (LG.RARE_COPY_WINDOW + 1))
+        LG.should_copy_rare(link(f"x{i}"), "DREAMSPACE", W,
+                            now=float(i) * (W + 1))
     note(len(LG._rare_copied) < 2600, "오래된 것은 버려짐",
          f"{len(LG._rare_copied)}개")
 
@@ -270,7 +294,25 @@ async def main():
         (f.name or "") + (f.value or "") for f in emb.fields)
     for b in RARE:
         note(b in blob, f"{b} 가 목록에 보임")
-    note("8분" in blob or "분" in blob, "도배 차단 창을 밝힘", blob[:60])
+    note("전부 보냅니다" in blob, "기본이 '전부 보내기' 임을 밝힘", blob[:70])
+
+    print("")
+    print("  켜 두면 몇 분인지 보여줘야 합니다")
+    s2 = await setup(rare_copy_dedup_minutes=3)
+    emb2 = LG.build_rare_copy_embed_settings(GUILD, s2)
+    blob2 = " ".join((f.name or "") + (f.value or "") for f in emb2.fields)
+    note("3분" in blob2, "창이 화면에 보임", blob2[:70])
+
+    print("")
+    print("  ⚠️ 끄고 켜는 버튼이 실제로 동작해야 합니다 (유일한 탈출구)")
+    for minutes in LG.RARE_COPY_WINDOW_CHOICES:
+        btn = LG.RareCopyDedupButton(minutes)
+        it = Inter()
+        await btn.callback(it)
+        await drain()
+        cur = (await vdb.get_linkguard_settings(GUILD.id)
+               ).get("rare_copy_dedup_minutes")
+        note(int(cur or 0) == minutes, f"{minutes}분으로 바뀜", str(cur))
 
     print("")
     print("  규칙이 없으면 **아무것도 안 간다고** 말해야 합니다")

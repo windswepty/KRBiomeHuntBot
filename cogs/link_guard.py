@@ -1618,12 +1618,15 @@ def build_rare_copy_embed_settings(guild, settings: dict,
                else "\u26a0\ufe0f **알림 규칙이 없어 아무것도 복사되지 않습니다.**\n"
                     "-# `/링크보호설정` → 알림 규칙에서 희귀 바이옴을 먼저 정하세요."),
         inline=False)
+    mins = int(settings.get("rare_copy_dedup_minutes", 0) or 0)
     embed.add_field(
-        name="\U0001f4e7 같은 링크 도배는 막습니다",
-        value=f"같은 **(링크 + 바이옴)** 조합은 **{RARE_COPY_WINDOW // 60}분** 안에 "
-              "한 번만 갑니다.\n"
-              "-# 매크로가 같은 서버를 수백 번 다시 올려도 한 줄만 남습니다. "
-              "다른 서버에서 뜬 같은 바이옴은 따로 갑니다.",
+        name="\U0001f4e7 중복 보내기",
+        value=("**끔 — 올라오는 대로 전부 보냅니다.**\n"
+               "-# 실측상 희귀 바이옴은 서버당 1번만 올라와 도배가 생기지 "
+               "않습니다. 혹시 도배가 생기면 아래 버튼으로 켜세요."
+               if mins <= 0 else
+               f"같은 **(링크 + 바이옴)** 조합은 **{mins}분** 안에 한 번만 갑니다.\n"
+               "-# 다른 서버에서 뜬 같은 바이옴은 따로 갑니다."),
         inline=False)
 
     if ch is not None:
@@ -1676,11 +1679,38 @@ class RareCopyOffButton(discord.ui.Button):
             ephemeral=True)
 
 
+class RareCopyDedupButton(discord.ui.Button):
+    """중복 보내기 창을 바꿉니다. **끄는 경로를 없애지 마세요** —
+    매크로가 동작을 바꿔 도배가 생겼을 때 이게 유일한 탈출구입니다."""
+
+    def __init__(self, minutes: int, active: bool = False):
+        super().__init__(
+            label="전부 보내기" if minutes <= 0 else f"{minutes}분에 한 번",
+            style=(discord.ButtonStyle.primary if active
+                   else discord.ButtonStyle.secondary),
+            disabled=active, custom_id=f"rarecopy:dedup:{minutes}")
+        self._minutes = minutes
+
+    async def callback(self, interaction: discord.Interaction):
+        await save_linkguard_settings(
+            interaction.guild.id, {"rare_copy_dedup_minutes": self._minutes})
+        settings = await get_linkguard_settings(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=build_rare_copy_embed_settings(
+                interaction.guild, settings,
+                "\u2705 전부 보냅니다." if self._minutes <= 0
+                else f"\u2705 {self._minutes}분에 한 번만 보냅니다."),
+            ephemeral=True)
+
+
 class RareCopyChannelView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, settings: dict | None = None):
         super().__init__(timeout=180)
         self.add_item(RareCopyChannelSelect())
         self.add_item(RareCopyOffButton())
+        cur = int((settings or {}).get("rare_copy_dedup_minutes", 0) or 0)
+        for m in RARE_COPY_WINDOW_CHOICES:
+            self.add_item(RareCopyDedupButton(m, active=(m == cur)))
 
 
 def public_no_guard_channels(guild, ids: list[int]) -> list:
@@ -2934,7 +2964,7 @@ class GuardSettingsSelect(discord.ui.Select):
         elif choice == "rarecopy":
             await interaction.response.send_message(
                 embed=build_rare_copy_embed_settings(guild, settings),
-                view=RareCopyChannelView(), ephemeral=True)
+                view=RareCopyChannelView(settings), ephemeral=True)
 
         elif choice == "addnoguard":
             ids = list(settings.get("no_guard_channel_ids") or [])
@@ -3276,26 +3306,38 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
 # 개인서버 주소는 그대로인 채 바이옴만 바뀌므로, 같은 서버에서 DREAMSPACE
 # 뒤에 CYBERSPACE 가 떠도 통째로 묻힙니다(알림 쿨타임을 걷어낸 것과 같은
 # 이유입니다). 창은 바이옴 수명(최대 10분)보다 **짧게** 둡니다.
-RARE_COPY_WINDOW = 8 * 60
+# 중복 제거 창(분). **기본은 0 = 끔** — 실측(2026-09-16)에서 희귀 바이옴은
+# 서버당 딱 1번만 올라왔습니다(합계 5건 / 고유 서버 5곳). 같은 링크가 수백 번
+# 다시 올라오는 것은 **흔한 바이옴** 얘기였습니다(NORMAL 123.6번).
+# 매크로가 동작을 바꿔 도배가 생기면 설정으로 되돌릴 수 있게 남겨 둡니다.
+RARE_COPY_WINDOW_CHOICES = (0, 3, 8)
 _rare_copied: dict[str, float] = {}
 
 
-def should_copy_rare(link: str, biome: str, now: float | None = None) -> bool:
+def should_copy_rare(link: str, biome: str, window: float = 0,
+                     now: float | None = None) -> bool:
     """이 (링크, 바이옴) 조합을 지금 복사해도 되는지.
 
-    같은 조합이 창 안에 이미 갔으면 건너뜁니다. 창이 지나면 다시 보냅니다 —
-    같은 서버에서 같은 바이옴이 다시 뜬 것일 수 있고, 그건 새 사건입니다.
+    `window` 가 0 이하면 **무조건 보냅니다.** 그 위면 같은 조합이 창 안에
+    이미 갔는지 봅니다. 창이 지나면 다시 보냅니다 — 같은 서버에서 같은
+    바이옴이 다시 뜬 것일 수 있고, 그건 새 사건입니다.
+
+    ⚠️ 키는 **(링크 + 바이옴)** 입니다. 링크만으로 막으면 주소는 그대로인 채
+    바이옴만 바뀌는 경우(같은 서버의 DREAMSPACE → CYBERSPACE)가 통째로
+    묻힙니다 — 알림 쿨타임을 걷어낸 것과 같은 이유입니다.
     """
+    if window <= 0:
+        return True
     now = time.monotonic() if now is None else now
     key = f"{link}|{_norm_biome(biome)}"
     last = _rare_copied.get(key)
-    if last is not None and now - last < RARE_COPY_WINDOW:
+    if last is not None and now - last < window:
         return False
     _rare_copied[key] = now
     # 창이 지난 것은 버립니다. 안 버리면 하루에 수천 개가 쌓입니다.
     if len(_rare_copied) > 2000:
         for k, t in list(_rare_copied.items()):
-            if now - t >= RARE_COPY_WINDOW:
+            if now - t >= window:
                 _rare_copied.pop(k, None)
     return True
 
@@ -4123,7 +4165,8 @@ class LinkGuard(commands.Cog):
                     links[0] if links else None)
         if not link:
             return
-        if not should_copy_rare(link, biome):
+        window = int(settings.get("rare_copy_dedup_minutes", 0) or 0) * 60
+        if not should_copy_rare(link, biome, window):
             return                      # 같은 (링크+바이옴) 이 방금 갔습니다
 
         channel = guild.get_channel(int(cid))

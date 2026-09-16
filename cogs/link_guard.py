@@ -543,7 +543,11 @@ def detect_biome_name(message) -> str | None:
             if kind.lower() != "started":
                 return None        # 종료 알림은 '등장' 이 아닙니다
             name = BIOME_TRIM_RE.sub("", name.strip(" -:_").strip())
-            return name[:60] or None
+            # ⚠️ **대문자로 통일합니다.** 매크로마다 제목 대소문자가 달라서
+            # (`RAINY` vs `Rainy`) 같은 바이옴이 두 줄로 갈라져 세어졌습니다 —
+            # 실측으로 16종 중 12종이 갈라져 1,167회가 새어 나갔습니다.
+            # 공백은 남깁니다(`BLAZING SUN` 이 한 단어가 되면 안 됩니다).
+            return name.upper()[:60] or None
     return None
 
 
@@ -3400,7 +3404,9 @@ def summarize_biomes(buckets: list[dict], days: int) -> dict[str, dict]:
 
     out: dict[str, dict] = {}
     for b in buckets:
-        name = str(b.get("biome") or "?")
+        # **읽을 때도 합칩니다.** ①만 고치면 이미 쌓인 소문자 표기가
+        # 90일 TTL 이 지날 때까지 화면에서 계속 갈라져 보입니다.
+        name = str(b.get("biome") or "?").upper()
         day = str(b.get("day") or "")
         cur = out.setdefault(name, {"count": 0, "today": 0, "total": 0,
                                     "notified": 0, "servers": set(),

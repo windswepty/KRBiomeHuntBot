@@ -103,9 +103,9 @@ async def main():
     cases = [
         ("Biome Started - DREAMSPACE", "DREAMSPACE"),
         ("BIOME STARTED - HELL Found", "HELL"),
-        ("BIOME  STARTED :: glitched_biome", "glitched_biome"),
-        ("Biome Started - Cyber Space", "Cyber Space"),
-        ("biome started - snowy", "snowy"),
+        ("BIOME  STARTED :: glitched_biome", "GLITCHED_BIOME"),
+        ("Biome Started - Cyber Space", "CYBER SPACE"),
+        ("biome started - snowy", "SNOWY"),
         ("Biome Ended - DREAMSPACE", None),      # 종료는 '등장' 이 아닙니다
         ("BIOME ENDED - HELL Found", None),
         ("오늘의 공지", None),
@@ -132,6 +132,40 @@ async def main():
         m = type("M", (), {"embeds": [discord.Embed(title=title)]})()
         got = LG.detect_biome_name(m)
         note(got == want, f"{title[:32]!r:36} -> {want!r}", repr(got))
+
+    print("")
+    print("  ⚠️ 대소문자가 달라도 **같은 바이옴**이어야 합니다")
+    # 매크로마다 제목 대소문자가 다릅니다. 실측으로 16종 중 12종이
+    # 갈라져 54,975회 중 1,167회가 별도 줄로 새어 나갔습니다.
+    for a_, b_ in [("Biome Started - Rainy", "Biome Started - RAINY"),
+                   ("Biome Started - Blazing Sun", "BIOME STARTED - BLAZING SUN"),
+                   ("Biome Started - Windy", "biome started - windy")]:
+        ma = type("M", (), {"embeds": [discord.Embed(title=a_)]})()
+        mb = type("M", (), {"embeds": [discord.Embed(title=b_)]})()
+        ga, gb = LG.detect_biome_name(ma), LG.detect_biome_name(mb)
+        note(ga == gb and ga is not None,
+             f"{a_[16:30]!r} 와 {b_[16:30]!r} 가 같은 이름", f"{ga!r} / {gb!r}")
+    m = type("M", (), {"embeds": [discord.Embed(title="Biome Started - Blazing Sun")]})()
+    note(LG.detect_biome_name(m) == "BLAZING SUN",
+         "**공백은 남깁니다** (한 단어가 되면 안 됩니다)",
+         repr(LG.detect_biome_name(m)))
+
+    print("")
+    print("  ⚠️ 이미 쌓인 소문자 기록도 읽을 때 합쳐야 합니다")
+    # 판정만 고치면 90일 TTL 이 지날 때까지 화면이 갈라져 보입니다.
+    mixed = [
+        {"biome": "RAINY", "day": "2026-09-16", "count": 100,
+         "notified_count": 0, "links": ["a"]},
+        {"biome": "Rainy", "day": "2026-09-16", "count": 30,
+         "notified_count": 0, "links": ["b"]},
+        {"biome": "rainy", "day": "2026-09-15", "count": 7,
+         "notified_count": 0, "links": ["c"]},
+    ]
+    agg = LG.summarize_biomes(mixed, 30)
+    note(list(agg) == ["RAINY"], "한 줄로 합쳐짐", str(list(agg)))
+    note(agg["RAINY"]["total"] == 137, "누적이 100+30+7", str(agg["RAINY"]["total"]))
+    note(len(agg["RAINY"]["servers"]) == 3, "서버 수도 합산",
+         str(len(agg["RAINY"]["servers"])))
 
     print("")
     print("  ⚠️ 같은 바이옴이 **형식 차이로 갈라지면** 안 됩니다")

@@ -92,11 +92,33 @@ def is_guarded_channel(channel, settings: dict) -> bool:
     if base is None:
         return False
 
+    # **보호 제외가 가장 먼저입니다.** 카테고리로 통째로 감시하면서 그 안의
+    # 채널 하나만 빼고 싶을 때 쓰므로, 나중에 보면 카테고리에 먹힙니다.
+    if is_no_guard_channel(channel, settings):
+        return False
+
     if base.id in settings.get("channel_ids", []):
         return True
 
     category_id = getattr(base, "category_id", None)
     return category_id is not None and category_id in settings.get("category_ids", [])
+
+
+def is_no_guard_channel(channel, settings: dict) -> bool:
+    """보호를 **일부러 끈** 채널인지.
+
+    관리자가 원본 임베드를 그대로 보려고 지정하는 채널입니다. 링크가 원문
+    그대로 남으므로 **관리자만 볼 수 있어야** 하고, 설정할 때 UI 가 그걸
+    검사합니다. 채널과 카테고리를 모두 받습니다.
+    """
+    base = resolve_base_channel(channel)
+    if base is None:
+        return False
+    ids = settings.get("no_guard_channel_ids") or []
+    if base.id in ids:
+        return True
+    category_id = getattr(base, "category_id", None)
+    return category_id is not None and category_id in ids
 
 
 def collect_guarded_channels(guild: discord.Guild, settings: dict) -> list:
@@ -1573,6 +1595,142 @@ class RemoveGuardChannelView(discord.ui.View):
         self.add_item(RemoveGuardChannelSelect(channel_ids, guild))
 
 
+def public_no_guard_channels(guild, ids: list[int]) -> list:
+    """보호 제외 채널 중 **`@everyone` 이 볼 수 있는 것**을 골라냅니다.
+
+    이 기능에서 가장 위험한 실수가 '관리자 전용으로 만들었다고 생각했는데
+    실제로는 전체 공개' 인 경우입니다. 보호를 끈 채널이 공개면 링크 보호
+    전체가 무의미해지는데, 화면에는 아무 표시도 안 나서 며칠 뒤 사고로
+    알게 됩니다. 그래서 **저장하는 순간** 검사합니다.
+    """
+    out = []
+    everyone = guild.default_role
+    for cid in ids:
+        ch = guild.get_channel(cid)
+        if ch is None:
+            continue
+        targets = ([c for c in ch.text_channels]
+                   if isinstance(ch, discord.CategoryChannel) else [ch])
+        for t in targets:
+            try:
+                if t.permissions_for(everyone).read_messages:
+                    out.append(t)
+            except Exception:
+                continue
+    return out
+
+
+def no_guard_list_lines(guild, ids: list[int]) -> list[str]:
+    lines = []
+    for cid in ids:
+        ch = guild.get_channel(cid)
+        if ch is None:
+            lines.append(f"• <#{cid}> \u26a0\ufe0f 채널을 찾을 수 없음")
+        elif isinstance(ch, discord.CategoryChannel):
+            lines.append(f"• \U0001f5c2\ufe0f **{ch.name}** (카테고리)")
+        else:
+            lines.append(f"• {ch.mention}")
+    return lines
+
+
+def build_no_guard_embed(guild, ids: list[int], note: str = "") -> discord.Embed:
+    """현재 보호 제외 채널과 **공개 여부 경고**를 함께 보여줍니다."""
+    public = public_no_guard_channels(guild, ids)
+    embed = discord.Embed(
+        title="\U0001f513 보호 제외 채널",
+        description=(f"{note}\n\n" if note else "")
+        + "여기 지정한 채널에서는 **원본 임베드가 그대로** 올라갑니다.\n"
+          "링크 제거도, 버튼 치환도 하지 않습니다.\n\n"
+        + ("**현재 목록**\n" + "\n".join(no_guard_list_lines(guild, ids))
+           if ids else "지정된 채널이 없습니다."),
+        color=discord.Color.red() if public else discord.Color.blurple())
+
+    if public:
+        embed.add_field(
+            name="\U0001f6a8 이 채널은 전체 공개입니다",
+            value="\n".join(f"• {c.mention}" for c in public[:10])
+                  + "\n\n**개인서버 주소가 모두에게 그대로 보입니다.**\n"
+                    "채널 권한에서 `@everyone` 의 **채널 보기**를 끄고 "
+                    "관리자 역할에만 열어 주세요.",
+            inline=False)
+    elif ids:
+        embed.add_field(
+            name="\u2705 관리자만 볼 수 있는 상태",
+            value="`@everyone` 이 볼 수 없는 것을 확인했습니다.",
+            inline=False)
+
+    embed.add_field(
+        name="\U0001f50e 유출 감지는 계속 됩니다",
+        value="보호는 건너뛰지만 링크는 **감지 색인에 그대로 넣습니다.** "
+              "여기서 복사해 다른 채널에 뿌리면 잡힙니다.",
+        inline=False)
+    embed.set_footer(text="카테고리를 지정하면 그 안의 모든 채널이 제외됩니다.")
+    return embed
+
+
+class AddNoGuardChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="보호를 끌 채널이나 카테고리를 선택하세요...",
+            channel_types=[discord.ChannelType.text,
+                           discord.ChannelType.category],
+            max_values=5)
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = await get_linkguard_settings(interaction.guild.id)
+        ids = list(settings.get("no_guard_channel_ids") or [])
+        added = 0
+        for selected in self.values:
+            if selected.id not in ids:
+                ids.append(selected.id)
+                added += 1
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"no_guard_channel_ids": ids})
+        await interaction.response.send_message(
+            embed=build_no_guard_embed(interaction.guild, ids,
+                                       f"**{added}개**를 추가했습니다."),
+            ephemeral=True)
+
+
+class AddNoGuardChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(AddNoGuardChannelSelect())
+
+
+class RemoveNoGuardChannelSelect(discord.ui.Select):
+    def __init__(self, ids: list[int], guild: discord.Guild):
+        options = []
+        for cid in ids[:25]:
+            ch = guild.get_channel(cid)
+            name = (f"\U0001f5c2\ufe0f {ch.name}"
+                    if isinstance(ch, discord.CategoryChannel)
+                    else f"#{ch.name}" if ch else f"ID {cid}")
+            options.append(discord.SelectOption(
+                label=name[:100], value=str(cid),
+                description="선택하면 이 채널도 다시 보호합니다", emoji="\U0001f512"))
+        super().__init__(placeholder="다시 보호할 채널을 선택하세요...",
+                         options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        cid = int(self.values[0])
+        settings = await get_linkguard_settings(interaction.guild.id)
+        ids = [c for c in (settings.get("no_guard_channel_ids") or [])
+               if c != cid]
+        await save_linkguard_settings(interaction.guild.id,
+                                      {"no_guard_channel_ids": ids})
+        await interaction.response.send_message(
+            embed=build_no_guard_embed(interaction.guild, ids,
+                                       f"<#{cid}> 를 **다시 보호합니다.**"),
+            ephemeral=True)
+
+
+class RemoveNoGuardChannelView(discord.ui.View):
+    def __init__(self, ids: list[int], guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.add_item(RemoveNoGuardChannelSelect(ids, guild))
+
+
 class AddExceptionChannelSelect(discord.ui.ChannelSelect):
     def __init__(self):
         super().__init__(
@@ -2519,6 +2677,18 @@ class GuardSettingsSelect(discord.ui.Select):
                 emoji="❌"
             ),
             discord.SelectOption(
+                label="\U0001f513 보호 제외 채널 지정 (원본 그대로)",
+                value="addnoguard",
+                description="관리자 전용 채널에 원본 임베드를 그대로 둡니다.",
+                emoji="\U0001f513",
+            ),
+            discord.SelectOption(
+                label="\U0001f512 보호 제외 해제 (다시 보호)",
+                value="removenoguard",
+                description="제외했던 채널을 다시 보호합니다.",
+                emoji="\U0001f512",
+            ),
+            discord.SelectOption(
                 label="유출 감지 예외 채널/카테고리 추가",
                 value="addexc",
                 description="특정 채널/카테고리에서는 보호된 링크를 올려도 삭제하지 않습니다.",
@@ -2666,6 +2836,24 @@ class GuardSettingsSelect(discord.ui.Select):
                 view=RemoveGuardChannelView(channel_ids, guild),
                 ephemeral=True
             )
+
+        elif choice == "addnoguard":
+            ids = list(settings.get("no_guard_channel_ids") or [])
+            await interaction.response.send_message(
+                embed=build_no_guard_embed(guild, ids),
+                view=AddNoGuardChannelView(), ephemeral=True)
+
+        elif choice == "removenoguard":
+            ids = list(settings.get("no_guard_channel_ids") or [])
+            if not ids:
+                await interaction.response.send_message(
+                    "\u2139\ufe0f 보호를 제외한 채널이 없습니다. "
+                    "지금은 감시 대상이 전부 보호되고 있습니다.",
+                    ephemeral=True)
+                return
+            await interaction.response.send_message(
+                "\U0001f512 **다시 보호할 채널을 선택하세요.**",
+                view=RemoveNoGuardChannelView(ids, guild), ephemeral=True)
 
         elif choice == "addexc":
             await interaction.response.send_message(
@@ -3530,6 +3718,13 @@ class LinkGuard(commands.Cog):
         settings = await get_linkguard_settings(guild.id)
         if not settings.get("enabled", True):
             return
+        # 보호 제외 채널: 원본을 그대로 두지만 **유출 감지 색인에는 넣습니다.**
+        # 건너뛰면 이 채널에만 올라온 링크는 다른 데로 새도 못 알아봅니다.
+        # (`_detect_leak` 은 웹훅 메시지를 무시하므로 이 채널의 원본이
+        #  스스로 유출로 잡히는 일은 없습니다.)
+        if is_no_guard_channel(message.channel, settings):
+            await self._index_without_guarding(message, settings)
+            return
         if not is_guarded_channel(message.channel, settings):
             return
 
@@ -3742,6 +3937,36 @@ class LinkGuard(commands.Cog):
         #    임베드는 10분마다 새로 뜨지만 실제로 눌리는 것은 극소수라, 보호할 때마다
         #    올리면 로그 채널이 '0명 사용' 알림으로 도배됩니다. 대신 **첫 클릭 시점**에
         #    ensure_usage_log() 가 만들고, 이후로는 그 임베드에 인원을 누적합니다.
+
+    async def _index_without_guarding(self, message: discord.Message,
+                                      settings: dict) -> None:
+        """보호는 하지 않고 **유출 감지 색인만** 남깁니다.
+
+        보호 제외 채널의 링크도 어딘가로 새면 알아야 합니다. 색인을
+        빼면 그 링크만 감지에서 사라지는데, 그건 조용한 구멍입니다.
+        실패해도 조용히 넘어갑니다 — 여기서 막으면 원본까지 못 보게 됩니다.
+        """
+        try:
+            only_roblox = settings.get("roblox_only", True)
+            locked = settings.get("locked_text", "")
+            links: list[str] = []
+            # 보호할 때와 **같은 경로**로 모읍니다 — 여기서만 다르게 훑으면
+            # 어느 한쪽이 놓치는 링크가 생깁니다.
+            for embed in message.embeds:
+                _, got = sanitize_embed(embed, locked, only_roblox)
+                links.extend(got)
+            _, got = strip_links(message.content or "", locked, only_roblox)
+            links.extend(got)
+            buttons = extract_component_links(message)
+            if only_roblox:
+                buttons = [u for u in buttons if is_roblox_link(u)]
+            links.extend(buttons)
+            keys = [k for k in (link_key(u) for u in links) if k]
+            if keys:
+                await register_guarded_keys(message.guild.id, keys)
+        except Exception as e:
+            print(f"[LinkGuard] 보호 제외 채널 색인 실패: "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     async def _detect_leak(self, message: discord.Message) -> None:
         """서버 안에서 보호 링크가 다시 뿌려지는지 감시합니다."""

@@ -1647,7 +1647,25 @@ def build_rare_copy_embed_settings(guild, settings: dict,
                 inline=False)
             embed.color = discord.Color.red()
 
-    embed.set_footer(text="멘션은 울리지 않습니다 — 매크로 채널에서 이미 나갑니다.")
+        # **설정하는 순간 검사합니다.** 권한이 없으면 `@everyone` 글자만 남고
+        # 알림은 가지 않는데, 초록불만 띄우면 운영진은 희귀 바이옴이 뜬 뒤
+        # "왜 알림이 안 왔지" 를 며칠 뒤에야 알게 됩니다.
+        me = getattr(guild, "me", None)
+        try:
+            can_ping = ch.permissions_for(me).mention_everyone if me else True
+        except Exception:
+            can_ping = True
+        if not can_ping:
+            embed.add_field(
+                name="⚠️ @everyone 을 울릴 수 없습니다",
+                value="이 채널에서 봇에게 **'@everyone, @here, 모든 역할 멘션'** "
+                      "권한이 없습니다.\n"
+                      "-# 지금은 멘션 글자만 남고 알림은 가지 않습니다.",
+                inline=False)
+            if embed.color != discord.Color.red():
+                embed.color = discord.Color.orange()
+
+    embed.set_footer(text="이 채널은 희귀 바이옴만 받으므로 @everyone 과 함께 갑니다.")
     return embed
 
 
@@ -3346,10 +3364,21 @@ def should_copy_rare(link: str, biome: str, window: float = 0,
     return True
 
 
+def rare_copy_title(biome: str) -> str:
+    """제목에 쓸 이름. 이모지 없이 `CYBERSPACE BIOME` 형태입니다.
+
+    이름에 이미 BIOME 이 붙어 오는 매크로가 있을 수 있어 **두 번 붙이지
+    않습니다** — 제목이 `CYBERSPACE BIOME BIOME` 이 되면 그것만으로 이
+    채널을 안 믿게 됩니다.
+    """
+    name = (biome or "").strip()
+    return name if name.upper().endswith("BIOME") else f"{name} BIOME"
+
+
 def build_rare_copy_embed(biome: str, link: str, source, when) -> discord.Embed:
     """관리자 채널에 올릴 '바로 들어가기' 카드."""
     embed = discord.Embed(
-        title=f"\U0001f3c3 {biome}",
+        title=rare_copy_title(biome),
         description=f"## [\u25b6 바로 들어가기]({link})\n"
                     f"-# 주소가 그대로 있으니 눌러서 바로 입장하세요.",
         color=discord.Color.gold())
@@ -3358,7 +3387,7 @@ def build_rare_copy_embed(biome: str, link: str, source, when) -> discord.Embed:
                     value=f"<t:{int(when)}:T> (<t:{int(when)}:R>)", inline=True)
     embed.add_field(
         name="\U0001f517 주소", value=f"```{link}```", inline=False)
-    embed.set_footer(text="희귀 바이옴은 길어야 10분입니다 · 관리자 전용")
+    embed.set_footer(text="관리자 전용")
     return embed
 
 
@@ -4187,15 +4216,32 @@ class LinkGuard(commands.Cog):
             print(f"[LinkGuard] #{channel} 에 '메시지 보내기' 권한이 없어 "
                   "희귀 바이옴 복사를 건너뜁니다.", flush=True)
             return
+        # 이 채널에는 **희귀 바이옴만** 올라오므로 매번 @everyone 을 붙입니다.
+        # 도배 걱정이 없는 것은 이 채널이 희귀만 받기 때문입니다 — 흔한
+        # 바이옴까지 들어오게 바꾸면 이 멘션부터 먼저 걷어내세요.
+        #
+        # 범위는 **관리자가 지정한 채널 하나**로 이미 묶여 있습니다
+        # (`rare_copy_channel_id` 가 없으면 여기까지 오지 않습니다).
+        # notify_rules 의 `@everyone` 이 채널 지정을 강제하는 것과 같은
+        # 이유이고, 여기서는 그 조건이 구조적으로 충족됩니다.
+        if perms is not None and not perms.mention_everyone:
+            # 글자만 남고 알림은 안 갑니다 — 알리지 않으면 아무도 못 풉니다.
+            print(f"[LinkGuard] #{channel} 에서 @everyone 을 울릴 수 "
+                  "없습니다 — 봇에게 '@everyone, @here, 모든 역할 멘션' 권한을 "
+                  "주세요. 지금은 멘션 글자만 남고 알림은 가지 않습니다.",
+                  flush=True)
 
         src = getattr(message.channel, "mention", None) or f"#{message.channel}"
         when = getattr(message, "created_at", None)
         ts = when.timestamp() if when else time.time()
         await channel.send(
+            content="@everyone",
             embed=build_rare_copy_embed(biome, link, src, ts),
-            # 관리자 전용 채널이라도 **멘션은 울리지 않습니다.**
-            # 매크로 채널에서 이미 전원 호출이 나갔습니다.
-            allowed_mentions=discord.AllowedMentions.none())
+            # **전원만** 울립니다. 역할·유저는 켜지 않습니다 — 원본 임베드에
+            # 섞여 있던 제작자 유저 멘션까지 울리면 그 사람에게 희귀 바이옴이
+            # 뜰 때마다 알림이 갑니다.
+            allowed_mentions=discord.AllowedMentions(
+                everyone=True, roles=False, users=False))
 
     async def _index_without_guarding(self, message: discord.Message,
                                       settings: dict) -> None:

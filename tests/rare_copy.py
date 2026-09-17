@@ -113,11 +113,26 @@ async def main():
     note(macro_ch.mention in blob or "잡담" in blob, "어느 채널에서 왔는지")
 
     print("")
-    print("  ⚠️ 멘션은 울리지 않아야 합니다 (매크로 채널에서 이미 나갔습니다)")
+    print("  제목은 이모지 없이 '<이름> BIOME' 이어야 합니다")
+    note(emb.title == "DREAMSPACE BIOME", "이름 뒤에 BIOME", emb.title)
+    note(emb.title.isascii(), "제목에 이모지가 남지 않음", emb.title)
+    # ⚠️ 이름에 이미 BIOME 이 붙어 오는 매크로가 있으면 두 번 붙습니다.
+    note(LG.rare_copy_title("GLITCHED BIOME") == "GLITCHED BIOME",
+         "BIOME 이 이미 있으면 두 번 붙이지 않음",
+         LG.rare_copy_title("GLITCHED BIOME"))
+    note("10분" not in (emb.footer.text or ""),
+         "'길어야 10분' 문구가 바닥글에 없음", emb.footer.text)
+
+    print("")
+    print("  ⚠️ 이 채널은 희귀만 받으므로 @everyone 이 함께 가야 합니다")
+    note("@everyone" in (got[0].get("content") or ""),
+         "본문에 @everyone", repr(got[0].get("content")))
     am = got[0].get("allowed_mentions")
     note(am is not None, "allowed_mentions 를 명시함", str(am))
-    note(am is not None and not am.everyone and not am.roles and not am.users,
-         "아무도 호출하지 않음", str(am))
+    note(am is not None and am.everyone, "전원 호출이 실제로 켜져 있음", str(am))
+    # 원본 임베드의 제작자 유저 멘션까지 울리면 그 사람에게 매번 갑니다.
+    note(am is not None and not am.roles and not am.users,
+         "역할·유저는 울리지 않음", str(am))
 
     print("")
     print("  원래 채널의 보호는 그대로여야 합니다")

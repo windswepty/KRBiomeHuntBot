@@ -3375,8 +3375,17 @@ def rare_copy_title(biome: str) -> str:
     return name if name.upper().endswith("BIOME") else f"{name} BIOME"
 
 
-def build_rare_copy_embed(biome: str, link: str, source, when) -> discord.Embed:
-    """관리자 채널에 올릴 '바로 들어가기' 카드."""
+def build_rare_copy_embed(biome: str, link: str, source, when,
+                          jump: str | None = None) -> discord.Embed:
+    """관리자 채널에 올릴 '바로 들어가기' 카드.
+
+    `jump` 는 **재게시된 보호 메시지**의 주소입니다. 원본이 아닙니다 —
+    원본은 `_guard_message` 가 이미 지웠으므로, 그 주소를 넣으면 눌렀을 때
+    '메시지를 불러올 수 없습니다' 만 뜹니다.
+
+    없으면 그 줄을 **통째로 뺍니다.** 죽은 링크를 눌러 보게 하는 것보다
+    없는 편이 낫습니다.
+    """
     embed = discord.Embed(
         title=rare_copy_title(biome),
         description=f"## [\u25b6 바로 들어가기]({link})\n"
@@ -3387,6 +3396,8 @@ def build_rare_copy_embed(biome: str, link: str, source, when) -> discord.Embed:
                     value=f"<t:{int(when)}:T> (<t:{int(when)}:R>)", inline=True)
     embed.add_field(
         name="\U0001f517 주소", value=f"```{link}```", inline=False)
+    if jump:
+        embed.description += f"\n**[\U0001f4cc 올라온 곳으로 이동]({jump})**"
     embed.set_footer(text="관리자 전용")
     return embed
 
@@ -4135,8 +4146,11 @@ class LinkGuard(commands.Cog):
         #      없으면 안 되는 것입니다.
         if biome_name:
             try:
+                # ⚠️ 이동 주소는 **재게시된 `sent`** 입니다. `message`(원본)는
+                #    바로 위에서 지웠으므로 그 주소는 눌러도 아무것도 없습니다.
                 await self._copy_rare_biome(
-                    guild, settings, biome_name, all_links, message)
+                    guild, settings, biome_name, all_links, message,
+                    getattr(sent, "jump_url", None))
             except Exception as e:
                 print(f"[LinkGuard] 희귀 바이옴 복사 실패: "
                       f"{type(e).__name__}: {e}", flush=True)
@@ -4181,7 +4195,8 @@ class LinkGuard(commands.Cog):
         #    ensure_usage_log() 가 만들고, 이후로는 그 임베드에 인원을 누적합니다.
 
     async def _copy_rare_biome(self, guild, settings: dict, biome: str,
-                               links: list[str], message) -> None:
+                               links: list[str], message,
+                               jump: str | None = None) -> None:
         """희귀 바이옴이면 원본 링크를 관리자 채널로 복사합니다.
 
         **어떤 바이옴이 희귀한지는 알림 규칙을 그대로 씁니다**
@@ -4236,7 +4251,7 @@ class LinkGuard(commands.Cog):
         ts = when.timestamp() if when else time.time()
         await channel.send(
             content="@everyone",
-            embed=build_rare_copy_embed(biome, link, src, ts),
+            embed=build_rare_copy_embed(biome, link, src, ts, jump),
             # **전원만** 울립니다. 역할·유저는 켜지 않습니다 — 원본 임베드에
             # 섞여 있던 제작자 유저 멘션까지 울리면 그 사람에게 희귀 바이옴이
             # 뜰 때마다 알림이 갑니다.

@@ -101,7 +101,8 @@ async def main():
 
     print("=== 1. 희귀 바이옴이면 원본 주소가 복사돼야 ===")
     await setup()
-    await run(macro(macro_ch, "DREAMSPACE", link("aaa111")))
+    origin = macro(macro_ch, "DREAMSPACE", link("aaa111"))
+    await run(origin)
     got = copied()
     note(len(got) == 1, "복사 채널에 한 건", str(len(got)))
     emb = got[0]["embed"]
@@ -122,6 +123,24 @@ async def main():
          LG.rare_copy_title("GLITCHED BIOME"))
     note("10분" not in (emb.footer.text or ""),
          "'길어야 10분' 문구가 바닥글에 없음", emb.footer.text)
+
+    print("")
+    print("  올라온 곳으로 이동하는 링크가 있어야 합니다")
+    desc = emb.description or ""
+    note("올라온 곳으로 이동" in desc, "이동 링크가 카드에 있음")
+    note("discord.com/channels/" in desc, "디스코드 메시지 주소 형태")
+    # ⚠️ **원본은 이미 지워졌습니다.** 원본 주소를 넣으면 눌러도
+    #    '메시지를 불러올 수 없습니다' 만 뜹니다 — 재게시본을 가리켜야 합니다.
+    note(f"/{origin.id})" not in desc,
+         "**지워진 원본이 아니라** 재게시된 보호 메시지를 가리킴", desc)
+    note(desc.index("바로 들어가기") < desc.index("올라온 곳으로 이동"),
+         "'바로 들어가기' 아래에 놓임")
+
+    print("")
+    print("  ⚠️ 주소를 못 구하면 그 줄은 아예 빠져야 합니다 (죽은 링크 금지)")
+    bare = LG.build_rare_copy_embed("WINDY", link("z"), "<#1>", 0)
+    note("올라온 곳으로 이동" not in (bare.description or ""),
+         "jump 가 없으면 줄이 없음", bare.description)
 
     print("")
     print("  ⚠️ 이 채널은 희귀만 받으므로 @everyone 이 함께 가야 합니다")

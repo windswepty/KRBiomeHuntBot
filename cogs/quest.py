@@ -772,6 +772,15 @@ class EventPickSelect(discord.ui.Select):
                                 + "-# 유저가 이미 받은 보상은 회수되지 않습니다.",
                     color=discord.Color.red()),
                 view=EventDeleteConfirm(eid, ev.get("name", "?")), ephemeral=True)
+        else:
+            # 여기 오면 메뉴에 항목을 더하고 분기를 빠뜨린 것입니다.
+            # 응답하지 않으면 화면에는 '상호작용 실패' 다섯 글자만 뜨고,
+            # 무엇이 빠졌는지는 아무도 알 수 없습니다.
+            print(f"[Quest] EventPickSelect: 모르는 action '{self.action}'",
+                  flush=True)
+            await interaction.response.send_message(
+                f"⚠️ 처리할 수 없는 요청입니다 (`{self.action}`). "
+                "개발자에게 알려 주세요.", ephemeral=True)
 
 
 class EventPickView(discord.ui.View):

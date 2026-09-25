@@ -2402,6 +2402,59 @@ class AutoDeleteToggleView(discord.ui.View):
 
 # ── 바이옴 알림 멘션 설정 UI ─────────────────────────────────────────
 
+def notify_blind_spots(guild, settings: dict) -> tuple[list, list]:
+    """**감시는 하는데 알림 규칙이 없는** 채널·카테고리를 찾습니다.
+
+    여기 걸린 곳에서 희귀 바이옴이 뜨면 링크는 보호되지만 **아무도 호출되지
+    않습니다.** 조용히 안 울리는 쪽이라 제보도 들어오지 않습니다 — 실제로
+    감시 카테고리 12곳 중 1곳이 어떤 규칙에도 없는 채로 있었고, 운영 DB 를
+    손으로 들여다보고서야 찾았습니다. 사람이 손으로 찾아야 하는 것은
+    **다음에는 아무도 안 찾습니다.**
+
+    돌려주는 것은 `(사각지대, 이름을 못 찾은 id)` 입니다. 지워진 카테고리는
+    사각지대가 아니라 **설정에 남은 쓰레기**라 따로 셉니다 — 섞으면 고칠 수
+    없는 경고가 화면에 영원히 남습니다.
+    """
+    rules = [r for r in (settings.get("notify_rules") or [])
+             if isinstance(r, dict)]
+
+    def covered(scope_id: int, is_category: bool) -> bool:
+        for r in rules:
+            # 범위 없는 `@everyone` 규칙은 `match_notify_rule` 이 건너뛰므로
+            # 여기서도 덮은 것으로 치지 않습니다. 둘이 어긋나면 화면은
+            # 초록인데 알림은 안 가는, 가장 나쁜 조합이 됩니다.
+            if (r.get("mention") == "everyone"
+                    and not (r.get("channel_ids") or r.get("category_ids"))):
+                continue
+            if not (r.get("channel_ids") or r.get("category_ids")):
+                return True                      # 전 범위 규칙
+            if is_category:
+                if scope_id in (r.get("category_ids") or []):
+                    return True
+            else:
+                if scope_id in (r.get("channel_ids") or []):
+                    return True
+                ch = guild.get_channel(scope_id) if guild else None
+                cat = getattr(ch, "category_id", None)
+                if cat is not None and cat in (r.get("category_ids") or []):
+                    return True
+        return False
+
+    blind, missing = [], []
+    no_guard = set(settings.get("no_guard_channel_ids") or [])
+    for cid in settings.get("category_ids") or []:
+        if covered(int(cid), True):
+            continue
+        obj = guild.get_channel(int(cid)) if guild else None
+        (blind if obj is not None else missing).append(obj or int(cid))
+    for cid in settings.get("channel_ids") or []:
+        if int(cid) in no_guard or covered(int(cid), False):
+            continue
+        obj = guild.get_channel(int(cid)) if guild else None
+        (blind if obj is not None else missing).append(obj or int(cid))
+    return blind, missing
+
+
 def build_notify_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
     rules = settings.get("notify_rules") or []
     carry = settings.get("carry_embed_mentions", True)
@@ -2440,6 +2493,30 @@ def build_notify_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
                "끝날 때도 울립니다."),
         inline=False
     )
+    # **감시는 하는데 규칙이 없는 곳**을 짚어 줍니다. 여기서 희귀 바이옴이
+    # 뜨면 링크는 보호되지만 아무도 호출되지 않고, 조용히 안 울리는 쪽이라
+    # 제보도 들어오지 않습니다. 없을 때는 이 칸을 띄우지 않습니다 —
+    # 늘 켜진 경고는 없느니만 못합니다.
+    blind, missing = notify_blind_spots(guild, settings)
+    if blind:
+        names = ", ".join(getattr(b, "mention", None) or f"`{b}`" for b in blind)
+        embed.add_field(
+            name=f"ℹ️ 봇이 멘션을 붙이지 않는 감시 구역 {len(blind)}곳",
+            value=(f"{names[:850]}\n"
+                   "**원본에 멘션이 있으면 그대로 울립니다** — 매크로가 본문에 "
+                   "역할을 적어 보내는 채널이면 이대로도 괜찮습니다.\n"
+                   "-# 다만 매크로가 판올림하며 멘션을 빼면 이 구역은 조용히 "
+                   "죽습니다. `/바이옴통계` 의 알림 횟수로 확인하세요."),
+            inline=False)
+    if missing:
+        # 지워진 카테고리는 고칠 수 없는 경고로 남으면 안 되므로 따로 적습니다.
+        embed.add_field(
+            name=f"🧹 설정에만 남은 곳 {len(missing)}개",
+            value=("이미 지워진 채널·카테고리입니다. 알림과는 무관하지만 "
+                   "`/링크보호설정` 에서 정리해 두면 위 경고가 정확해집니다.\n"
+                   + ", ".join(f"`{m}`" for m in missing)[:800]),
+            inline=False)
+
     embed.set_footer(text="위에 있는 규칙이 먼저 적용됩니다 (맞는 것 하나만).")
     return embed
 
@@ -3300,6 +3377,18 @@ def build_status_embed(guild: discord.Guild, settings: dict, verify_settings: di
                  "모릅니다. **바이옴 알림 멘션**에서 규칙을 만드세요.")
     embed.add_field(name="🔔 바이옴 알림 멘션", value=value[:1024], inline=False)
 
+    # 권한이 있어도 **규칙이 닿지 않는 구역**이면 조용히 안 울립니다.
+    # 위의 ✅ 는 규칙 하나하나만 보므로 이 구멍을 잡지 못합니다.
+    blind, _ = notify_blind_spots(guild, settings)
+    if blind:
+        names = ", ".join(getattr(b, "mention", None) or f"`{b}`" for b in blind)
+        embed.add_field(
+            name=f"ℹ️ 봇이 멘션을 붙이지 않는 감시 구역 {len(blind)}곳",
+            value=(f"{names[:850]}\n"
+                   "-# 원본에 멘션이 있으면 그대로 울립니다. 매크로가 멘션을 "
+                   "빼면 조용히 죽으므로 알림 횟수를 함께 보세요."),
+            inline=False)
+
     embed.add_field(
         name="🔗 버튼 문구",
         value=f"`{settings.get('button_label', '🎮 개인서버 입장하기')}`",
@@ -3362,6 +3451,44 @@ def should_copy_rare(link: str, biome: str, window: float = 0,
             if now - t >= window:
                 _rare_copied.pop(k, None)
     return True
+
+
+# ── 디스코드가 잠깐 5xx 를 돌려줄 때 ────────────────────────────────
+#
+# **실측(2026-09-18~25): 삭제 실패 22건 · 재전송 실패 34건.** 하루 3만 건을
+# 보호하는 중의 0.02% 지만, 이 둘은 실패했을 때의 결과가 서로 다릅니다.
+#
+#   · 삭제 실패  → 원문 링크가 **채널에 그대로 남습니다** (보호 실패)
+#   · 재전송 실패 → 원본은 이미 지워진 뒤라 **그 바이옴이 통째로 사라집니다**
+#
+# discord.py 2.7.1 은 `{500, 502, 504, 524}` 만 스스로 재시도하고 **503 은
+# 그대로 올려보냅니다.** 실제로 기록된 것이 전부 503 이라, 여기서 한 겹 더
+# 감쌉니다. 이 경로는 상호작용이 아니라 `on_message` 라 3초 제한이 없습니다.
+TRANSIENT_BACKOFF = (0.5, 1.5, 3.0)
+
+
+async def _retry_transient(fn):
+    """일시적 실패(5xx · 연결 끊김)만 다시 시도합니다.
+
+    **권한·없음(4xx)은 즉시 올려보냅니다.** 되지 않을 일을 세 번 더 해 봐야
+    이벤트 루프만 잡아먹고 결과는 같습니다.
+    """
+    last = None
+    for i, wait in enumerate((*TRANSIENT_BACKOFF, None)):
+        try:
+            return await fn()
+        except (discord.NotFound, discord.Forbidden):
+            raise
+        except discord.HTTPException as e:
+            if getattr(e, "status", 500) < 500:
+                raise
+            last = e
+        except (OSError, asyncio.TimeoutError) as e:
+            last = e            # [Errno 104] Connection reset by peer 등
+        if wait is None:
+            break
+        await asyncio.sleep(wait)
+    raise last
 
 
 def rare_copy_title(biome: str) -> str:
@@ -4012,14 +4139,19 @@ class LinkGuard(commands.Cog):
 
         # 4. 원본을 먼저 삭제해 노출 시간을 최소화합니다
         try:
-            await message.delete()
+            await _retry_transient(message.delete)
         except discord.NotFound:
             return
         except discord.Forbidden:
             print(f"[LinkGuard] #{message.channel} 원본 메시지 삭제에 실패했습니다 (권한 부족).", flush=True)
             return
         except Exception as e:
-            print(f"[LinkGuard] 원본 메시지 삭제 중 오류: {e}", flush=True)
+            # ⚠️ 여기까지 오면 **원문 링크가 채널에 그대로 남아 있습니다.**
+            #    '오류가 났다' 가 아니라 '보호가 안 됐다' 로 적습니다 —
+            #    로그를 보는 사람이 심각도를 바로 알아야 합니다.
+            print(f"[LinkGuard] 🚨 원본 삭제 실패 — #{message.channel} 에 "
+                  f"원문 링크가 그대로 남았습니다 ({type(e).__name__}: {e})",
+                  flush=True)
             return
 
         # 5. 원본 작성자(웹훅) 정보를 임베드에 남겨 누가 보냈는지 알 수 있게 합니다
@@ -4124,14 +4256,18 @@ class LinkGuard(commands.Cog):
                 flush=True)
 
         try:
-            sent = await message.channel.send(
+            sent = await _retry_transient(lambda: message.channel.send(
                 content=clean_content or None,
                 embeds=sanitized_embeds,
                 view=view,
                 allowed_mentions=allowed,
-            )
+            ))
         except Exception as e:
-            print(f"[LinkGuard] 보호 메시지 재전송 중 오류: {e}", flush=True)
+            # ⚠️ 원본은 위에서 이미 지웠습니다. 여기서 실패하면 **그 바이옴
+            #    알림이 통째로 사라집니다** — 아무도 뜬 줄 모릅니다.
+            print(f"[LinkGuard] 🚨 재게시 실패 — #{message.channel} 의 바이옴 "
+                  f"알림이 사라졌습니다 (원본은 이미 삭제됨). "
+                  f"{type(e).__name__}: {e}", flush=True)
             return
 
         # 6. 재게시된 메시지 ID를 키로 원본 링크를 저장 (버튼이 이 키로 조회합니다)

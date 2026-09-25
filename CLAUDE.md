@@ -125,8 +125,8 @@ asyncio.run(m())"
 `verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
 
 **경고·밴**(`moderation` · `utils/mod_db.py` · `mod_settings` `mod_cases` `mod_users`)은
-세 번째 독립 시스템입니다 — 위 둘 다 import 하지 않습니다. `?warn` `?ban` `?warnings`
-(접두사 `?`)는 상호작용이 아니라 **규칙 1의 예외**로 채널에 답합니다. 슬래시와
+세 번째 독립 시스템입니다 — 위 둘 다 import 하지 않습니다. `!warn` `!ban` `!warnings`
+(접두사 `!`)는 상호작용이 아니라 **규칙 1의 예외**로 채널에 답합니다. 슬래시와
 같은 본체(`do_warn` `do_ban`)를 쓰세요 — 갈라지면 한쪽으로 검사가 우회됩니다.
 
 ### 데이터 계층 패턴

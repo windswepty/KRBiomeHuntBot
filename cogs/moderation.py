@@ -1173,7 +1173,7 @@ class ModPanelView(discord.ui.View):
                                         view=AutoRuleView(settings), ephemeral=True)
 
 
-# ── 경고 · 밴 본체 (슬래시와 ?명령어가 같이 씁니다) ─────────────────────
+# ── 경고 · 밴 본체 (슬래시와 !명령어가 같이 씁니다) ─────────────────────
 #
 # 두 갈래로 두면 한쪽에만 검사가 들어가 **다른 쪽으로 우회됩니다**
 # (뽑기 1회/10회가 그랬습니다). 그래서 본체는 하나이고, 명령어는 입력을
@@ -1254,9 +1254,9 @@ async def record_embed_for(guild, user) -> discord.Embed:
 
 
 PREFIX_USAGE = {
-    "warn": "`?warn [유저 ID 또는 멘션] [사유]`",
-    "ban": "`?ban [유저 ID 또는 멘션] [사유]`",
-    "warnings": "`?warnings [유저 ID 또는 멘션]`",
+    "warn": "`!warn [유저 ID 또는 멘션] [사유]`",
+    "ban": "`!ban [유저 ID 또는 멘션] [사유]`",
+    "warnings": "`!warnings [유저 ID 또는 멘션]`",
 }
 
 
@@ -1300,7 +1300,7 @@ class Moderation(commands.Cog):
         await interaction.followup.send(embed=build_panel_embed(interaction.guild, settings),
                                         view=ModPanelView(), ephemeral=True)
 
-    # ── ?명령어 (Dyno 식) ──────────────────────────────────────────────
+    # ── !명령어 (Dyno 식) ──────────────────────────────────────────────
     #
     # ⚠️ **CLAUDE.md 규칙 1(ephemeral)의 예외입니다.** 접두사 명령어는
     #    상호작용이 아니라 일반 메시지라 '본인에게만 보이기' 가 불가능합니다.
@@ -1334,13 +1334,13 @@ class Moderation(commands.Cog):
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx: commands.Context, error):
-        """?명령어 오류를 **무엇이 틀렸는지** 알려 줍니다.
+        """!명령어 오류를 **무엇이 틀렸는지** 알려 줍니다.
 
         이 리스너가 있으면 라이브러리 기본 처리(콘솔에 트레이스백)가
         꺼집니다. 그래서 여기서 빠뜨린 오류는 반드시 로그로 남깁니다.
         """
         if isinstance(error, commands.CommandNotFound):
-            return          # ?로 시작하는 평범한 채팅 — 조용히 넘어갑니다
+            return          # !로 시작하는 평범한 채팅 — 조용히 넘어갑니다
         name = ctx.command.name if ctx.command else ""
         usage = PREFIX_USAGE.get(name, "")
         if isinstance(error, commands.MissingPermissions):
@@ -1352,7 +1352,7 @@ class Moderation(commands.Cog):
         elif isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
             msg = ("⚠️ 유저를 찾지 못했습니다. **유저 ID** 나 멘션으로 적어 주세요.\n"
                    f"사용법: {usage}"
-                   + ("\n-# `?warn` 은 서버에 있는 사람만 됩니다. 나간 사람은 `?ban` 으로 막으세요."
+                   + ("\n-# `!warn` 은 서버에 있는 사람만 됩니다. 나간 사람은 `!ban` 으로 막으세요."
                       if name == "warn" else ""))
         elif isinstance(error, commands.BadArgument):
             msg = f"⚠️ 입력을 이해하지 못했습니다.\n사용법: {usage}"

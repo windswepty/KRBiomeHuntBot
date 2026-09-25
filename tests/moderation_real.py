@@ -7,7 +7,7 @@ tests/moderation.py 는 콜백을 직접 부릅니다. 그래서 다음은 거�
      실패**해 유저에게는 '상호작용 실패' 만 뜹니다. 로컬에서는 멀쩡합니다.
   2. 슬래시 명령어 동기화 페이로드 — 하나가 규격을 어기면 sync 가 통째로
      실패해 **모든 명령어가** 갱신되지 않습니다.
-  3. ?명령어의 실제 경로 — 접두사 파싱 · 나머지 인자(`*, 사유`) · 변환기 ·
+  3. !명령어의 실제 경로 — 접두사 파싱 · 나머지 인자(`*, 사유`) · 변환기 ·
      권한 검사 · 오류 리스너 · 답장 페이로드. 콜백을 직접 부르면 이 전부를
      건너뜁니다.
   4. 정밀 점검에서 나온 버그들의 회귀 검사.
@@ -206,7 +206,7 @@ NAME_RE = re.compile(r"^[-_\w฀-๿]{1,32}$")
 
 async def test_tree():
     print("\n=== 2. 슬래시 명령어 동기화 페이로드 (전체) ===")
-    bot = commands.Bot(command_prefix="?", intents=discord.Intents.all())
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
     for f in sorted(os.listdir(os.path.join(PROJ, "cogs"))):
         if f.endswith(".py") and not f.startswith("__"):
             await bot.load_extension(f"cogs.{f[:-3]}")
@@ -249,7 +249,7 @@ async def test_tree():
     await bot.close()
 
 
-# ── 3. ?명령어를 진짜 경로로 ──────────────────────────────────────────
+# ── 3. !명령어를 진짜 경로로 ──────────────────────────────────────────
 class PermChannel(F.Channel):
     """권한 검사가 진짜 `discord.Permissions` 를 보게 합니다."""
     def permissions_for(self, m):
@@ -278,11 +278,11 @@ class Msg:
 
 
 async def test_prefix_real():
-    print("\n=== 3. ?명령어 — 진짜 discord.py 경로 (파싱 · 변환 · 권한 · 오류 · 답장) ===")
+    print("\n=== 3. !명령어 — 진짜 discord.py 경로 (파싱 · 변환 · 권한 · 오류 · 답장) ===")
     src = io.open(os.path.join(PROJ, "main.py"), encoding="utf-8").read()
-    note('command_prefix="?"' in src and "help_command=None" in src
+    note('command_prefix="!"' in src and "help_command=None" in src
          and "case_insensitive=True" in src, "main.py 의 봇 설정을 그대로 씁니다")
-    bot = commands.Bot(command_prefix="?", intents=discord.Intents.all(),
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.all(),
                        help_command=None, case_insensitive=True)
     await bot._async_setup_hook()          # 로그인 때 라이브러리가 하는 루프 연결
     await bot.load_extension("cogs.moderation")
@@ -329,9 +329,9 @@ async def test_prefix_real():
     def embed_of(p):
         return discord.Embed.from_dict(p["embeds"][0]) if p.get("embeds") else None
 
-    out, _ = await run(f"?warn {t.id} 채팅 도배 여러 단어 사유")
+    out, _ = await run(f"!warn {t.id} 채팅 도배 여러 단어 사유")
     e = embed_of(out[0]) if out else None
-    note(e is not None and "경고 | 케이스" in e.title, "?warn ID 사유 → 경고", e.title if e else str(out))
+    note(e is not None and "경고 | 케이스" in e.title, "!warn ID 사유 → 경고", e.title if e else str(out))
     note(e is not None and "채팅 도배 여러 단어 사유" in e.description,
          "사유가 띄어쓰기째 전부 들어감 (나머지 인자)")
     p = out[0] if out else {}
@@ -339,59 +339,61 @@ async def test_prefix_real():
          "답장이 아무도 호출하지 않음 (명령어 친 사람 포함)", str(p.get("allowed_mentions")))
     note((p.get("message_reference") or {}).get("message_id") is not None,
          "명령어 메시지에 답장으로 붙음")
-    check("?warn 답장 임베드가 규격 안", embed_problems(e) if e else ["없음"])
+    check("!warn 답장 임베드가 규격 안", embed_problems(e) if e else ["없음"])
     note(t.dms and "채팅 도배 여러 단어 사유" in text_of(t.dms[-1]["embed"]), "대상에게 DM")
 
-    out, _ = await run(f"?WARN <@{t.id}> 대문자와 멘션")
-    note(out and "케이스" in (embed_of(out[0]).title or ""), "?WARN (대문자) · 멘션도 됨")
+    out, _ = await run(f"!WARN <@{t.id}> 대문자와 멘션")
+    note(out and "케이스" in (embed_of(out[0]).title or ""), "!WARN (대문자) · 멘션도 됨")
 
-    out, _ = await run(f"?warn {t.id}")
+    out, _ = await run(f"!warn {t.id}")
     c = (out[0].get("content") if out else "") or ""
-    note("`사유` 을(를) 빠뜨렸습니다" in c and "?warn [유저 ID" in c,
+    note("`사유` 을(를) 빠뜨렸습니다" in c and "!warn [유저 ID" in c,
          "사유를 빠뜨리면 무엇이 빠졌는지 + 사용법", c[:60])
 
-    out, _ = await run("?warn 없는사람 사유")
+    out, _ = await run("!warn 없는사람 사유")
     c = (out[0].get("content") if out else "") or ""
     note("유저를 찾지 못했습니다" in c, "없는 사람은 찾지 못했다고", c[:40])
 
     n_before = len(await mdb.get_active_warnings(GUILD.id, t.id))
-    out, _ = await run(f"?warn {t.id} 권한없이", author=user)
+    out, _ = await run(f"!warn {t.id} 권한없이", author=user)
     c = (out[0].get("content") if out else "") or ""
     note("권한이 없습니다" in c, "권한 없는 사람은 거부 (진짜 권한 검사)", c[:40])
     note(len(await mdb.get_active_warnings(GUILD.id, t.id)) == n_before, "거부됐으면 경고도 안 쌓임")
 
-    out, _ = await run(f"?warnings {t.id}")
+    out, _ = await run(f"!warnings {t.id}")
     e = embed_of(out[0]) if out else None
     note(e is not None and "채팅 도배 여러 단어 사유" in text_of(e) and "<t:" in text_of(e),
-         "?warnings → 사유와 시각")
-    check("?warnings 답장 임베드가 규격 안", embed_problems(e) if e else ["없음"])
+         "!warnings → 사유와 시각")
+    check("!warnings 답장 임베드가 규격 안", embed_problems(e) if e else ["없음"])
 
-    out, _ = await run("?warnings")
-    note(out and "`유저` 을(를) 빠뜨렸습니다" in (out[0].get("content") or ""), "?warnings 인자 빠뜨림")
+    out, _ = await run("!warnings")
+    note(out and "`유저` 을(를) 빠뜨렸습니다" in (out[0].get("content") or ""), "!warnings 인자 빠뜨림")
 
-    out, _ = await run(f"?ban {t.id} 진짜 밴 사유")
+    out, _ = await run(f"!ban {t.id} 진짜 밴 사유")
     e = embed_of(out[0]) if out else None
-    note(e is not None and "밴 |" in e.title and t.id in GUILD.bans, "?ban ID 사유 → 밴",
+    note(e is not None and "밴 |" in e.title and t.id in GUILD.bans, "!ban ID 사유 → 밴",
          e.title if e else str(out))
     note("진짜 밴 사유" in text_of(t.dms[-1]["embed"]), "밴 DM 에 사유")
 
-    out, _ = await run(f"?ban {BASE + 55555} 없는계정")
+    out, _ = await run(f"!ban {BASE + 55555} 없는계정")
     note(out and "유저를 찾지 못했습니다" in (out[0].get("content") or ""),
          "존재하지 않는 ID 는 찾지 못했다고")
 
-    out, _ = await run(f"?ban {t.id} 한번더", author=user)
-    note(out and "권한이 없습니다" in (out[0].get("content") or ""), "?ban 도 권한 검사")
+    out, _ = await run(f"!ban {t.id} 한번더", author=user)
+    note(out and "권한이 없습니다" in (out[0].get("content") or ""), "!ban 도 권한 검사")
 
-    out, log = await run("?아무말이나 적은 채팅")
+    out, log = await run("!아무말이나 적은 채팅")
     note(not out and "Traceback" not in log and "Ignoring exception" not in log,
-         "?로 시작하는 평범한 채팅은 조용히 무시")
-    out, _ = await run("?help")
-    note(not out, "기본 ?help 는 꺼져 있음")
+         "!로 시작하는 평범한 채팅은 조용히 무시")
+    out, _ = await run("!help")
+    note(not out, "기본 !help 는 꺼져 있음")
+    out, _ = await run(f"?warn {t.id} Dyno 접두사")
+    note(not out, "Dyno 의 ?warn 에는 반응하지 않음 (두 봇이 한꺼번에 답하지 않게)")
 
     botuser = Member(BASE + 3, "다른봇", False, guild=GUILD)
     botuser.bot = True
-    out, _ = await run(f"?warn {t.id} 봇이보냄", author=botuser)
-    note(not out, "다른 봇의 ?명령어는 무시")
+    out, _ = await run(f"!warn {t.id} 봇이보냄", author=botuser)
+    note(not out, "다른 봇의 !명령어는 무시")
 
     print("\n  예상 못한 오류는 원인을 로그에 남기고 사람에게는 짧게")
     # ⚠️ load_extension 은 모듈을 새로 만듭니다(LESSONS). 위에서 import 한 M 을
@@ -403,7 +405,7 @@ async def test_prefix_real():
         raise KeyError("일부러 낸 오류")
     LM.do_warn = boom
     try:
-        out, log = await run(f"?warn {BASE + 7001} x")
+        out, log = await run(f"!warn {BASE + 7001} x")
     finally:
         LM.do_warn = real
     note(out and "처리 중 오류" in (out[0].get("content") or ""), "사람에게는 짧은 안내")

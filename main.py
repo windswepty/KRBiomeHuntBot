@@ -20,9 +20,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# 접두사 `?` 는 Dyno 식 처벌 명령어(?warn · ?ban · ?warnings, cogs/moderation.py)
-# 용입니다. 기본 help 는 영어이고 명령어 목록을 드러내므로 끕니다.
-bot = commands.Bot(command_prefix="?", intents=intents, help_command=None,
+# 접두사 `!` 는 Dyno 식 처벌 명령어(!warn · !ban · !warnings, cogs/moderation.py)
+# 용입니다. `?` 가 아닌 이유: Dyno 가 아직 서버에 있고 `?warn` 에 "Prefix commands
+# have been deprecated" 로 답합니다. 같은 접두사를 쓰면 두 봇이 한꺼번에 답합니다.
+# 기본 help 는 영어이고 명령어 목록을 드러내므로 끕니다.
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None,
                    case_insensitive=True)
 
 # 무인 운영 전제입니다. 관리자가 오래 자리를 비워도 스스로 살아나야 하므로,

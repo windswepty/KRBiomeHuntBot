@@ -1,4 +1,4 @@
-"""경고 · 밴 (cogs/moderation.py) — 명령어·버튼·모달·?명령어를 실제로 호출합니다.
+"""경고 · 밴 (cogs/moderation.py) — 명령어·버튼·모달·!명령어를 실제로 호출합니다.
 
 여기서 지켜야 할 것 (전부 '겉보기엔 되는데 조용히 틀리는' 자리입니다):
 
@@ -7,7 +7,7 @@
   3. 자동 처벌은 **정확히 그 횟수에 한 번** — 동시에 경고해도 건너뛰지 않는다
   4. 같은 경고를 두 번 풀어도 **한 번만** 빠진다
   5. 이름 검색은 `re.escape` — `.*` 로 기록이 통째로 나오면 안 된다
-  6. 슬래시와 ?명령어가 **같은 본체**를 쓴다 (한쪽만 검사가 빠지지 않게)
+  6. 슬래시와 !명령어가 **같은 본체**를 쓴다 (한쪽만 검사가 빠지지 않게)
 """
 import sys, os, tempfile, asyncio
 
@@ -69,7 +69,7 @@ def text_of(e):
 
 
 class Ctx:
-    """?명령어용 가짜 Context."""
+    """!명령어용 가짜 Context."""
     def __init__(self, author, command=None):
         self.guild, self.author, self.command = GUILD, author, command
         self.replies = []
@@ -463,13 +463,13 @@ async def test_settings_ui():
 
 
 async def test_prefix():
-    print("\n=== 8. ?warn · ?ban · ?warnings ===")
+    print("\n=== 8. !warn · !ban · !warnings ===")
     src = open(os.path.join(PROJ, "main.py"), encoding="utf-8").read()
-    note('command_prefix="?"' in src, "접두사가 ? 임")
-    bot = commands.Bot(command_prefix="?", intents=discord.Intents.all())
+    note('command_prefix="!"' in src, "접두사가 ! 임")
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
     await bot.load_extension("cogs.moderation")
     names = {c.name for c in bot.commands}
-    note({"warn", "ban", "warnings"} <= names, "?명령어 3개 등록", str(sorted(names)))
+    note({"warn", "ban", "warnings"} <= names, "!명령어 3개 등록", str(sorted(names)))
     cog = bot.get_cog("Moderation")
     moder = Member(7, "관리자", True, roles=[MOD_ROLE], guild=GUILD)
 
@@ -478,15 +478,15 @@ async def test_prefix():
     sayu = "채팅 도배"
     await cog.warn_prefix.callback(cog, ctx, t, 사유=sayu)
     e = ctx.replies[-1]["embed"]
-    note("경고 | 케이스" in e.title and sayu in e.description, "?warn → 경고", e.title)
+    note("경고 | 케이스" in e.title and sayu in e.description, "!warn → 경고", e.title)
     note(t.dms and ctx.replies[-1]["allowed_mentions"].users is False,
          "대상 DM · 채널 답장은 아무도 호출 안 함")
 
     ctx = Ctx(moder)
     await cog.warnings_prefix.callback(cog, ctx, t)
-    note(sayu in text_of(ctx.replies[-1]["embed"]), "?warnings → 사유가 보임")
+    note(sayu in text_of(ctx.replies[-1]["embed"]), "!warnings → 사유가 보임")
 
-    print("\n  ?warnings 에 경고·밴을 받은 **시각**이 보여야 합니다")
+    print("\n  !warnings 에 경고·밴을 받은 **시각**이 보여야 합니다")
     import re as _re, datetime as _dt
     tt = member(8603, "시각대상")
     await cog.warn_prefix.callback(cog, Ctx(moder), tt, 사유="시각확인경고")
@@ -514,15 +514,15 @@ async def test_prefix():
     note(M.when({}) == "? KST", "시각이 없으면 깨지지 않고 ? 로")
 
     ctx = Ctx(moder)
-    await cog.ban_prefix.callback(cog, ctx, t, 사유="?로 밴")
-    note(t.id in GUILD.bans and "밴 |" in ctx.replies[-1]["embed"].title, "?ban → 밴 + DM",
+    await cog.ban_prefix.callback(cog, ctx, t, 사유="!로 밴")
+    note(t.id in GUILD.bans and "밴 |" in ctx.replies[-1]["embed"].title, "!ban → 밴 + DM",
          ctx.replies[-1]["embed"].title)
 
     print("\n  ⚠️ 슬래시와 같은 검사를 거쳐야 합니다 (한쪽으로 우회 금지)")
     boss = member(8602, "높은사람3", [HIGH_ROLE])
     ctx = Ctx(moder)
     await cog.ban_prefix.callback(cog, ctx, boss, 사유="x")
-    note(boss.id not in GUILD.bans and not boss.dms, "?ban 도 역할이 높으면 거부")
+    note(boss.id not in GUILD.bans and not boss.dms, "!ban 도 역할이 높으면 거부")
 
     print("\n  오류는 무엇이 틀렸는지 알려 줍니다")
     param = type("P", (), {"name": "사유", "displayed_name": "사유"})()

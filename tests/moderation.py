@@ -72,6 +72,7 @@ class Ctx:
     """!명령어용 가짜 Context."""
     def __init__(self, author, command=None):
         self.guild, self.author, self.command = GUILD, author, command
+        self.prefix = "!"                    # 진짜 Context 는 친 접두사를 담습니다
         self.replies = []
 
     async def reply(self, *a, **k):
@@ -465,7 +466,8 @@ async def test_settings_ui():
 async def test_prefix():
     print("\n=== 8. !warn · !ban · !warnings ===")
     src = open(os.path.join(PROJ, "main.py"), encoding="utf-8").read()
-    note('command_prefix="!"' in src, "접두사가 ! 임")
+    note("command_prefix=prefix_for" in src and set(mdb.PREFIXES) >= {"!", "ㅂ!", "q!"},
+         "접두사 ! · ㅂ! · q! 를 셋 다 받음")
     bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
     await bot.load_extension("cogs.moderation")
     names = {c.name for c in bot.commands}

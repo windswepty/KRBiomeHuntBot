@@ -280,9 +280,9 @@ class Msg:
 async def test_prefix_real():
     print("\n=== 3. !명령어 — 진짜 discord.py 경로 (파싱 · 변환 · 권한 · 오류 · 답장) ===")
     src = io.open(os.path.join(PROJ, "main.py"), encoding="utf-8").read()
-    note('command_prefix="!"' in src and "help_command=None" in src
+    note("command_prefix=prefix_for" in src and "help_command=None" in src
          and "case_insensitive=True" in src, "main.py 의 봇 설정을 그대로 씁니다")
-    bot = commands.Bot(command_prefix="!", intents=discord.Intents.all(),
+    bot = commands.Bot(command_prefix=mdb.prefix_for, intents=discord.Intents.all(),
                        help_command=None, case_insensitive=True)
     await bot._async_setup_hook()          # 로그인 때 라이브러리가 하는 루프 연결
     await bot.load_extension("cogs.moderation")
@@ -389,6 +389,34 @@ async def test_prefix_real():
     note(not out, "기본 !help 는 꺼져 있음")
     out, _ = await run(f"?warn {t.id} Dyno 접두사")
     note(not out, "Dyno 의 ?warn 에는 반응하지 않음 (두 봇이 한꺼번에 답하지 않게)")
+
+    print("\n  접두사 ! · ㅂ! · q! 셋 다 늘 동작 (다른 봇과 겹치면 다른 것으로 치면 됨)")
+    for cmd in (f"ㅂ!warn {t.id} 한글 접두사", f"q!warn {t.id} 영문 접두사",
+                f"Q!warn {t.id} 휴대폰 대문자", f"!warn {t.id} 기본 접두사"):
+        out, _ = await run(cmd)
+        note(out and "경고 | 케이스" in (embed_of(out[0]).title or ""), f"{cmd.split()[0]} 동작")
+    out, _ = await run(f"q!WARNINGS {t.id}")
+    note(out and embed_of(out[0]) is not None, "q!WARNINGS (명령어 대문자) 도 동작")
+    out, _ = await run(f"ㅂ!warn {t.id}")
+    note(out and "`ㅂ!warn [유저 ID" in (out[0].get("content") or ""),
+         "사용법 안내는 친 접두사 그대로", (out[0].get("content") or "")[-40:] if out else "")
+    for other in (f"/warn {t.id} x", f"ㅂwarn {t.id} x", f"q warn {t.id} x"):
+        out, _ = await run(other)
+        note(not out, f"'{other.split()[0]}' 같은 다른 형태에는 반응 안 함")
+
+    calls = []
+    real_get = mdb.get_mod_settings
+
+    async def counting(gid):
+        calls.append(gid)
+        return await real_get(gid)
+    mdb.get_mod_settings = counting
+    try:
+        for _ in range(50):
+            await bot.process_commands(Msg(bot, "그냥 채팅", mod, ch))
+    finally:
+        mdb.get_mod_settings = real_get
+    note(not calls, "평범한 채팅 50줄에 DB 조회 0번 (접두사 판정은 DB 를 안 읽음)", f"{len(calls)}번")
 
     botuser = Member(BASE + 3, "다른봇", False, guild=GUILD)
     botuser.bot = True

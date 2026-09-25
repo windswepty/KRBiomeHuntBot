@@ -117,6 +117,21 @@ DEFAULT_MOD_SETTINGS = {
     "auto_rules": [],
 }
 
+# !warn · !ban · !warnings 의 접두사. **셋 다 늘 받습니다.** 다른 봇이 `!` 를
+# 써서 겹치면 운영진이 `ㅂ!` · `q!` 로 치면 됩니다 — 설정을 바꿀 필요가 없습니다.
+# `?` 는 넣지 않습니다: Dyno 가 아직 서버에 있고 `?warn` 에 답합니다.
+# `Q!` 는 휴대폰 키보드가 첫 글자를 대문자로 바꾸기 때문입니다.
+PREFIXES = ("!", "ㅂ!", "q!", "Q!")
+DEFAULT_PREFIX = "!"
+
+
+def prefix_for(bot, message):
+    """`commands.Bot(command_prefix=...)` 에 넘기는 함수 (main.py · 검증이 같이 씁니다).
+
+    **모든 채팅마다** 불리므로 DB 를 읽지 않습니다.
+    """
+    return list(PREFIXES)
+
 
 async def get_mod_settings(guild_id: int) -> dict:
     key = str(guild_id)

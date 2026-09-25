@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 1. **모든 디스코드 응답은 `ephemeral=True`** — 슬래시 명령어, View/Select/Button 상호작용 전부. 신규 코드에도 예외 없이 적용합니다.
 2. **작업 완료 시 자동 배포** — 코드 변경이 끝나면 `git add` → `commit` → `push`를 실행합니다. **커밋 메시지는 한국어**로 작성합니다.
    Render 시절에는 push 만으로 재배포됐지만 **지금은 Oracle 이라 자동이 아닙니다.**
-   서버에서 아래를 실행해야 반영됩니다.
+   디스코드 `/봇업데이트`(검사 후 적용 · 실패 시 되돌림) 또는 서버에서:
 
    ```bash
    ssh krbiomehunt
@@ -126,7 +126,7 @@ asyncio.run(m())"
 
 **경고·밴**(`moderation` · `utils/mod_db.py` · `mod_settings` `mod_cases` `mod_users`)은
 세 번째 독립 시스템입니다 — 위 둘 다 import 하지 않습니다. `!warn` `!ban` `!warnings`
-(접두사 `!`)는 상호작용이 아니라 **규칙 1의 예외**로 채널에 답합니다. 슬래시와
+(접두사 `!` `ㅂ!` `q!` 전부)는 상호작용이 아니라 **규칙 1의 예외**로 채널에 답합니다. 슬래시와
 같은 본체(`do_warn` `do_ban`)를 쓰세요 — 갈라지면 한쪽으로 검사가 우회됩니다.
 
 ### 데이터 계층 패턴

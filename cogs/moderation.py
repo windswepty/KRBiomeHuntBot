@@ -26,6 +26,7 @@ from utils.mod_db import (
     get_mod_settings, save_mod_settings, add_case, add_warning,
     get_user_cases, get_active_warnings, find_users_by_name,
     remove_warnings, AUTO_ACTIONS, TIMEOUT_MAX_MINUTES,
+    PREFIXES, DEFAULT_PREFIX,
 )
 
 
@@ -1109,6 +1110,9 @@ def build_panel_embed(guild, settings: dict) -> discord.Embed:
     # 칸이 1024자를 넘으면 패널 **전송 자체가 실패**해 /경고설정 이 안 열립니다
     for i, chunk in enumerate(_chunk_lines([describe_rule(r) for r in rules]) or ["없음"]):
         embed.add_field(name="⚖️ 자동 처벌" if i == 0 else "\u200b", value=chunk, inline=False)
+    embed.add_field(name="⌨️ 접두사 명령어",
+                    value="`!warn` · `ㅂ!warn` · `q!warn` 셋 다 됩니다 (ban · warnings 도 같음)",
+                    inline=False)
     embed.set_footer(text="이 화면은 본인에게만 보입니다")
     return embed
 
@@ -1315,9 +1319,9 @@ async def record_embed_for(guild, user) -> discord.Embed:
 
 
 PREFIX_USAGE = {
-    "warn": "`!warn [유저 ID 또는 멘션] [사유]`",
-    "ban": "`!ban [유저 ID 또는 멘션] [사유]`",
-    "warnings": "`!warnings [유저 ID 또는 멘션]`",
+    "warn": "`{p}warn [유저 ID 또는 멘션] [사유]`",
+    "ban": "`{p}ban [유저 ID 또는 멘션] [사유]`",
+    "warnings": "`{p}warnings [유저 ID 또는 멘션]`",
 }
 
 
@@ -1416,7 +1420,9 @@ class Moderation(commands.Cog):
         if isinstance(error, commands.CommandNotFound):
             return          # !로 시작하는 평범한 채팅 — 조용히 넘어갑니다
         name = ctx.command.name if ctx.command else ""
-        usage = PREFIX_USAGE.get(name, "")
+        # 접두사는 서버마다 바꿀 수 있으므로 **실제로 친 접두사**로 안내합니다
+        p = ctx.prefix or DEFAULT_PREFIX
+        usage = PREFIX_USAGE.get(name, "").format(p=p)
         if isinstance(error, commands.MissingPermissions):
             msg = "⛔ 이 명령어를 쓸 권한이 없습니다."
         elif isinstance(error, commands.NoPrivateMessage):
@@ -1426,7 +1432,7 @@ class Moderation(commands.Cog):
         elif isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
             msg = ("⚠️ 유저를 찾지 못했습니다. **유저 ID** 나 멘션으로 적어 주세요.\n"
                    f"사용법: {usage}"
-                   + ("\n-# `!warn` 은 서버에 있는 사람만 됩니다. 나간 사람은 `!ban` 으로 막으세요."
+                   + (f"\n-# `{p}warn` 은 서버에 있는 사람만 됩니다. 나간 사람은 `{p}ban` 으로 막으세요."
                       if name == "warn" else ""))
         elif isinstance(error, commands.BadArgument):
             msg = f"⚠️ 입력을 이해하지 못했습니다.\n사용법: {usage}"

@@ -55,6 +55,57 @@ def test_pending():
     ro.start(1, 8)          # 새 발급이 청소를 유발합니다
     note(len(ro._pending) == 1, f"만료분 자동 정리 (남은 {len(ro._pending)}개)")
 
+    print("")
+    print("  ⚠️ 실패 이유를 갈라야 합니다 (실측 7건이 전부 같은 한 줄이었습니다)")
+    # 한 줄로 뭉개면 새로고침인지 · 오래 걸린 것인지 · 재시작으로 날아간
+    # 것인지 구분이 안 되고, 셋은 고쳐야 할 것이 서로 다릅니다.
+    ro.clear()
+    _, s_ok = ro.start(1, 7)
+    info, why = ro.take_pending_detailed(s_ok)
+    note(info is not None and why == "ok", "정상은 ok", why)
+
+    _, why = ro.take_pending_detailed(s_ok)
+    note(why == "used", "**같은 것을 다시 누르면 used** (새로고침·뒤로가기)", why)
+
+    _, why = ro.take_pending_detailed("전혀모르는state")
+    note(why == "unknown", "모르는 것은 unknown (재시작·옛 링크)", why)
+
+    _, why = ro.take_pending_detailed("")
+    note(why == "empty", "state 가 아예 없으면 empty", why)
+
+    ro.clear()
+    _, s_old = ro.start(1, 7)
+    ro._pending[s_old]["expires"] = time.monotonic() - 1
+    _, why = ro.take_pending_detailed(s_old)
+    note(why == "expired", "오래 걸린 것은 expired", why)
+    # 만료된 것도 '썼다'고 기록해야, 새로고침이 unknown 으로 흐려지지 않습니다.
+    _, why2 = ro.take_pending_detailed(s_old)
+    note(why2 == "used", "만료 뒤 새로고침은 used (unknown 으로 흐려지지 않음)",
+         why2)
+
+    print("")
+    print("  로그인 제한 시간은 10분으로는 모자랐습니다")
+    # 실측(2026-09-18~25): 성공 16 · 실패 7(30%). 로블록스 로그인은
+    # 비밀번호·2단계 인증·계정 생성까지 끼면 휴대폰에서 10분을 넘깁니다.
+    note(ro.PENDING_TTL >= 1800, f"{ro.PENDING_TTL // 60}분 이상")
+    note(ro.take_pending(s_ok) is None, "옛 함수도 그대로 동작 (호환)")
+
+    print("")
+    print("  쓴 기록이 무한정 쌓이면 안 됩니다")
+    ro.clear()
+    for _ in range(5):
+        _, s = ro.start(1, 7)
+        ro.take_pending_detailed(s)
+        ro._used[s] = time.monotonic() - 1      # 보관 기간이 지난 것으로
+    ro.start(1, 8)          # 새 발급이 청소를 유발합니다
+    note(len(ro._used) == 0, f"지난 기록 자동 정리 (남은 {len(ro._used)}개)")
+    # verifier 를 오래 들고 있지 않아야 합니다 (값 없이 시각만 남깁니다)
+    ro.clear()
+    _, s = ro.start(1, 7)
+    ro.take_pending_detailed(s)
+    note(all(isinstance(v, float) for v in ro._used.values()),
+         "**쓴 기록에는 verifier 를 남기지 않음**")
+
 
 # ── 토큰 교환 ──────────────────────────────────────────────────────
 def test_exchange():

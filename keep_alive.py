@@ -149,7 +149,15 @@ _MESSAGES = {
                   "이 로블록스 계정은 다른 디스코드 계정에 이미 연결돼 있습니다.<br>"
                   "본인 계정이 맞다면 관리자에게 문의해 주세요."),
     "rbx_expired": ("연동 요청이 만료되었습니다",
-                    "디스코드에서 <b>/로블록스연동</b> 을 다시 실행해 주세요."),
+                    "디스코드에서 <b>/로블록스연동</b> 을 다시 실행해 주세요.<br>"
+                    "<small>예전에 받은 링크는 다시 눌러도 열리지 않습니다.</small>"),
+    # 새로고침이나 뒤로가기로 같은 주소를 다시 연 경우입니다.
+    # 앞선 시도가 성공했을 수 있으므로 **실패했다고 단정하지 않습니다** —
+    # 단정하면 이미 연동된 사람이 관리자에게 문의하게 됩니다.
+    "rbx_used": ("이미 처리된 요청입니다",
+                 "이 주소는 한 번만 쓸 수 있습니다.<br>"
+                 "디스코드에서 <b>/내연동정보</b> 로 연동됐는지 확인해 주세요.<br>"
+                 "안 돼 있으면 <b>/로블록스연동</b> 을 다시 실행하시면 됩니다."),
     "rbx_failed": ("로블록스 연동에 실패했습니다",
                    "잠시 후 다시 시도해 주세요.<br>"
                    "문제가 계속되면 관리자에게 문의해 주세요."),
@@ -655,10 +663,18 @@ def roblox_callback():
               f"({request.args.get('error_description', '')})", flush=True)
         return _page("rbx_failed")
 
-    pending = roblox_oauth.take_pending(request.args.get("state") or "")
+    pending, why = roblox_oauth.take_pending_detailed(
+        request.args.get("state") or "")
     if pending is None:
-        print("[RobloxOAuth] 콜백 실패: state 없음 또는 만료", flush=True)
-        return _page("rbx_expired")
+        # **한 줄로 뭉개지 않습니다.** 셋은 고쳐야 할 것이 서로 다릅니다.
+        note = {
+            "used": "이미 쓴 state (새로고침·뒤로가기로 보입니다 — 정상일 수 있음)",
+            "expired": f"로그인이 {roblox_oauth.PENDING_TTL // 60}분을 넘겼습니다",
+            "unknown": "모르는 state (봇 재시작으로 날아갔거나 옛 링크를 다시 누름)",
+            "empty": "state 파라미터가 아예 없습니다",
+        }.get(why, why)
+        print(f"[RobloxOAuth] 콜백 실패({why}): {note}", flush=True)
+        return _page("rbx_used" if why == "used" else "rbx_expired")
 
     code = request.args.get("code")
     if not code:

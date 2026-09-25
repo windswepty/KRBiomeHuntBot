@@ -35,13 +35,29 @@ SCOPES = "openid profile"
 # 지정합니다. 로블록스는 현재 기본 UA 도 통과시키지만 의존하지 않습니다.
 USER_AGENT = "KRBiomeHuntBot (https://github.com/windswepty/KRBiomeHuntBot, 1.0)"
 
-# 로그인 왕복 제한 시간
-PENDING_TTL = 600          # 10분
+# 로그인 왕복 제한 시간.
+#
+# 예전에는 10분이었는데, 실측(2026-09-18~25)에서 콜백 실패가 **성공 16건에
+# 실패 7건(30%)** 이었습니다. 로블록스 로그인은 비밀번호·2단계 인증·계정
+# 생성까지 끼면 휴대폰에서 10분을 넘기기 쉽습니다.
+#
+# 늘려도 안전한 이유: state_id 는 24바이트 난수이고 **1회용**이며 PKCE
+# (code_verifier)가 따로 붙습니다. 30분은 흔한 값입니다.
+PENDING_TTL = 1800         # 30분
 MAX_PENDING = 2000
+
+# 이미 쓴 state 를 잠깐 기억합니다. **원인을 가르기 위한 것**입니다 —
+# 기억하지 않으면 "새로고침해서 두 번 온 것"과 "처음부터 없던 것"이
+# 로그에서 똑같이 보입니다. 실제로 11초 간격으로 같은 실패가 두 번
+# 찍힌 적이 있는데, 그게 무엇이었는지 끝내 알 수 없었습니다.
+USED_TTL = 900             # 15분
+MAX_USED = 2000
 
 _lock = threading.Lock()
 # state_id -> {"guild_id", "user_id", "verifier", "expires"}
 _pending: dict[str, dict] = {}
+# state_id -> 버릴 시각 (값은 남기지 않습니다 — verifier 를 오래 두지 않으려고)
+_used: dict[str, float] = {}
 
 
 def client_id() -> str:
@@ -67,6 +83,12 @@ def _purge_locked(now: float) -> None:
     if len(_pending) > MAX_PENDING:
         for k in list(_pending)[:len(_pending) - MAX_PENDING // 2]:
             _pending.pop(k, None)
+
+    for k in [k for k, t in _used.items() if t <= now]:
+        _used.pop(k, None)
+    if len(_used) > MAX_USED:
+        for k in list(_used)[:len(_used) - MAX_USED // 2]:
+            _used.pop(k, None)
 
 
 def start(guild_id: int, user_id: int) -> tuple[str, str]:
@@ -103,15 +125,38 @@ def start(guild_id: int, user_id: int) -> tuple[str, str]:
     return f"{AUTHORIZE}?{urllib.parse.urlencode(params)}", state_id
 
 
-def take_pending(state_id: str) -> dict | None:
-    """state 를 소비합니다(1회용). 없거나 만료면 None."""
+def take_pending_detailed(state_id: str) -> tuple[dict | None, str]:
+    """state 를 소비하고(1회용) **왜 실패했는지까지** 돌려줍니다.
+
+    돌려주는 이유는 `ok` · `empty` · `used` · `expired` · `unknown` 입니다.
+    한 줄로 뭉개면 안 되는 이유는, 셋이 서로 **고쳐야 할 것이 다르기**
+    때문입니다.
+
+      · `used`    새로고침하거나 뒤로 갔다 다시 온 것 — 고칠 것이 없습니다
+      · `expired` 로그인이 오래 걸린 것 — `PENDING_TTL` 을 봐야 합니다
+      · `unknown` 봇 재시작으로 날아갔거나(메모리에만 둡니다) 옛 링크를
+                  다시 누른 것 — 안내 문구를 봐야 합니다
+    """
     now = time.monotonic()
+    if not state_id:
+        return None, "empty"
     with _lock:
         info = _pending.pop(state_id, None)
+        if info is not None:
+            # 만료됐어도 **쓴 것으로 기록**합니다. 안 그러면 새로고침했을 때
+            # expired 가 unknown 으로 바뀌어 원인이 흐려집니다.
+            _used[state_id] = now + USED_TTL
         _purge_locked(now)
-        if info is None or info["expires"] <= now:
-            return None
-        return info
+        if info is None:
+            return None, ("used" if state_id in _used else "unknown")
+        if info["expires"] <= now:
+            return None, "expired"
+        return info, "ok"
+
+
+def take_pending(state_id: str) -> dict | None:
+    """state 를 소비합니다(1회용). 없거나 만료면 None."""
+    return take_pending_detailed(state_id)[0]
 
 
 def _request(url: str, data: bytes | None, headers: dict, method: str) -> dict | None:
@@ -272,6 +317,9 @@ def clear() -> None:
         _name_cache.clear()
     with _lock:
         _pending.clear()
+        # 이것도 비웁니다 — 안 비우면 앞 시험이 쓴 state 때문에
+        # 뒤 시험에서 `unknown` 이 `used` 로 보입니다.
+        _used.clear()
 
 
 # ── 저장 다리 (Flask 스레드 → asyncio 봇) ─────────────────────────────

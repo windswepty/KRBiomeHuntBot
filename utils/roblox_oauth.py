@@ -347,3 +347,29 @@ def save_link(guild_id: int, user_id: int, info: dict) -> tuple[bool, str]:
     except Exception as e:
         print(f"[RobloxOAuth] 저장 실패: {type(e).__name__}: {e}", flush=True)
         return False, "error"
+
+
+# ── 결과 기록 다리 (Flask 스레드 → asyncio 봇) ─────────────────────────
+#
+# 실패 원인이 서버 로그에만 남으면 SSH 를 못 쓰는 사람은 볼 수 없습니다.
+# 봇이 DB 에 세어 두면 `/연동점검` 이 보여 줍니다.
+#
+# **기다리지 않습니다.** 기록은 있으면 좋은 것이고, 유저가 보는 안내
+# 페이지가 그것 때문에 늦어지면 안 됩니다.
+
+_recorder = None
+
+
+def set_recorder(fn) -> None:
+    """fn(reason) 형태. 예외를 던지지 않고 바로 돌아와야 합니다."""
+    global _recorder
+    _recorder = fn
+
+
+def record(reason: str) -> None:
+    if _recorder is None:
+        return
+    try:
+        _recorder(reason)
+    except Exception as e:
+        print(f"[RobloxOAuth] 결과 기록 실패: {type(e).__name__}: {e}", flush=True)

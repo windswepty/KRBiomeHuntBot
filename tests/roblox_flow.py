@@ -418,6 +418,133 @@ async def test_linked_role():
             guild.members.remove(m)
 
 
+# ── 로그인 결과 기록 ───────────────────────────────────────────────
+def test_callback_record():
+    print("")
+    print("=== 콜백의 모든 갈래가 결과를 남겨야 합니다 (SSH 없이 보려면) ===")
+    # 실패 원인을 갈라 놓고도 서버 로그에만 남기면, 관리자가 자리를
+    # 비운 동안 "며칠 쌓이면 답이 나온다" 를 아무도 확인하지 못합니다.
+    import keep_alive
+    c = keep_alive.app.test_client()
+    got = []
+    ro.set_recorder(got.append)
+    real_exchange, real_save = ro.exchange, ro.save_link
+    info = {"roblox_id": 42, "roblox_name": "tester", "created_at": ""}
+
+    def hit(path, expect, label):
+        got.clear()
+        c.get(path)
+        note(got == [expect], f"{label} → {expect}", str(got))
+
+    try:
+        ro.clear()
+        got.clear()
+        c.head("/roblox/callback?state=x&code=y")
+        note(got == [], "HEAD(미리보기)는 세지 않음 — state 도 안 태우는 요청", str(got))
+
+        hit("/roblox/callback?error=access_denied", "denied", "로블록스에서 거부")
+        hit("/roblox/callback?code=y", "empty", "state 없음")
+        hit("/roblox/callback?state=nope&code=y", "unknown", "모르는 state")
+
+        _, sid = ro.start(1, 7)
+        ro._pending[sid]["expires"] = time.monotonic() - 1
+        hit(f"/roblox/callback?state={sid}&code=y", "expired", "오래 걸림")
+        hit(f"/roblox/callback?state={sid}&code=y", "used", "새로고침")
+
+        _, sid = ro.start(1, 7)
+        hit(f"/roblox/callback?state={sid}", "no_code", "code 없음")
+
+        ro.exchange = lambda code, verifier: None
+        _, sid = ro.start(1, 7)
+        hit(f"/roblox/callback?state={sid}&code=y", "exchange", "토큰 교환 실패")
+
+        ro.exchange = lambda code, verifier: dict(info)
+        ro.save_link = lambda g, u, i: (False, "taken")
+        _, sid = ro.start(1, 7)
+        hit(f"/roblox/callback?state={sid}&code=y", "taken", "이미 연결된 계정")
+
+        ro.save_link = lambda g, u, i: (False, "error")
+        _, sid = ro.start(1, 7)
+        hit(f"/roblox/callback?state={sid}&code=y", "save", "저장 실패")
+
+        ro.save_link = lambda g, u, i: (True, "ok")
+        _, sid = ro.start(1, 7)
+        hit(f"/roblox/callback?state={sid}&code=y", "ok", "성공")
+
+        cid = os.environ.pop("ROBLOX_CLIENT_ID")
+        try:
+            hit("/roblox/callback?state=x&code=y", "disabled", "OAuth 꺼짐")
+        finally:
+            os.environ["ROBLOX_CLIENT_ID"] = cid
+
+        # 기록이 터져도 유저가 보는 페이지는 멀쩡해야 합니다
+        def boom(_):
+            raise RuntimeError("기록 실패")
+        ro.set_recorder(boom)
+        ro.save_link = lambda g, u, i: (True, "ok")
+        _, sid = ro.start(1, 7)
+        r = c.get(f"/roblox/callback?state={sid}&code=y")
+        note(r.status_code == 200, "기록이 실패해도 성공 페이지는 그대로",
+             str(r.status_code))
+    finally:
+        ro.exchange, ro.save_link = real_exchange, real_save
+        ro.set_recorder(None)
+        ro.clear()
+
+
+async def test_oauth_results():
+    print("")
+    print("=== 로그인 결과 집계 · /연동점검 표시 ===")
+    from utils import verify_db as vdb
+    base = (await vdb.get_oauth_results(7))["counts"]
+    note(not base, "처음에는 비어 있음", str(base))
+    txt = RL.format_oauth_results(await vdb.get_oauth_results(7), 30)
+    note("아직 기록이 없습니다" in txt, "기록이 없으면 없다고 말함 (0% 로 속이지 않음)")
+
+    for r in ("ok", "ok", "ok", "used", "expired", "unknown", "unknown"):
+        await vdb.record_oauth_result(r)
+    await vdb.record_oauth_result("a.b$c")
+    res = await vdb.get_oauth_results(7)
+    cnt = res["counts"]
+    note(cnt.get("ok") == 3 and cnt.get("unknown") == 2 and cnt.get("used") == 1,
+         "이유별로 셈", str(cnt))
+    note("a.b$c" not in cnt and cnt.get("other") == 1,
+         "모르는 이유는 other 로 (필드 이름에 점·$ 가 들어가지 않음)", str(cnt))
+    note(bool(res["first_day"]), "기록을 시작한 날을 돌려줌 (며칠치인지 알아야 함)",
+         res["first_day"])
+
+    txt = RL.format_oauth_results(res, 30)
+    note("성공 **3** · 실패 **5**" in txt and "실패율 62%" in txt,
+         "성공과 실패를 같이 (분모 없는 개수 금지)", txt.split(chr(10))[0])
+    note("30분" in txt, "만료 문구에 실제 제한 시간이 들어감")
+    note("취소·거부" not in txt, "0건인 이유는 적지 않음")
+    note("여러 건으로" in txt, "한 사람의 반복 실패가 섞인다는 단서를 붙임")
+    note(len(txt) <= 1024, "칸 1024자 이내", str(len(txt)))
+
+    print("")
+    print("  Flask 스레드 → 봇 루프로 넘어가 실제로 저장돼야 합니다")
+    rec = RL._make_recorder(asyncio.get_running_loop())
+    await asyncio.to_thread(rec, "denied")
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if (await vdb.get_oauth_results(7))["counts"].get("denied"):
+            break
+    note((await vdb.get_oauth_results(7))["counts"].get("denied") == 1,
+         "다른 스레드에서 부른 기록이 저장됨")
+
+    print("")
+    print("  /연동점검 화면에 실제로 뜨는지")
+    cog = RL.RobloxLink(None)
+    it = F.Inter()
+    it.guild = F.GUILD
+    await cog.link_check.callback(cog, it)
+    sent = (it.followup.sent or [{}])[-1]
+    emb = sent.get("embed")
+    field = next((f for f in emb.fields if "로그인 결과" in f.name), None) if emb else None
+    note(field is not None and "실패율" in field.value,
+         "/연동점검 에 로그인 결과 칸", field.value[:40] if field else "")
+
+
 async def main():
     test_pending()
     test_exchange()
@@ -425,6 +552,8 @@ async def main():
     await test_duplicate_account()
     await test_revoke()
     await test_link_check()
+    test_callback_record()
+    await test_oauth_results()
     await test_linked_role()
     test_disabled()
 

@@ -27,6 +27,7 @@ GUARDKEY_FILE = os.path.join(DATA_DIR, "guarded_keys.json")
 USAGE_FILE = os.path.join(DATA_DIR, "link_usage.json")
 LOGREF_FILE = os.path.join(DATA_DIR, "log_references.json")
 ROBLOX_FILE = os.path.join(DATA_DIR, "roblox_links.json")
+OAUTH_FILE = os.path.join(DATA_DIR, "oauth_events.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 KST = timezone(timedelta(hours=9))
@@ -41,6 +42,7 @@ _usage_lock = asyncio.Lock()
 _logref_lock = asyncio.Lock()
 _roblox_lock = asyncio.Lock()
 _biome_lock = asyncio.Lock()
+_oauth_lock = asyncio.Lock()
 
 verify_col = None
 linkguard_col = None
@@ -52,6 +54,7 @@ usage_col = None
 logref_col = None
 roblox_col = None
 biome_col = None
+oauth_col = None
 
 if MONGO_URI:
     try:
@@ -69,6 +72,7 @@ if MONGO_URI:
         logref_col = _db["log_references"]
         roblox_col = _db["roblox_links"]
         biome_col = _db["biome_events"]
+        oauth_col = _db["oauth_events"]
 
         # 인덱스는 없어도 기능은 동작하므로, 생성에 실패해도 Mongo 연결 자체를
         # 포기하지 않도록 별도의 try로 감쌉니다. create_index는 멱등이라
@@ -121,6 +125,11 @@ if MONGO_URI:
             biome_col.create_index(
                 "updated", name="biome_ttl", expireAfterSeconds=90 * 24 * 3600
             )
+            # 로블록스 로그인 결과(날짜 버킷). '며칠 쌓이면 원인이 보인다'
+            # 를 보려는 것이라 30일이면 충분합니다.
+            oauth_col.create_index(
+                "updated", name="oauth_ttl", expireAfterSeconds=30 * 24 * 3600
+            )
         except Exception as e:
             print(f"MongoDB index setup warning: {e}", flush=True)
 
@@ -136,6 +145,8 @@ if MONGO_URI:
         usage_col = None
         logref_col = None
         roblox_col = None
+        biome_col = None
+        oauth_col = None
 
 
 def _utcnow():
@@ -1595,3 +1606,93 @@ async def get_biome_buckets(guild_id: int, since_days: int = 30) -> list[dict]:
             out.append(dict(row))
     out.sort(key=lambda r: r.get("day", ""), reverse=True)
     return out
+
+
+# ── 로블록스 로그인 결과 ─────────────────────────────────────────────
+#
+# 콜백 실패 원인(`used` · `expired` · `unknown` …)을 가르기 시작했는데
+# **서버 로그에만** 남아서, SSH 를 못 쓰는 사람은 볼 수 없었습니다.
+# 관리자가 자리를 비우면 "며칠 쌓이면 답이 나온다" 를 아무도 확인하지
+# 못합니다. 그래서 날짜 버킷에 세고 `/연동점검` 이 보여 줍니다.
+#
+#   _id = "oauth:<KST 날짜>"   { ok: 3, used: 1, expired: 0, ... }
+#
+# ⚠️ **길드로 나누지 않습니다.** 실패의 대부분(`unknown` · `used` ·
+# `empty` · `denied`)은 state 를 못 읽은 것이라 **어느 서버의 요청인지
+# 알 수 없습니다.** 억지로 나누면 실패만 빠져 성공률이 부풀려집니다.
+# 이 봇은 서버 하나에서 돕니다.
+
+OAUTH_REASONS = ("ok", "used", "expired", "unknown", "empty", "denied",
+                 "no_code", "exchange", "taken", "save", "disabled")
+
+
+def _oauth_reason(reason: str) -> str:
+    # 필드 이름이 되므로 아는 값만 받습니다(점 · `$` 가 섞이면 Mongo 가
+    # 중첩 문서를 만들거나 거부합니다).
+    return reason if reason in OAUTH_REASONS else "other"
+
+
+async def record_oauth_result(reason: str) -> None:
+    """로블록스 로그인 콜백 한 번의 결과를 셉니다."""
+    now = datetime.now(timezone.utc)
+    day = _biome_day()
+    key = f"oauth:{day}"
+    field = _oauth_reason(reason)
+
+    if oauth_col is not None:
+        try:
+            await _db(oauth_col.update_one, {"_id": key},
+                      {"$inc": {field: 1}, "$set": {"updated": now},
+                       "$setOnInsert": {"day": day}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB record_oauth_result error: {e}, using local file.", flush=True)
+
+    async with _oauth_lock:
+        all_rows = _read_json(OAUTH_FILE)
+        row = all_rows.get(key) or {"day": day}
+        row[field] = int(row.get(field, 0) or 0) + 1
+        row["updated"] = now.isoformat()
+        all_rows[key] = row
+        _write_json(OAUTH_FILE, all_rows)
+
+
+async def get_oauth_results(since_days: int = 7) -> dict:
+    """기간 안의 결과를 합칩니다.
+
+    돌려주는 것: {"counts": {이유: 횟수}, "first_day": 가장 이른 기록 날짜}
+    `first_day` 가 있어야 "7일" 이 실제로 며칠치인지 압니다 — 기록을
+    시작한 지 이틀이면 7일 합계가 아니라 이틀 합계입니다.
+    """
+    days = max(1, int(since_days))
+    cutoff_day = (datetime.now(KST) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+
+    rows = None
+    if oauth_col is not None:
+        try:
+            def _fetch():
+                return list(oauth_col.find({"day": {"$gte": cutoff_day}}))
+            rows = await _db(_fetch)
+        except Exception as e:
+            print(f"MongoDB get_oauth_results error: {e}, using local file.", flush=True)
+            rows = None
+    if rows is None:
+        async with _oauth_lock:
+            all_rows = _read_json(OAUTH_FILE)
+        rows = [r for r in all_rows.values()
+                if str(r.get("day", "")) >= cutoff_day]
+
+    counts: dict = {}
+    first = ""
+    for r in rows:
+        day = str(r.get("day", ""))
+        if day and (not first or day < first):
+            first = day
+        for k, v in r.items():
+            if k in ("_id", "day", "updated"):
+                continue
+            try:
+                counts[k] = counts.get(k, 0) + int(v or 0)
+            except (TypeError, ValueError):
+                continue
+    return {"counts": counts, "first_day": first}

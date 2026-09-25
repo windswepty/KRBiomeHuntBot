@@ -995,7 +995,8 @@ DB에서 지워진 값을 캐시가 계속 돌려주거나 캐시가 무한히 �
 - `utils/database.py`(포인트 · 상점 · 뽑기 · 제보 · 블랙리스트)를 **전혀 import 하지 않습니다**.
 - 포인트를 지급 · 차감하지 않고, `/로그`의 활동 기록에도 남기지 않습니다.
 - MongoDB 컬렉션(`verify_settings`, `linkguard_settings`, `protected_links`,
-  `link_clicks`, `link_watermarks`, `guarded_keys`, `roblox_links`)과
+  `link_clicks`, `link_watermarks`, `guarded_keys`, `roblox_links`,
+  `biome_events`, `oauth_events`)과
   로컬 JSON 파일(`data/verify_settings.json` 등)을 **별도로 사용**합니다.
 
 따라서 이코노미 쪽 코드를 수정하거나 제거해도 인증 · 링크 보호는 그대로 동작합니다.

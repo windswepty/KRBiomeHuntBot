@@ -655,12 +655,14 @@ def roblox_callback():
 
     if not roblox_oauth.enabled():
         print("[RobloxOAuth] 콜백 실패: 환경 변수 누락", flush=True)
+        roblox_oauth.record("disabled")
         return _page("rbx_failed")
 
     err = request.args.get("error")
     if err:
         print(f"[RobloxOAuth] 콜백 실패: 로블록스가 거부 - {err} "
               f"({request.args.get('error_description', '')})", flush=True)
+        roblox_oauth.record("denied")
         return _page("rbx_failed")
 
     pending, why = roblox_oauth.take_pending_detailed(
@@ -674,27 +676,33 @@ def roblox_callback():
             "empty": "state 파라미터가 아예 없습니다",
         }.get(why, why)
         print(f"[RobloxOAuth] 콜백 실패({why}): {note}", flush=True)
+        roblox_oauth.record(why)
         return _page("rbx_used" if why == "used" else "rbx_expired")
 
     code = request.args.get("code")
     if not code:
         print("[RobloxOAuth] 콜백 실패: code 파라미터 없음", flush=True)
+        roblox_oauth.record("no_code")
         return _page("rbx_failed")
 
     info = roblox_oauth.exchange(code, pending["verifier"])
     if info is None:
+        roblox_oauth.record("exchange")
         return _page("rbx_failed")
 
     ok, reason = roblox_oauth.save_link(
         pending["guild_id"], pending["user_id"], info)
     if not ok:
         if reason == "taken":
+            roblox_oauth.record("taken")
             return _page("rbx_taken", status=409)
         print(f"[RobloxOAuth] 저장 거부: {reason}", flush=True)
+        roblox_oauth.record("save")
         return _page("rbx_failed")
 
     print(f"[RobloxOAuth] 연동 성공: discord={pending['user_id']} "
           f"roblox={info['roblox_id']}({info['roblox_name']})", flush=True)
+    roblox_oauth.record("ok")
 
     if _bot is not None:
         try:

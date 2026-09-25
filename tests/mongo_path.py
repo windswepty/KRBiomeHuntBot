@@ -23,7 +23,7 @@ DB_COLS = ["users_col", "settings_col", "shop_col", "gacha_col", "logs_col",
 
 VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
             "watermark_col", "guardkey_col", "usage_col", "logref_col",
-            "roblox_col"]
+            "roblox_col", "oauth_col"]
 
 
 class UpdateOne:
@@ -276,6 +276,19 @@ async def run_all(db, vdb, cols, vcols):
         rows = await vdb.search_roblox_links(G, ".*", 10)
         note(len(rows) == 0, "정규식 특수문자는 문자 그대로 (re.escape)",
              f"{len(rows)}건 — 명단 덤프 방지")
+
+    if hasattr(vdb, "record_oauth_result"):
+        print("\n=== 로그인 결과 집계 ($inc upsert · $gte) ===")
+        await asyncio.gather(*(vdb.record_oauth_result(r)
+                               for r in ["ok"] * 5 + ["used", "unknown"]))
+        await vdb.record_oauth_result("x.y")
+        res = await vdb.get_oauth_results(7)
+        c = res["counts"]
+        note(c.get("ok") == 5 and c.get("used") == 1 and c.get("unknown") == 1,
+             "동시에 기록해도 빠짐없이 셈 ($inc)", str(c))
+        note(c.get("other") == 1 and "x.y" not in c,
+             "모르는 이유는 other (점이 필드 이름으로 가지 않음)", str(c))
+        note(bool(res["first_day"]), "기록 시작일", res["first_day"])
 
 
 asyncio.run(main())

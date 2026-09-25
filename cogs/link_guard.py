@@ -3476,7 +3476,12 @@ async def _retry_transient(fn):
     last = None
     for i, wait in enumerate((*TRANSIENT_BACKOFF, None)):
         try:
-            return await fn()
+            result = await fn()
+            if i:
+                # 재시도가 실제로 살린 건수. 이게 0 이면 재시도는 쓸모없고,
+                # 실패가 계속 남으면 재시도 폭이 모자란 것입니다.
+                health.count_guard("retry_saved")
+            return result
         except (discord.NotFound, discord.Forbidden):
             raise
         except discord.HTTPException as e:
@@ -4152,6 +4157,7 @@ class LinkGuard(commands.Cog):
             print(f"[LinkGuard] 🚨 원본 삭제 실패 — #{message.channel} 에 "
                   f"원문 링크가 그대로 남았습니다 ({type(e).__name__}: {e})",
                   flush=True)
+            health.count_guard("delete_failed")
             return
 
         # 5. 원본 작성자(웹훅) 정보를 임베드에 남겨 누가 보냈는지 알 수 있게 합니다
@@ -4268,6 +4274,7 @@ class LinkGuard(commands.Cog):
             print(f"[LinkGuard] 🚨 재게시 실패 — #{message.channel} 의 바이옴 "
                   f"알림이 사라졌습니다 (원본은 이미 삭제됨). "
                   f"{type(e).__name__}: {e}", flush=True)
+            health.count_guard("send_failed")
             return
 
         # 6. 재게시된 메시지 ID를 키로 원본 링크를 저장 (버튼이 이 키로 조회합니다)

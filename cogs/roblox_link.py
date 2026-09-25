@@ -26,8 +26,62 @@ from utils.verify_db import (
     remove_roblox_link, list_roblox_links, search_roblox_links,
     get_verify_settings, get_linkguard_settings, get_usage_summary,
     get_link_usage, get_protected_link, get_log_reference,
+    record_oauth_result, get_oauth_results,
     KST,
 )
+
+
+# `/연동점검` 에 보여 줄 로그인 실패 원인. **단정하지 않습니다** — 한
+# 사람이 여러 번 실패하면 여러 건이 되고, 적은 숫자로 원인을 못 박으면
+# 멀쩡한 설정을 고치게 됩니다. 무엇을 봐야 하는지만 적습니다.
+_OAUTH_REASON_TEXT = (
+    ("used", "🔁 새로고침·뒤로가기",
+     "대개 괜찮습니다 (앞 시도가 성공했을 수 있음)"),
+    ("expired", "⏰ 로그인이 {ttl}분을 넘김",
+     "많으면 제한 시간을 다시 봐야 합니다"),
+    ("unknown", "❓ 모르는 요청",
+     "봇 재시작 또는 예전 버튼 재사용 · 많으면 안내 문구를 봐야 합니다"),
+    ("denied", "🙅 로블록스 화면에서 취소·거부", ""),
+    ("exchange", "🔑 로블록스와 토큰 교환 실패",
+     "계속되면 Client Secret · 로블록스 장애를 확인하세요"),
+    ("taken", "👥 다른 디스코드에 이미 연결된 계정", ""),
+    ("save", "💾 저장 실패", "계속되면 DB 연결을 확인하세요"),
+    ("empty", "🧩 주소가 잘려서 들어옴 (state 없음)", ""),
+    ("no_code", "🧩 주소가 잘려서 들어옴 (code 없음)", ""),
+    ("disabled", "⛔ OAuth 가 꺼진 채 요청이 들어옴", ""),
+    ("other", "기타", ""),
+)
+
+
+def format_oauth_results(res: dict, ttl_minutes: int) -> str:
+    """로그인 결과 집계를 `/연동점검` 칸에 넣을 글로 만듭니다.
+
+    분모 없는 개수는 쓸모없으므로 **성공도 같이** 세어 실패율을 보여
+    줍니다. 기록을 시작한 날도 적습니다 — 이틀치를 7일치로 읽으면
+    판단이 틀어집니다.
+    """
+    counts = res.get("counts") or {}
+    ok = int(counts.get("ok", 0))
+    fail = sum(int(v) for k, v in counts.items() if k != "ok")
+    total = ok + fail
+    if total == 0:
+        return ("아직 기록이 없습니다.\n"
+                "-# 이 기록은 이 기능이 배포된 뒤부터 쌓입니다.")
+
+    lines = [f"성공 **{ok}** · 실패 **{fail}** "
+             f"(실패율 {fail * 100 // total}%)"]
+    for key, label, hint in _OAUTH_REASON_TEXT:
+        n = int(counts.get(key, 0))
+        if not n:
+            continue
+        line = f"• {label.format(ttl=ttl_minutes)} **{n}**"
+        if hint:
+            line += f" — {hint}"
+        lines.append(line)
+    first = res.get("first_day") or ""
+    lines.append(f"-# {first + ' 부터 · ' if first else ''}봇 전체 기준 · "
+                 "한 사람이 여러 번 실패하면 여러 건으로 셉니다")
+    return "\n".join(lines)
 
 
 def _login_embed_and_view(guild_id: int, user_id: int,
@@ -952,6 +1006,7 @@ class RobloxLink(commands.Cog):
                 "%Y-%m-%d %H:%M:%S")
 
         rows = await list_roblox_links(interaction.guild.id)
+        oauth_res = await get_oauth_results(7)
         stamps = sorted((r.get("linked_at") or "") for r in rows)
         last = stamps[-1] if stamps else ""
         h1, d1, d7 = ago(hours=1), ago(days=1), ago(days=7)
@@ -1011,6 +1066,11 @@ class RobloxLink(commands.Cog):
             value=(f"최근 1시간 **{n_1h}명** · 24시간 **{n_1d}명** · "
                    f"7일 **{n_7d}명**\n"
                    f"전체 **{len(rows)}명** · 마지막 `{last or '없음'}`"),
+            inline=False)
+        embed.add_field(
+            name="🧾 로그인 결과 (최근 7일)",
+            value=format_oauth_results(
+                oauth_res, roblox_oauth.PENDING_TTL // 60),
             inline=False)
         embed.add_field(
             name="🧾 안 된다는 사람에게 전달할 안내",
@@ -1159,10 +1219,31 @@ def _make_saver(bot, loop):
     return bridge
 
 
+def _make_recorder(loop):
+    """로그인 결과를 봇 루프에서 DB 에 셉니다. **기다리지 않습니다.**
+
+    유저가 보는 안내 페이지가 기록 때문에 늦어지면 안 됩니다.
+    """
+    def _done(fut):
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"[RobloxLink] 로그인 결과 기록 실패: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    def recorder(reason: str):
+        asyncio.run_coroutine_threadsafe(
+            record_oauth_result(reason), loop).add_done_callback(_done)
+
+    return recorder
+
+
 async def setup(bot):
     await bot.add_cog(RobloxLink(bot))
     # Flask 스레드에서 저장할 수 있도록 봇의 이벤트 루프를 연결합니다.
-    roblox_oauth.set_saver(_make_saver(bot, asyncio.get_running_loop()))
+    loop = asyncio.get_running_loop()
+    roblox_oauth.set_saver(_make_saver(bot, loop))
+    roblox_oauth.set_recorder(_make_recorder(loop))
     if roblox_oauth.enabled():
         print("[RobloxLink] 로블록스 연동: 활성화 (OAuth)", flush=True)
     else:

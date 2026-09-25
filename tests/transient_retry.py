@@ -141,6 +141,71 @@ async def main():
     note(await LG._retry_transient(fine) == "바로 성공", "성공값을 그대로 돌려줌")
     note(not slept, "성공했으면 한 번도 안 기다림", str(slept))
 
+    print("")
+    print("=== 4. 재시도 결과를 세야 (SSH 없이 효과를 보려면) ===")
+    # 서버 로그에만 남으면 관리자가 자리를 비운 동안 아무도 못 봅니다.
+    from utils import health
+    import cogs.backup as BK
+    health._state["guard_counts"].clear()
+
+    note(await LG._retry_transient(fine) == "바로 성공"
+         and not health.snapshot()["guard_counts"],
+         "처음부터 성공하면 세지 않음 (살린 것이 아님)")
+
+    tries = [0]
+
+    async def once(t=tries):
+        t[0] += 1
+        if t[0] < 2:
+            raise http_error(503)
+        return "ok"
+
+    await LG._retry_transient(once)
+    note(health.snapshot()["guard_counts"].get("retry_saved") == 1,
+         "재시도로 성공하면 '살림' 1건", str(health.snapshot()["guard_counts"]))
+
+    try:
+        await LG._retry_transient(always)
+    except discord.HTTPException:
+        pass
+    note(health.snapshot()["guard_counts"].get("retry_saved") == 1,
+         "끝내 실패하면 '살림' 으로 세지 않음",
+         str(health.snapshot()["guard_counts"]))
+
+    snap = health.snapshot()
+    snap["guard_counts"]["retry_saved"] = 999
+    note(health.snapshot()["guard_counts"]["retry_saved"] == 1,
+         "snapshot 은 복사본 (다른 스레드와 안쪽 dict 를 같이 쥐지 않음)")
+
+    print("")
+    print("  상태 임베드에는 일이 있었을 때만 뜹니다 (늘 켜진 칸 금지)")
+    state = {"boot_history": [], "last_boot_kst": "", "boot_count": 1,
+             "last_full_backup_kst": ""}
+
+    def guard_field(embed):
+        return next((f for f in embed.fields if "링크 보호" in f.name), None)
+
+    health._state["guard_counts"].clear()
+    e = await BK.build_status_embed(None, F.GUILD, state)
+    note(guard_field(e) is None, "아무 일 없으면 칸이 없음")
+
+    health.count_guard("retry_saved")
+    e = await BK.build_status_embed(None, F.GUILD, state)
+    f = guard_field(e)
+    note(f is not None and "1건" in f.value and "🚨" not in f.value,
+         "살리기만 했으면 경고 없이 건수만", f.value[:60] if f else "")
+
+    health.count_guard("delete_failed")
+    health.count_guard("send_failed")
+    health.count_guard("send_failed")
+    e = await BK.build_status_embed(None, F.GUILD, state)
+    f = guard_field(e)
+    note(f is not None and "원문 링크가 채널에 남음 **1건**" in f.value
+         and "알림이 사라짐 **2건**" in f.value,
+         "실패는 무엇이 어떻게 됐는지 따로 적음", f.value[:80] if f else "")
+    note(len(f.value) <= 1024 if f else False, "칸 1024자 이내")
+    health._state["guard_counts"].clear()
+
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
     for x in F.FAILS:
         print("   -", x)

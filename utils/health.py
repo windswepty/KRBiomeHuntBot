@@ -64,6 +64,9 @@ _state = {
     "commands": 0,
     "rate_limited_at": None,      # 마지막 429 관측 시각 (monotonic)
     "restart_times": [],          # 최근 재시작 시각들 (monotonic)
+    # 링크 보호가 디스코드 일시 오류(5xx)를 만난 결과. 서버 로그에만 남으면
+    # SSH 를 못 쓰는 사람은 재시도가 효과가 있는지 볼 수 없습니다.
+    "guard_counts": {},
 }
 
 
@@ -257,9 +260,22 @@ def add_note(note: str) -> None:
             _state["notes"].append(note)
 
 
+def count_guard(kind: str) -> None:
+    """링크 보호의 재시도 결과를 셉니다 (이번 가동 중 누적).
+
+    `retry_saved` 재시도로 살림 · `delete_failed` 원문이 남음 ·
+    `send_failed` 재게시 실패로 알림이 사라짐
+    """
+    with _lock:
+        c = _state["guard_counts"]
+        c[kind] = c.get(kind, 0) + 1
+
+
 def snapshot() -> dict:
     with _lock:
         s = dict(_state)
+        # 얕은 복사로는 안쪽 dict 를 다른 스레드와 같이 쥐게 됩니다.
+        s["guard_counts"] = dict(_state["guard_counts"])
     s["uptime_seconds"] = round(time.monotonic() - s["booted_at"])
     s["notes"] = list(s["notes"])
     return s

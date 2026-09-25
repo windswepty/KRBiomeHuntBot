@@ -120,7 +120,7 @@ asyncio.run(m())"
 | Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
 | 보조 모듈 | `utils/health.py`(공용) | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
-| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` |
+| Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` `biome_events` `oauth_events` |
 
 `verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.
 
@@ -349,6 +349,14 @@ await _db(users_col.update_one, {"_id": key}, {"$set": {"points": doc["points"] 
   볼 수 있어 **관리자가 없으면 아무도 확인할 수 없었습니다.**
 - `PUBLIC_BASE_URL` 이 빠지면 돌아올 주소가 깨져 전원이 실패하므로,
   그 경우를 따로 빨간불로 구분합니다.
+- **로그인 실패 원인을 화면에 셉니다**(`oauth_events`, 날짜 버킷, 30일).
+  원인을 갈라 놓고 서버 로그에만 남기면 SSH 를 못 쓰는 사람은 볼 수 없어
+  "며칠 쌓이면 답이 나온다" 를 **아무도 확인하지 못합니다.** 콜백의 모든
+  갈래가 `roblox_oauth.record()` 를 부르고, 새 갈래를 만들면 그것도
+  불러야 합니다(`tests/roblox_flow.py` 가 갈래마다 검사합니다).
+  **길드로 나누지 않습니다** — 실패 대부분은 state 를 못 읽은 것이라
+  어느 서버인지 알 수 없고, 억지로 나누면 실패만 빠져 성공률이 부풀려집니다.
+  원인을 **단정하지 않습니다** — 한 사람이 여러 번 실패하면 여러 건입니다.
 
 ### 유출을 실제로 증명하는 것은 `/개인서버대조` 입니다
 

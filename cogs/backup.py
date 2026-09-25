@@ -404,6 +404,24 @@ async def build_status_embed(bot, guild, state: dict | None = None) -> discord.E
         embed.add_field(name="⚠️ 기동 중 발견된 문제",
                         value="\n".join(f"• {n}" for n in notes), inline=False)
 
+    # 링크 보호가 디스코드 일시 오류(5xx)를 만난 결과. **일이 있었을 때만**
+    # 띄웁니다 — 늘 떠 있는 칸은 익숙해져서 아무도 안 봅니다. 제목을
+    # 빨갛게 하지는 않습니다(하루 3만 건 중 몇 건이고, 고칠 것이 봇 쪽에
+    # 있지 않습니다). 무엇이 어떻게 됐는지만 적습니다.
+    gc = st.get("guard_counts") or {}
+    saved = gc.get("retry_saved", 0)
+    lost_del = gc.get("delete_failed", 0)
+    lost_send = gc.get("send_failed", 0)
+    if saved or lost_del or lost_send:
+        lines = [f"디스코드 일시 오류를 재시도로 살림 **{saved}건**"]
+        if lost_del:
+            lines.append(f"🚨 원문 링크가 채널에 남음 **{lost_del}건**")
+        if lost_send:
+            lines.append(f"🚨 재게시 실패로 바이옴 알림이 사라짐 **{lost_send}건**")
+        lines.append("-# 이번 가동 중 누적 · 재시작하면 0 부터 다시 셉니다")
+        embed.add_field(name="🛡️ 링크 보호 (디스코드 5xx)",
+                        value="\n".join(lines), inline=False)
+
     # 주기 작업이 429 백오프 중이면 알려둡니다
     bo = health.backoff_status()
     if bo:

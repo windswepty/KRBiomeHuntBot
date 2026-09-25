@@ -127,6 +127,10 @@ class Channel:
     async def create_text_channel(self, *a, **k):
         return Channel(777, a[0] if a else "ticket", self.guild)
 
+    async def purge(self, *, limit=100, check=None, reason=None, **kw):
+        self.purged = (limit, reason)
+        return []
+
     async def set_permissions(self, *a, **k):
         pass
 

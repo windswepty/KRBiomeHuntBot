@@ -1245,6 +1245,67 @@ async def do_ban(guild, moderator, user, reason: str, delete_days: int = 0) -> d
          if res["dm"] == "sent" and not settings.get("support_link") else ""])
 
 
+PURGE_MAX = 100
+# 고정 메시지를 건너뛰고도 요청한 개수를 채우도록 이만큼 더 훑습니다
+PURGE_SCAN_EXTRA = 100
+
+
+async def do_purge(guild, channel, moderator, count: int) -> discord.Embed:
+    """이 채널의 최근 메시지를 `count` 개 지웁니다.
+
+    **고정 메시지는 지우지 않습니다.** 규칙 · 공지가 대개 고정돼 있어서,
+    `/청소 50` 한 번에 그게 날아가면 되살릴 방법이 없습니다. 대신 건너뛴
+    만큼 더 거슬러 올라가 **요청한 개수는 채웁니다** — 10개를 지우라고 했는데
+    고정 2개 때문에 8개만 지우면 명령어를 믿을 수 없게 됩니다.
+    """
+    if not hasattr(channel, "purge"):
+        return _result_embed("⛔ 청소할 수 없습니다", discord.Color.greyple(),
+                             ["이 종류의 채널에서는 메시지를 한꺼번에 지울 수 없습니다."])
+    perms = channel.permissions_for(guild.me)
+    if not (perms.manage_messages and perms.read_message_history):
+        return _result_embed("⛔ 청소할 수 없습니다", discord.Color.greyple(),
+                             [f"봇에게 {channel.mention} 의 **메시지 관리 · 메시지 기록 보기** "
+                              "권한이 없습니다."])
+
+    count = max(1, min(PURGE_MAX, int(count)))
+    taken, pinned = 0, 0
+
+    def keep(m) -> bool:
+        nonlocal taken, pinned
+        if taken >= count:
+            return False
+        if getattr(m, "pinned", False):
+            pinned += 1
+            return False
+        taken += 1
+        return True
+
+    try:
+        deleted = await channel.purge(limit=count + PURGE_SCAN_EXTRA, check=keep,
+                                      reason=_audit_reason(moderator, f"/청소 {count}개"))
+    except discord.Forbidden:
+        return _result_embed("⚠️ 청소 실패", discord.Color.orange(),
+                             ["봇에게 **메시지 관리** 권한이 없습니다."])
+    except discord.HTTPException as e:
+        return _result_embed("⚠️ 청소 실패", discord.Color.orange(),
+                             [f"디스코드 오류로 멈췄습니다 ({e.status}). 일부만 지워졌을 수 있습니다."])
+
+    n = len(deleted)
+    settings = await get_mod_settings(guild.id)
+    log = discord.Embed(title="🧹 메시지 청소", color=discord.Color.blurple())
+    log.add_field(name="채널", value=channel.mention, inline=True)
+    log.add_field(name="처리자", value=f"<@{moderator.id}> `{_truncate(str(moderator), 40)}`",
+                  inline=True)
+    log.add_field(name="삭제", value=f"**{n}개** (요청 {count}개)", inline=True)
+    await send_log(guild, settings, log)
+
+    return _result_embed(
+        "🧹 청소 완료", discord.Color.green(),
+        [f"{channel.mention} 의 최근 메시지 **{n}개**를 지웠습니다.",
+         f"📌 고정 메시지 {pinned}개는 남겨 두었습니다." if pinned else "",
+         "-# 채널에 지울 메시지가 더 없었습니다." if n < count else ""])
+
+
 async def record_embed_for(guild, user) -> discord.Embed:
     cases = await get_user_cases(guild.id, user.id)
     state, why = await fetch_ban_state(guild, user.id)
@@ -1288,6 +1349,19 @@ class Moderation(commands.Cog):
                   메시지삭제: app_commands.Range[int, 0, 7] = 0):
         await interaction.response.defer(ephemeral=True, thinking=True)
         embed = await do_ban(interaction.guild, interaction.user, 유저, 사유, 메시지삭제)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="청소", description="이 채널의 최근 메시지를 지정한 개수만큼 지웁니다.")
+    @app_commands.describe(개수="지울 메시지 수 (1~100)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def purge(self, interaction: discord.Interaction,
+                    개수: app_commands.Range[int, 1, 100]):
+        # 이 응답은 본인에게만 보이는 것이라 채널 기록에 남지 않고, 따라서
+        # 청소 대상에 섞이지도 않습니다.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        embed = await do_purge(interaction.guild, interaction.channel, interaction.user, 개수)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="경고설정", description="[관리자 전용] 경고·밴 관리 패널을 엽니다.")

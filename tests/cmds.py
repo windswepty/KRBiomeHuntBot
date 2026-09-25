@@ -21,6 +21,7 @@ ARGS = {
     "amount": lambda: 100,
     "points": lambda: 100,
     "사유": lambda: "테스트",
+    "개수": lambda: 10,
     "reason": lambda: "테스트",
     "검색어": lambda: "8",
     "query": lambda: "8",

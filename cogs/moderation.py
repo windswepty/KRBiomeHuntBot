@@ -144,9 +144,15 @@ def _chunk_lines(lines: list, limit: int = 1024) -> list:
 
 # ── DM · 로그 임베드 ───────────────────────────────────────────────────
 
+def server_label(name: str) -> str:
+    """'한바헌 서버' · 이름이 이미 '서버' 로 끝나면 그대로 ('OO 서버 서버' 방지)."""
+    name = (name or "").strip()
+    return name if name.endswith("서버") else f"{name} 서버"
+
+
 def build_ban_dm(guild, reason: str, settings: dict) -> tuple[discord.Embed, discord.ui.View | None]:
     embed = discord.Embed(
-        title=f"🔨 {guild.name} 서버에서 차단되었습니다",
+        title=f"🔨 {server_label(guild.name)}에서 차단되었습니다",
         description=(settings.get("ban_dm_message") or
                      "서버 규칙 위반으로 차단되었습니다."),
         color=discord.Color.red())
@@ -171,7 +177,7 @@ def build_ban_dm(guild, reason: str, settings: dict) -> tuple[discord.Embed, dis
 
 def build_warn_dm(guild, doc: dict, count: int, auto_note: str = "") -> discord.Embed:
     embed = discord.Embed(
-        title=f"⚠️ {guild.name} 서버에서 경고를 받았습니다",
+        title=f"⚠️ {server_label(guild.name)}에서 경고를 받았습니다",
         color=discord.Color.gold())
     embed.add_field(name="📝 사유", value=_truncate(doc.get("reason"), 1000) or "사유 없음",
                     inline=False)
@@ -282,19 +288,36 @@ async def execute_ban(guild, moderator, user, reason: str, settings: dict,
     return {"ok": True, "case": doc, "dm": dm_status}
 
 
+def auto_rule_blocker(guild, member, action: str) -> str | None:
+    """자동 처벌을 **실행할 수 없는 이유**. 할 수 있으면 None.
+
+    `do_warn` 이 경고 DM 을 보낼지 정할 때와 `apply_auto_rule` 이 실행할 때
+    **같은 기준**을 써야 합니다. 갈라지면 "곧 밴됩니다" DM 만 가고 밴은
+    안 되거나, 밴 DM 을 기대하고 경고 DM 을 건너뛰었는데 밴이 막혀
+    **아무 DM 도 안 가는** 일이 생깁니다.
+    """
+    me = guild.me
+    perm = ACTION_PERM.get(action)
+    if perm and not getattr(me.guild_permissions, perm, False):
+        return f"봇에게 **{PERM_LABEL[perm]}** 권한이 없습니다."
+    if member.top_role >= me.top_role:
+        return "대상의 역할이 봇보다 같거나 높습니다."
+    # 디스코드는 관리자 권한이 있는 멤버의 타임아웃을 거부합니다(403).
+    # '권한이 부족합니다' 로만 뜨면 봇 권한을 고치러 가게 됩니다.
+    if action == "timeout" and getattr(member.guild_permissions, "administrator", False):
+        return "관리자 권한이 있는 멤버는 디스코드가 타임아웃을 막습니다."
+    return None
+
+
 async def apply_auto_rule(guild, member, rule: dict, count: int, last_reason: str,
                           settings: dict) -> str:
     """경고 누적 자동 처벌을 실행하고 결과 한 줄을 돌려줍니다."""
     action = rule.get("action")
     reason = f"경고 {count}회 누적 (자동) — 마지막 경고: {last_reason}"
     me = guild.me
-    perm = ACTION_PERM.get(action)
-    if perm and not getattr(me.guild_permissions, perm, False):
-        return (f"⚠️ 자동 {ACTION_LABEL[action]} 실패 — 봇에게 "
-                f"**{PERM_LABEL[perm]}** 권한이 없습니다.")
-    if member.top_role >= me.top_role:
-        return (f"⚠️ 자동 {ACTION_LABEL[action]} 실패 — 대상의 역할이 봇보다 "
-                "같거나 높습니다.")
+    blocker = auto_rule_blocker(guild, member, action)
+    if blocker:
+        return f"⚠️ 자동 {ACTION_LABEL.get(action, action)} 실패 — {blocker}"
     try:
         if action == "ban":
             res = await execute_ban(guild, me, member, reason, settings, 0, auto=True)
@@ -377,6 +400,17 @@ async def fetch_ban_state(guild, user_id: int):
         return "unknown", ""
 
 
+def current_ban_case(cases: list) -> dict | None:
+    """**지금 걸려 있는 밴**의 봇 기록. `cases` 는 최신 순입니다.
+
+    가장 최근의 밴/해제가 '해제' 라면, 지금 밴은 그 뒤에 봇 밖에서(우클릭)
+    다시 걸린 것이라 봇 기록에는 없습니다. 그냥 '마지막 밴' 을 고르면
+    **예전에 풀린 밴의 사유**를 지금 사유로 보여 줍니다.
+    """
+    last = next((c for c in cases if c.get("kind") in ("ban", "unban")), None)
+    return last if last is not None and last.get("kind") == "ban" else None
+
+
 def _case_ts(c: dict) -> int | None:
     """기록 시각(유닉스 초). Mongo 는 tz 없는 UTC datetime 을, JSON 폴백은
     ISO 문자열을 돌려주므로 둘 다 받습니다. 없으면 KST 문자열에서 읽습니다."""
@@ -452,7 +486,7 @@ def _build_record_embed(guild, user_id, name, cases, ban_state, ban_reason,
         embed.set_thumbnail(url=member.display_avatar.url)
 
     if ban_state == "banned":
-        last_ban = next((c for c in cases if c.get("kind") == "ban"), None)
+        last_ban = current_ban_case(cases)
         why = (last_ban or {}).get("reason") or ban_reason or "사유 없음"
         how = (f"🕒 {when(last_ban)} · 케이스 `#{last_ban['case']}` · "
                f"처리자 {_truncate(last_ban.get('mod_name', '?'), 30)}" if last_ban
@@ -634,6 +668,22 @@ async def show_unwarn(interaction: discord.Interaction, user_id: int, name: str,
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
+async def stored_name(guild, user_id: int, fallback: str = "") -> str:
+    """기록에 남길 이름 (사용자명). 화면용 이름을 넣으면 안 됩니다.
+
+    검색 후보의 이름은 `표시이름 (사용자명)` · `이름 (서버에 없음)` 처럼
+    꾸며져 있습니다. 그걸 기록하면 이름 검색이 그 꾸밈을 다시 읽어
+    `이름 (서버에 없음) (서버에 없음)` 이 되고, 사용자명으로는 안 찾아집니다.
+    """
+    m = guild.get_member(user_id)
+    if m is not None:
+        return str(m)
+    for c in await get_user_cases(guild.id, user_id, limit=20):
+        if c.get("user_name"):
+            return c["user_name"]
+    return fallback or str(user_id)
+
+
 async def _finish_unwarn(interaction, user_id, name, cases, reason):
     guild = interaction.guild
     await interaction.response.defer()
@@ -647,7 +697,8 @@ async def _finish_unwarn(interaction, user_id, name, cases, reason):
         return
     remain = len(await get_active_warnings(guild.id, user_id))
     nums = ", ".join(f"#{c}" for c in sorted(done))
-    doc = await add_case(guild.id, "unwarn", user_id, name, interaction.user.id,
+    doc = await add_case(guild.id, "unwarn", user_id,
+                         await stored_name(guild, user_id, str(user_id)), interaction.user.id,
                          str(interaction.user),
                          f"경고 {nums} 해제" + (f" — {reason}" if reason else ""))
     settings = await get_mod_settings(guild.id)
@@ -714,8 +765,8 @@ async def do_unban(interaction: discord.Interaction, user_id: int, reason: str) 
                              color=discord.Color.orange())
 
     cases = await get_user_cases(guild.id, user_id, limit=50)
-    last_ban = next((c for c in cases if c.get("kind") == "ban"), None)
-    name = (last_ban or {}).get("user_name") or str(user_id)
+    last_ban = current_ban_case(cases)
+    name = next((c["user_name"] for c in cases if c.get("user_name")), str(user_id))
     doc = await add_case(guild.id, "unban", user_id, name, interaction.user.id,
                          str(interaction.user), reason or "사유 없음")
     was = (last_ban or {}).get("reason") or discord_reason or "기록 없음"
@@ -931,6 +982,9 @@ class LogChannelView(discord.ui.View):
 
 # ── 자동 처벌 ──────────────────────────────────────────────────────────
 
+MAX_AUTO_RULES = 25
+
+
 def build_auto_embed(guild, settings: dict) -> discord.Embed:
     rules = sorted(settings.get("auto_rules") or [], key=lambda r: int(r.get("count", 0)))
     lines = [f"• {describe_rule(r)}" for r in rules] or ["없음 — 경고만 쌓이고 자동 처벌은 없습니다"]
@@ -984,6 +1038,12 @@ class AutoRuleModal(discord.ui.Modal, title="⚖️ 자동 처벌 규칙"):
         settings = await get_mod_settings(interaction.guild.id)
         # 같은 횟수의 규칙은 바꿔 끼웁니다. 둘이면 어느 쪽이 도는지 알 수 없습니다.
         rules = [r for r in settings.get("auto_rules") or [] if int(r.get("count", 0)) != count]
+        # 지우기 메뉴는 25개까지만 담습니다. 넘기면 **지울 수 없는 규칙**이 생깁니다.
+        if len(rules) >= MAX_AUTO_RULES:
+            await interaction.followup.send(
+                f"⚠️ 자동 처벌 규칙은 최대 **{MAX_AUTO_RULES}개**입니다. 먼저 하나를 지워 주세요.",
+                ephemeral=True)
+            return
         rule = {"count": count, "action": action}
         if action == "timeout":
             rule["minutes"] = minutes
@@ -1046,8 +1106,9 @@ def build_panel_embed(guild, settings: dict) -> discord.Embed:
     embed.add_field(name="⚠️ 경고 DM",
                     value="🟢 켜짐" if settings.get("warn_dm") else "⚫ 꺼짐", inline=True)
     rules = sorted(settings.get("auto_rules") or [], key=lambda r: int(r.get("count", 0)))
-    embed.add_field(name="⚖️ 자동 처벌",
-                    value="\n".join(describe_rule(r) for r in rules) or "없음", inline=False)
+    # 칸이 1024자를 넘으면 패널 **전송 자체가 실패**해 /경고설정 이 안 열립니다
+    for i, chunk in enumerate(_chunk_lines([describe_rule(r) for r in rules]) or ["없음"]):
+        embed.add_field(name="⚖️ 자동 처벌" if i == 0 else "\u200b", value=chunk, inline=False)
     embed.set_footer(text="이 화면은 본인에게만 보입니다")
     return embed
 
@@ -1134,13 +1195,16 @@ async def do_warn(guild, moderator, member, reason: str) -> discord.Embed:
     doc, count = await add_warning(guild.id, member.id, str(member),
                                    moderator.id, str(moderator), reason)
     rule = match_auto_rule(settings.get("auto_rules"), count)
-    auto_ban = bool(rule and rule.get("action") == "ban")
-
-    # 자동 밴이면 밴 DM(서포트 링크 포함)이 대신 갑니다 — 두 통 보내지 않습니다
+    blocker = auto_rule_blocker(guild, member, rule["action"]) if rule else None
+    # 자동 밴이 **실제로 실행되고 밴 DM 이 켜져 있을 때만** 밴 DM(서포트 링크
+    # 포함)이 경고 DM 을 대신합니다 — 두 통 보내지 않습니다. 밴 DM 이 꺼져
+    # 있거나 밴이 막히면 경고 DM 이라도 가야 합니다(아무것도 안 가면 안 됩니다).
+    ban_dm_instead = bool(rule and rule.get("action") == "ban" and not blocker
+                          and settings.get("ban_dm"))
     dm_status = "off"
-    if settings.get("warn_dm") and not auto_ban:
+    if settings.get("warn_dm") and not ban_dm_instead:
         note = (f"누적 {count}회로 **{describe_rule(rule).split('→')[-1].strip()}** 처리됩니다."
-                if rule else "")
+                if rule and not blocker else "")
         _, dm_status = await safe_dm(member, build_warn_dm(guild, doc, count, note))
 
     await send_log(guild, settings, build_log_embed(
@@ -1151,7 +1215,7 @@ async def do_warn(guild, moderator, member, reason: str) -> discord.Embed:
         f"⚠️ 경고 | 케이스 #{doc['case']}", discord.Color.gold(),
         [f"{member.mention} 님에게 경고를 줬습니다. 누적 유효 경고 **{count}회**",
          f"📝 {_truncate(reason, 300)}",
-         "" if auto_ban else DM_STATUS.get(dm_status, dm_status),
+         "" if ban_dm_instead else DM_STATUS.get(dm_status, dm_status),
          auto_line])
 
 
@@ -1293,7 +1357,9 @@ class Moderation(commands.Cog):
         elif isinstance(error, commands.BadArgument):
             msg = f"⚠️ 입력을 이해하지 못했습니다.\n사용법: {usage}"
         else:
-            print(f"[Moderation] ?{name} 실패: {type(error).__name__}: {error}", flush=True)
+            # CommandInvokeError 는 겉껍데기입니다. 원인을 남겨야 고칠 수 있습니다.
+            cause = getattr(error, "original", error)
+            print(f"[Moderation] ?{name} 실패: {type(cause).__name__}: {cause}", flush=True)
             msg = "⚠️ 처리 중 오류가 났습니다. 잠시 후 다시 시도해 주세요."
         try:
             await ctx.reply(msg, mention_author=False,

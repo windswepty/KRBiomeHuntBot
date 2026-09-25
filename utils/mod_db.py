@@ -288,8 +288,24 @@ async def get_user_cases(guild_id: int, user_id: int, limit: int = 200) -> list:
 
 
 async def get_active_warnings(guild_id: int, user_id: int) -> list:
-    return [r for r in await get_user_cases(guild_id, user_id)
-            if r.get("kind") == "warn" and r.get("active")]
+    """유효 경고 전부 (최신 순).
+
+    `get_user_cases` 의 상한(200건)을 거치지 않고 **직접** 찾습니다. 기록이
+    많은 사람은 오래된 유효 경고가 상한 밖으로 밀려 '전체 해제' 에서 빠집니다.
+    """
+    q = {"guild_id": str(guild_id), "user_id": str(user_id), "kind": "warn", "active": True}
+    if mod_cases_col is not None:
+        try:
+            def _fetch():
+                return list(mod_cases_col.find(q).sort("case", -1))
+            return await _db(_fetch)
+        except Exception as e:
+            print(f"MongoDB get_active_warnings error: {e}, using local file.", flush=True)
+    async with _cases_lock:
+        all_rows = _read_json(MOD_CASES_FILE)
+    return _sort_cases([r for r in all_rows.values()
+                        if r.get("guild_id") == q["guild_id"] and r.get("user_id") == q["user_id"]
+                        and r.get("kind") == "warn" and r.get("active")])
 
 
 async def find_users_by_name(guild_id: int, query: str, limit: int = 25) -> list:

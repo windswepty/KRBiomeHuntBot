@@ -128,7 +128,7 @@ def check_db_wrap():
     print("    (동기 라이브러리라 그냥 부르면 이벤트 루프 전체가 멈춥니다)")
     bad = []
     for p in FILES:
-        if p.name not in ("database.py", "verify_db.py"):
+        if p.name not in ("database.py", "verify_db.py", "mod_db.py"):
             continue
         tree, _ = parse(p)
 
@@ -328,6 +328,7 @@ DB_AWAITS = {
     "get_verify_settings", "get_linkguard_settings", "get_roblox_link",
     "list_point_snapshots", "get_biome_buckets", "get_backup_settings",
     "get_quest_progress", "get_boost", "_db",
+    "get_mod_settings", "get_user_cases", "get_active_warnings",
 }
 
 # 규칙을 어기는 것이 **맞는** 자리 (모달은 첫 응답이어야 해서 defer 불가 등).

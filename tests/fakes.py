@@ -160,7 +160,25 @@ class Member:
                 self.roles.remove(r)
 
     async def send(self, *a, **k):
+        if getattr(self, "dm_closed", False):
+            raise discord.Forbidden(type("R", (), {"status": 403, "reason": ""})(),
+                                    "Cannot send messages to this user")
         self.dms.append(k or {"pos": a})
+        m = Msg(700 + len(self.dms), None, None)
+        m.dm_of = self
+        self.__dict__.setdefault("dm_msgs", []).append(m)
+        return m
+
+    async def timeout(self, until, reason=None):
+        self.timed_out = (until, reason)
+
+    async def kick(self, reason=None):
+        self.kicked = reason
+        if self.guild is not None and self in self.guild.members:
+            self.guild.members.remove(self)
+
+    def __str__(self):
+        return self.name
 
 
 class Guild:
@@ -185,6 +203,24 @@ class Guild:
                         Member(8, "유저", False, guild=self)]
         self.member_count = 6500
         self.default_role = self.roles[0]
+        self.owner_id = None
+        self.bans = {}          # user_id -> reason
+        self.ban_fail = None    # 넣으면 ban() 이 그 예외를 던집니다
+
+    async def ban(self, user, reason=None, delete_message_seconds=0):
+        if self.ban_fail is not None:
+            raise self.ban_fail
+        self.bans[user.id] = reason
+
+    async def unban(self, user, reason=None):
+        if user.id not in self.bans:
+            raise discord.NotFound(type("R", (), {"status": 404, "reason": ""})(), "Unknown Ban")
+        self.bans.pop(user.id)
+
+    async def fetch_ban(self, user):
+        if user.id not in self.bans:
+            raise discord.NotFound(type("R", (), {"status": 404, "reason": ""})(), "Unknown Ban")
+        return type("BanEntry", (), {"reason": self.bans[user.id], "user": user})()
 
     def get_role(self, rid):
         return self._roles.get(int(rid)) if rid else None

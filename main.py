@@ -20,7 +20,10 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# 접두사 `?` 는 Dyno 식 처벌 명령어(?warn · ?ban · ?warnings, cogs/moderation.py)
+# 용입니다. 기본 help 는 영어이고 명령어 목록을 드러내므로 끕니다.
+bot = commands.Bot(command_prefix="?", intents=intents, help_command=None,
+                   case_insensitive=True)
 
 # 무인 운영 전제입니다. 관리자가 오래 자리를 비워도 스스로 살아나야 하므로,
 # 이상을 발견하면 사람을 기다리지 않고 프로세스를 끝냅니다.

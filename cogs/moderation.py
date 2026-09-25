@@ -377,8 +377,60 @@ async def fetch_ban_state(guild, user_id: int):
         return "unknown", ""
 
 
+def _case_ts(c: dict) -> int | None:
+    """기록 시각(유닉스 초). Mongo 는 tz 없는 UTC datetime 을, JSON 폴백은
+    ISO 문자열을 돌려주므로 둘 다 받습니다. 없으면 KST 문자열에서 읽습니다."""
+    from datetime import datetime, timezone, timedelta
+    v = c.get("created_at")
+    try:
+        if isinstance(v, str):
+            v = datetime.fromisoformat(v)
+        if isinstance(v, datetime):
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=timezone.utc)
+            return int(v.timestamp())
+        raw = c.get("created") or ""
+        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M")
+                   .replace(tzinfo=timezone(timedelta(hours=9))).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _kst_ts(raw: str) -> int | None:
+    from datetime import datetime, timezone, timedelta
+    try:
+        return int(datetime.strptime(raw or "", "%Y-%m-%d %H:%M")
+                   .replace(tzinfo=timezone(timedelta(hours=9))).timestamp())
+    except ValueError:
+        return None
+
+
+def when(c: dict) -> str:
+    """디스코드 시각 표기. 보는 사람의 언어·시간대로 **연월일 시분**이
+    그대로 보입니다(예: 2026년 9월 25일 오후 2:03). 못 읽으면 KST 글자로."""
+    ts = _case_ts(c)
+    return f"<t:{ts}:f>" if ts else f"{c.get('created', '?')} KST"
+
+
+# 한 임베드는 6,000자 · 25칸이 상한이고 넘기면 **전송 자체가 실패**합니다.
+# 줄마다 시각을 넣으면 길어지므로, 넘치면 보여 줄 건수를 줄여 다시 만듭니다.
+RECORD_LIMITS = (15, 8, 10)          # 유효 경고 · 해제된 경고 · 처벌 기록
+EMBED_BUDGET = 5800
+
+
 def build_record_embed(guild, user_id: int, name: str, cases: list,
                        ban_state: str, ban_reason: str) -> discord.Embed:
+    la, lr, lp = RECORD_LIMITS
+    while True:
+        embed = _build_record_embed(guild, user_id, name, cases, ban_state,
+                                    ban_reason, la, lr, lp)
+        if (len(embed) <= EMBED_BUDGET and len(embed.fields) <= 25) or la + lr + lp <= 3:
+            return embed
+        la, lr, lp = max(1, la * 2 // 3), max(1, lr * 2 // 3), max(1, lp * 2 // 3)
+
+
+def _build_record_embed(guild, user_id, name, cases, ban_state, ban_reason,
+                        la, lr, lp) -> discord.Embed:
     member = guild.get_member(user_id)
     warns = [c for c in cases if c.get("kind") == "warn"]
     active = [c for c in warns if c.get("active")]
@@ -402,44 +454,52 @@ def build_record_embed(guild, user_id: int, name: str, cases: list,
     if ban_state == "banned":
         last_ban = next((c for c in cases if c.get("kind") == "ban"), None)
         why = (last_ban or {}).get("reason") or ban_reason or "사유 없음"
-        how = (f"케이스 `#{last_ban['case']}` · {last_ban.get('created', '')} · "
-               f"처리자 {last_ban.get('mod_name', '?')}" if last_ban
-               else "-# 봇 밖에서(우클릭 등) 밴되어 디스코드에 남은 사유만 있습니다")
+        how = (f"🕒 {when(last_ban)} · 케이스 `#{last_ban['case']}` · "
+               f"처리자 {_truncate(last_ban.get('mod_name', '?'), 30)}" if last_ban
+               else "-# 봇 밖에서(우클릭 등) 밴되어 디스코드에 남은 사유만 있습니다 "
+                    "(밴한 시각은 알 수 없습니다)")
         embed.add_field(name="🔨 밴 사유", value=f"{_truncate(why, 800)}\n{how}",
                         inline=False)
 
     # 분모 없는 개수는 쓸모없습니다 — 몇 건 중 몇 건을 보여 주는지 적습니다
-    shown = active[:15]
-    lines = [f"`#{c['case']}` {c.get('created', '')[5:]} · {_truncate(c.get('reason'), 80)}"
+    def label(title, total, shown):
+        return f"{title} ({total}건" + (f" 중 최근 {shown}건)" if total > shown else ")")
+
+    shown = active[:la]
+    lines = [f"`#{c['case']}` 🕒 {when(c)}\n└ {_truncate(c.get('reason'), 80)}"
              f" — {_truncate(c.get('mod_name'), 20)}" for c in shown]
-    label = f"⚠️ 유효 경고 ({len(active)}건" + (f" 중 최근 {len(shown)}건)" if len(active) > len(shown) else ")")
     for i, chunk in enumerate(_chunk_lines(lines) or ["없음"]):
-        embed.add_field(name=label if i == 0 else "​", value=chunk, inline=False)
+        embed.add_field(name=label("⚠️ 유효 경고", len(active), len(shown)) if i == 0 else "\u200b",
+                        value=chunk, inline=False)
 
     if removed:
-        rs = removed[:8]
-        lines = [f"~~`#{c['case']}`~~ {_truncate(c.get('reason'), 60)} "
-                 f"— 해제: {_truncate(c.get('removed_by_name'), 20)}"
-                 + (f" ({_truncate(c.get('removed_reason'), 40)})" if c.get("removed_reason") else "")
-                 for c in rs]
-        label = f"♻️ 해제된 경고 ({len(removed)}건" + (f" 중 최근 {len(rs)}건)" if len(removed) > len(rs) else ")")
+        rs = removed[:lr]
+        lines = []
+        for c in rs:
+            off = _kst_ts(c.get("removed_at"))
+            off_s = f"<t:{off}:f>" if off else (c.get("removed_at") or "?")
+            lines.append(f"~~`#{c['case']}`~~ 🕒 {when(c)} · {_truncate(c.get('reason'), 60)}\n"
+                         f"└ 해제 {off_s} — {_truncate(c.get('removed_by_name'), 20)}"
+                         + (f" ({_truncate(c.get('removed_reason'), 40)})"
+                            if c.get("removed_reason") else ""))
         for i, chunk in enumerate(_chunk_lines(lines)):
-            embed.add_field(name=label if i == 0 else "​", value=chunk, inline=False)
+            embed.add_field(name=label("♻️ 해제된 경고", len(removed), len(rs)) if i == 0 else "\u200b",
+                            value=chunk, inline=False)
 
     if punish:
-        ps = punish[:10]
+        ps = punish[:lp]
         lines = []
         for c in ps:
             emoji, lab, _ = KIND_META[c["kind"]]
             extra = f" {fmt_minutes(c['minutes'])}" if c.get("minutes") else ""
             auto = " (자동)" if c.get("auto") else ""
-            lines.append(f"{emoji} `#{c['case']}` {c.get('created', '')[5:]} **{lab}{extra}**{auto}"
-                         f" · {_truncate(c.get('reason'), 70)} — {_truncate(c.get('mod_name'), 20)}")
-        label = f"🗂️ 처벌 기록 ({len(punish)}건" + (f" 중 최근 {len(ps)}건)" if len(punish) > len(ps) else ")")
+            lines.append(f"{emoji} `#{c['case']}` **{lab}{extra}**{auto} 🕒 {when(c)}\n"
+                         f"└ {_truncate(c.get('reason'), 70)} — {_truncate(c.get('mod_name'), 20)}")
         for i, chunk in enumerate(_chunk_lines(lines)):
-            embed.add_field(name=label if i == 0 else "​", value=chunk, inline=False)
+            embed.add_field(name=label("🗂️ 처벌 기록", len(punish), len(ps)) if i == 0 else "\u200b",
+                            value=chunk, inline=False)
 
-    embed.set_footer(text="이 화면은 본인에게만 보입니다")
+    embed.set_footer(text="🕒 시각은 보는 사람의 시간대로 표시됩니다")
     return embed
 
 
@@ -555,7 +615,7 @@ async def show_unwarn(interaction: discord.Interaction, user_id: int, name: str,
                               color=discord.Color.greyple())
         view = None
     else:
-        lines = [f"`#{w['case']}` {w.get('created', '')[5:]} · {_truncate(w.get('reason'), 80)}"
+        lines = [f"`#{w['case']}` 🕒 {when(w)} · {_truncate(w.get('reason'), 80)}"
                  for w in warns[:25]]
         embed = discord.Embed(
             title=f"♻️ {name} 님의 경고 해제",
@@ -1204,7 +1264,7 @@ class Moderation(commands.Cog):
     @commands.has_permissions(moderate_members=True)
     async def warnings_prefix(self, ctx: commands.Context, 유저: discord.User):
         embed = await record_embed_for(ctx.guild, 유저)
-        embed.set_footer(text="?warn 로 경고 · /경고설정 에서 해제")
+        embed.set_footer(text="🕒 시각은 보는 사람의 시간대로 표시됩니다 · /경고설정 에서 해제")
         await ctx.reply(embed=embed, mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none())
 

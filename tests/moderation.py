@@ -23,6 +23,11 @@ import fakes as F
 from fakes import note, drain, GUILD, Inter, Role, Member, Perms
 
 import cogs.moderation as M
+import re as _re_mod
+
+
+def _re_search(p, t):
+    return _re_mod.search(p, t) is not None
 import utils.mod_db as mdb
 
 MOD_ROLE = Role(5001, "운영진", 50)
@@ -365,7 +370,7 @@ async def test_search():
     e = await M.record_embed_for(GUILD, heavy)
     note(all(len(f.value) <= 1024 for f in e.fields) and len(e) <= 6000 and len(e.fields) <= 25,
          "칸 1024 · 합계 6000 · 25칸 이내", f"{len(e)}자 / {len(e.fields)}칸")
-    note("40건 중 최근 8건" in text_of(e), "몇 건 중 몇 건인지 적음 (분모)")
+    note(_re_search(r"40건 중 최근 \d+건", text_of(e)), "몇 건 중 몇 건인지 적음 (분모)")
 
 
 async def test_panel():
@@ -480,6 +485,33 @@ async def test_prefix():
     ctx = Ctx(moder)
     await cog.warnings_prefix.callback(cog, ctx, t)
     note(sayu in text_of(ctx.replies[-1]["embed"]), "?warnings → 사유가 보임")
+
+    print("\n  ?warnings 에 경고·밴을 받은 **시각**이 보여야 합니다")
+    import re as _re, datetime as _dt
+    tt = member(8603, "시각대상")
+    await cog.warn_prefix.callback(cog, Ctx(moder), tt, 사유="시각확인경고")
+    await cog.ban_prefix.callback(cog, Ctx(moder), tt, 사유="시각확인밴")
+    await mdb.remove_warnings(GUILD.id, tt.id, None, 7, "관리자", "풀어줌")
+    ctx = Ctx(moder)
+    await cog.warnings_prefix.callback(cog, ctx, tt)
+    body = text_of(ctx.replies[-1]["embed"])
+    stamps = [int(x) for x in _re.findall(r"<t:(\d+):f>", body)]
+    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    note(len(stamps) >= 3, "해제된 경고 · 밴 · 밴 사유 칸에 시각", f"{len(stamps)}개")
+    note(all(abs(now - x) < 300 for x in stamps), "시각이 실제 처리 시각과 맞음 (UTC 어긋남 없음)",
+         str([int(now - x) for x in stamps]))
+    note("해제 <t:" in body, "해제된 경고는 해제한 시각도 보임")
+    note("시간대로 표시" in ctx.replies[-1]["embed"].footer.text, "시간대 안내")
+
+    print("\n  Mongo 는 tz 없는 UTC, JSON 은 문자열 — 둘 다 같은 시각이어야 합니다")
+    naive = {"created_at": _dt.datetime(2026, 9, 25, 5, 3), "created": "2026-09-25 14:03"}
+    iso = {"created_at": "2026-09-25T05:03:00+00:00", "created": "2026-09-25 14:03"}
+    only = {"created": "2026-09-25 14:03"}
+    want = int(_dt.datetime(2026, 9, 25, 5, 3, tzinfo=_dt.timezone.utc).timestamp())
+    note(M._case_ts(naive) == M._case_ts(iso) == M._case_ts(only) == want,
+         "세 형태가 전부 KST 14:03 = UTC 05:03",
+         str([M._case_ts(naive), M._case_ts(iso), M._case_ts(only), want]))
+    note(M.when({}) == "? KST", "시각이 없으면 깨지지 않고 ? 로")
 
     ctx = Ctx(moder)
     await cog.ban_prefix.callback(cog, ctx, t, 사유="?로 밴")

@@ -2890,16 +2890,37 @@ def event_period_key(event_id: str) -> str:
     return f"E{event_id}"
 
 
+def parse_event_day(raw):
+    """관리자가 적은 날짜를 date 로. `2026-9-5` 처럼 한 자리도 받습니다.
+
+    ⚠️ **글자로 비교하지 마세요.** `"2026-09-26" < "2026-9-21"` 입니다
+    ('0' < '9'). 한 자리로 적은 이벤트가 기간 안인데도 늘 '기간 밖' 으로
+    떠서 **진행도가 한 번도 쌓이지 않았습니다**(2026-09-26 발견).
+    """
+    try:
+        return datetime.strptime(str(raw).strip(), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
 def event_is_active(ev: dict, when: datetime | None = None) -> bool:
-    """지금이 이벤트 기간 안인지. 날짜는 KST 기준이며 양끝을 포함합니다."""
+    """지금이 이벤트 기간 안인지. 날짜는 KST 기준이며 양끝을 포함합니다.
+
+    읽을 수 없는 날짜는 **기간 밖** 으로 봅니다. 끝을 무시하면 역할 보상이
+    걸린 이벤트가 영원히 열려 있게 됩니다.
+    """
     if not ev.get("enabled", True):
         return False
-    today = (when or datetime.now(KST)).strftime("%Y-%m-%d")
-    starts, ends = ev.get("starts") or "", ev.get("ends") or ""
-    if starts and today < starts:
-        return False
-    if ends and today > ends:
-        return False
+    today = (when or datetime.now(KST)).date()
+    starts, ends = ev.get("starts"), ev.get("ends")
+    if starts:
+        day = parse_event_day(starts)
+        if day is None or today < day:
+            return False
+    if ends:
+        day = parse_event_day(ends)
+        if day is None or today > day:
+            return False
     return True
 
 

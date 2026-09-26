@@ -29,6 +29,7 @@ from utils.database import (
     quest_channels, goal_min_chat, quest_goal_period,
     active_events, event_status, event_period_key, KST,
     list_events, get_event, save_event, delete_event, event_is_active,
+    parse_event_day,
     EVENT_KINDS, MAX_TIERS, MAX_OBJECTIVES,
     QUEST_KINDS,
 )
@@ -472,16 +473,19 @@ class EventBasicModal(discord.ui.Modal, title="🎉 이벤트 만들기"):
                 "⚠️ 기간은 `2026-09-15 ~ 2026-09-22` 형태로 적어 주세요.",
                 ephemeral=True)
             return
-        starts, ends = raw[0].strip(), raw[1].strip()
-        for d in (starts, ends):
-            try:
-                datetime.datetime.strptime(d, "%Y-%m-%d")
-            except ValueError:
+        days = []
+        for d in (raw[0].strip(), raw[1].strip()):
+            day = parse_event_day(d)
+            if day is None:
                 await interaction.response.send_message(
                     f"⚠️ 날짜 형식이 올바르지 않습니다: `{d}`  (예: 2026-09-15)",
                     ephemeral=True)
                 return
-        if ends < starts:
+            days.append(day)
+        # 날짜로 비교하고 두 자리로 정리해 저장합니다. 글자로 비교하면
+        # `2026-9-30 ~ 2026-10-5` 가 '끝이 더 빠르다' 로 거부됩니다.
+        starts, ends = (d.strftime("%Y-%m-%d") for d in days)
+        if days[1] < days[0]:
             await interaction.response.send_message(
                 "⚠️ 끝나는 날이 시작일보다 빠릅니다.", ephemeral=True)
             return

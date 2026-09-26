@@ -1111,7 +1111,8 @@ def build_panel_embed(guild, settings: dict) -> discord.Embed:
     for i, chunk in enumerate(_chunk_lines([describe_rule(r) for r in rules]) or ["없음"]):
         embed.add_field(name="⚖️ 자동 처벌" if i == 0 else "\u200b", value=chunk, inline=False)
     embed.add_field(name="⌨️ 접두사 명령어",
-                    value="`!warn` · `ㅂ!warn` · `q!warn` 셋 다 됩니다 (ban · warnings 도 같음)",
+                    value=("`!warn` · `q!warn` · `ㅂ!warn` 다 됩니다 (ban · warnings 도 같음)\n"
+                           "한글 자판 그대로 쳐도 됩니다 — `ㅂ!ㅈㅁ구` 는 `q!warn` 으로 알아듣습니다"),
                     inline=False)
     embed.set_footer(text="이 화면은 본인에게만 보입니다")
     return embed
@@ -1318,6 +1319,45 @@ async def record_embed_for(guild, user) -> discord.Embed:
     return build_record_embed(guild, user.id, name, cases, state, why)
 
 
+# ── 한글 자판으로 친 명령어 ──────────────────────────────────────────
+#
+# 한글 자판 그대로 `q!warn` 을 치면 실제로는 **`ㅂ!ㅈㅁ구`** 가 들어옵니다.
+# 접두사(`ㅂ!`)는 받아도 명령어 이름이 `ㅈㅁ구` 라 **아무 반응 없이** 무시됐습니다
+# (2026-09-26 제보: "ㅂ!warn · q!warn 이 안 된다"). 입력기마다 글자를 묶는
+# 방식이 조금씩 달라 `ㅈㅁ구` 를 별칭으로 박으면 빠지는 경우가 생깁니다. 그래서
+# 반대로 **친 글자를 누른 키로 되돌립니다** — 어떻게 묶였든 누른 키는 같습니다.
+
+_KEY_OF = {
+    "ㅂ": "q", "ㅈ": "w", "ㄷ": "e", "ㄱ": "r", "ㅅ": "t", "ㅛ": "y", "ㅕ": "u", "ㅑ": "i",
+    "ㅐ": "o", "ㅔ": "p", "ㅁ": "a", "ㄴ": "s", "ㅇ": "d", "ㄹ": "f", "ㅎ": "g", "ㅗ": "h",
+    "ㅓ": "j", "ㅏ": "k", "ㅣ": "l", "ㅋ": "z", "ㅌ": "x", "ㅊ": "c", "ㅍ": "v", "ㅠ": "b",
+    "ㅜ": "n", "ㅡ": "m", "ㅃ": "Q", "ㅉ": "W", "ㄸ": "E", "ㄲ": "R", "ㅆ": "T", "ㅒ": "O",
+    "ㅖ": "P",
+    # 겹모음 · 겹받침은 두 키입니다
+    "ㅘ": "hk", "ㅙ": "ho", "ㅚ": "hl", "ㅝ": "nj", "ㅞ": "np", "ㅟ": "nl", "ㅢ": "ml",
+    "ㄳ": "rt", "ㄵ": "sw", "ㄶ": "sg", "ㄺ": "fr", "ㄻ": "fa", "ㄼ": "fq", "ㄽ": "ft",
+    "ㄾ": "fx", "ㄿ": "fv", "ㅀ": "fg", "ㅄ": "qt",
+}
+_CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+_JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+_JONG = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ",
+         "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
+HANGUL_RE = re.compile(r"[\u3131-\u318E\uAC00-\uD7A3]")
+
+
+def hangul_to_keys(text: str) -> str:
+    """한글 자판으로 친 글자 → 누른 영문 키 (두벌식). `ㅈㅁ구` → `warn`."""
+    out = []
+    for ch in text:
+        code = ord(ch) - 0xAC00
+        if 0 <= code < 11172:
+            jamo = [_CHO[code // 588], _JUNG[(code % 588) // 28], _JONG[code % 28]]
+            out.append("".join(_KEY_OF.get(j, j) for j in jamo if j))
+        else:
+            out.append(_KEY_OF.get(ch, ch))
+    return "".join(out)
+
+
 PREFIX_USAGE = {
     "warn": "`{p}warn [유저 ID 또는 멘션] [사유]`",
     "ban": "`{p}ban [유저 ID 또는 멘션] [사유]`",
@@ -1418,7 +1458,15 @@ class Moderation(commands.Cog):
         꺼집니다. 그래서 여기서 빠뜨린 오류는 반드시 로그로 남깁니다.
         """
         if isinstance(error, commands.CommandNotFound):
-            return          # !로 시작하는 평범한 채팅 — 조용히 넘어갑니다
+            # 한글 자판 그대로 친 것(`ㅂ!ㅈㅁ구`)이면 키로 되돌려 실행합니다.
+            # 권한 검사 · 인자 해석은 bot.invoke 가 원래 명령어와 **똑같이** 합니다.
+            word = getattr(ctx, "invoked_with", None) or ""
+            if HANGUL_RE.search(word):
+                cmd = self.bot.get_command(hangul_to_keys(word).lower())
+                if cmd is not None and cmd.cog is self:
+                    ctx.command, ctx.invoked_with = cmd, cmd.name
+                    await self.bot.invoke(ctx)
+            return          # 그 밖에 !로 시작하는 평범한 채팅 — 조용히 넘어갑니다
         name = ctx.command.name if ctx.command else ""
         # 접두사는 서버마다 바꿀 수 있으므로 **실제로 친 접두사**로 안내합니다
         p = ctx.prefix or DEFAULT_PREFIX

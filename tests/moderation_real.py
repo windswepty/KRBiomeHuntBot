@@ -400,6 +400,28 @@ async def test_prefix_real():
     out, _ = await run(f"ㅂ!warn {t.id}")
     note(out and "`ㅂ!warn [유저 ID" in (out[0].get("content") or ""),
          "사용법 안내는 친 접두사 그대로", (out[0].get("content") or "")[-40:] if out else "")
+    print("\n  한글 자판 그대로 친 명령어 (q!warn → ㅂ!ㅈㅁ구, 2026-09-26 제보)")
+    for cmd, label in ((f"ㅂ!ㅈㅁ구 {t.id} 한글자판", "ㅂ!ㅈㅁ구 (q!warn 을 한글 자판으로)"),
+                       (f"q!ㅈㅁ구 {t.id} 중간에전환", "q!ㅈㅁ구 (접두사만 영문)"),
+                       (f"ㅃ!ㅈㅁ구 {t.id} 쉬프트", "ㅃ!ㅈㅁ구 (Shift+q)"),
+                       (f"!ㅈㅁ구 {t.id} 느낌표", "!ㅈㅁ구")):
+        out, _ = await run(cmd)
+        note(out and embed_of(out[0]) is not None and "경고 | 케이스" in (embed_of(out[0]).title or ""),
+             f"{label} → 경고", str(out[0].get("content") if out else "무응답")[:50])
+    out, _ = await run(f"ㅂ!ㅈㅁ구ㅑㅜㅎㄴ {t.id}")
+    note(out and embed_of(out[0]) is not None, "ㅂ!ㅈㅁ구ㅑㅜㅎㄴ (warnings) → 기록")
+    out, _ = await run(f"ㅂ!ㅈㅁ궇ㄴ {t.id}")
+    note(not out, "ㅂ!ㅈㅁ궇ㄴ(= warngs, 오타) 는 다른 명령어로 오인하지 않음")
+    out, _ = await run(f"ㅂ!ㅈㅁ구 {t.id} 권한없음", author=user)
+    note(out and "권한이 없습니다" in (out[0].get("content") or ""),
+         "한글 자판으로 쳐도 **권한 검사는 그대로**")
+    out, _ = await run("ㅂ!ㅈㅁ구")
+    note(out and "`ㅂ!warn [유저 ID" in (out[0].get("content") or ""),
+         "인자를 빠뜨리면 사용법을 영문 이름으로 안내", (out[0].get("content") or "")[-30:] if out else "")
+    for chat in ("!안녕하세요", "ㅂ!ㅋㅋㅋㅋ", "!ㅎㅇ"):
+        out, log = await run(chat)
+        note(not out and "Traceback" not in log, f"'{chat}' 같은 평범한 채팅은 여전히 조용히 무시")
+
     for other in (f"/warn {t.id} x", f"ㅂwarn {t.id} x", f"q warn {t.id} x"):
         out, _ = await run(other)
         note(not out, f"'{other.split()[0]}' 같은 다른 형태에는 반응 안 함")

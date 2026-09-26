@@ -21,7 +21,8 @@ intents.message_content = True
 intents.members = True
 
 # 접두사는 Dyno 식 처벌 명령어(!warn · !ban · !warnings, cogs/moderation.py)
-# 용입니다. `!` · `ㅂ!` · `q!` 를 **셋 다** 받습니다 (utils/mod_db.PREFIXES).
+# 용입니다. `!` · `ㅂ!` · `ㅃ!` · `q!` 를 전부 받습니다 (utils/mod_db.PREFIXES).
+# 한글 자판으로 친 명령어 이름(`ㅂ!ㅈㅁ구`)은 cogs/moderation.py 가 되돌립니다.
 # `?` 를 쓰지 않는 이유: Dyno 가 아직 서버에 있고 `?warn` 에 답합니다.
 # 기본 help 는 영어이고 명령어 목록을 드러내므로 끕니다.
 from utils.mod_db import prefix_for

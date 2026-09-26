@@ -3564,8 +3564,22 @@ def rare_biome_names(settings: dict) -> list[str]:
     return names
 
 
-def summarize_biomes(buckets: list[dict], days: int) -> dict[str, dict]:
+def ignored_biomes(settings: dict) -> set[str]:
+    """통계에서 뺄 이름 (대문자 · 앞뒤 공백 제거 — 기록할 때와 같은 모양)."""
+    out = set()
+    for raw in (settings or {}).get("biome_ignore") or []:
+        name = BIOME_TRIM_RE.sub("", str(raw).strip()).upper()
+        if name:
+            out.add(name)
+    return out
+
+
+def summarize_biomes(buckets: list[dict], days: int,
+                     ignore: set | None = None) -> dict[str, dict]:
     """날짜 버킷을 바이옴별로 접습니다.
+
+    `ignore` 의 이름은 뺍니다. 지우지 않고 **화면에서만** 빼므로, 목록에서
+    다시 빼면 그동안의 기록이 그대로 돌아옵니다.
 
     `total` 은 보관 기간(90일) 전체의 종합 등장 횟수이고, `count` 는 고른
     기간 안의 것입니다. 둘을 함께 보여줘야 "오늘은 조용한데 원래 흔한
@@ -3579,6 +3593,8 @@ def summarize_biomes(buckets: list[dict], days: int) -> dict[str, dict]:
         # **읽을 때도 합칩니다.** ①만 고치면 이미 쌓인 소문자 표기가
         # 90일 TTL 이 지날 때까지 화면에서 계속 갈라져 보입니다.
         name = str(b.get("biome") or "?").upper()
+        if ignore and name in ignore:
+            continue
         day = str(b.get("day") or "")
         cur = out.setdefault(name, {"count": 0, "today": 0, "total": 0,
                                     "notified": 0, "servers": set(),
@@ -3672,7 +3688,7 @@ def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
                             unparsed: dict | None = None) -> discord.Embed:
     label = next((n for n, d in BIOME_PERIODS if d == days), f"{days}일")
     rare = rare_biome_names(settings)
-    agg = summarize_biomes(buckets, days)
+    agg = summarize_biomes(buckets, days, ignored_biomes(settings))
 
     embed = discord.Embed(title=f"📊 바이옴 등장 통계 · 최근 {label}",
                           color=discord.Color.blurple())
@@ -3765,14 +3781,88 @@ def build_biome_stats_embed(guild: discord.Guild, buckets: list[dict],
                    + (" …" if len(dropped) > 12 else "")
                    + "\n-# 다시 뜨면 자동으로 돌아옵니다."),
             inline=False)
+
+    # 뺀 이름도 **조용히 숨기지 않습니다** — "왜 안 보이지?" 를 풀 수 있어야 합니다
+    hidden = sorted(ignored_biomes(settings))
+    if hidden:
+        embed.add_field(
+            name="🙈 통계에서 뺀 이름",
+            value=(f"**{len(hidden)}개** — 바이옴이 아닌데 매크로가 보낸 이름이라 세지 않습니다.\n"
+                   f"-# {', '.join(f'`{n}`' for n in hidden)}")[:1000]
+                  + "\n-# 아래 🙈 버튼으로 고칩니다. 빼도 기록은 지우지 않습니다.",
+            inline=False)
     return embed
 
 
+MAX_BIOME_IGNORE = 25
+
+
+class BiomeIgnoreModal(discord.ui.Modal, title="🙈 통계에서 뺄 이름"):
+    names = discord.ui.TextInput(
+        label="이름 (줄바꿈이나 쉼표로 구분)", style=discord.TextStyle.paragraph,
+        required=False, max_length=1000, placeholder="예: IN LOBBY, SCHOOL")
+
+    def __init__(self, current: list[str]):
+        super().__init__()
+        self.names.default = "\n".join(current)[:1000]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        out: list[str] = []
+        for raw in re.split(r"[\n,]+", str(self.names.value or "")):
+            name = BIOME_TRIM_RE.sub("", raw.strip()).upper()[:60]
+            if name and name not in out:
+                out.append(name)
+        cut = len(out) - MAX_BIOME_IGNORE
+        out = out[:MAX_BIOME_IGNORE]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await save_linkguard_settings(interaction.guild.id, {"biome_ignore": out})
+        settings = await get_linkguard_settings(interaction.guild.id)
+        schedule_board_refresh(interaction.guild, settings)
+
+        # 희귀 바이옴을 빼면 '떴는데 알림이 안 나감' 판정이 통째로 사라집니다
+        rare = [n for n in out if any(r.upper().replace(" ", "") in n.replace(" ", "")
+                                      or n.replace(" ", "") in r.upper().replace(" ", "")
+                                      for r in rare_biome_names(settings))]
+        embed = discord.Embed(
+            title="🙈 통계에서 뺄 이름을 저장했습니다" if out else "🙈 뺄 이름을 모두 비웠습니다",
+            description=(", ".join(f"`{n}`" for n in out)[:3500] if out
+                         else "이제 모든 이름을 셉니다.")
+                        + "\n-# 앞으로 이 이름은 기록하지 않고, 이미 쌓인 것은 화면에서만 뺍니다.",
+            color=discord.Color.green())
+        if rare:
+            embed.color = discord.Color.orange()
+            embed.add_field(name="⚠️ 희귀 바이옴 규칙에 있는 이름입니다",
+                            value=(", ".join(f"`{n}`" for n in rare)
+                                   + "\n통계에서 빠지면 '떴는데 알림이 안 나간 희귀 바이옴' 을 "
+                                     "잡을 수 없습니다. 의도한 게 아니면 다시 빼 주세요.")[:1024],
+                            inline=False)
+        if cut > 0:
+            embed.add_field(name="⚠️ 일부만 저장",
+                            value=f"최대 {MAX_BIOME_IGNORE}개까지라 뒤의 {cut}개는 빠졌습니다.",
+                            inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class BiomeIgnoreButton(discord.ui.Button):
+    def __init__(self, current: list[str]):
+        super().__init__(label="뺄 이름", emoji="🙈", style=discord.ButtonStyle.secondary, row=1)
+        self._current = list(current)
+
+    async def callback(self, interaction: discord.Interaction):
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and perms.administrator):
+            await interaction.response.send_message("⛔ 관리자만 바꿀 수 있습니다.", ephemeral=True)
+            return
+        # 모달은 첫 응답이어야 합니다 — DB 를 읽지 않고 화면을 그릴 때 받은 목록을 씁니다
+        await interaction.response.send_modal(BiomeIgnoreModal(self._current))
+
+
 class BiomeStatsView(discord.ui.View):
-    def __init__(self, days: int = 1):
+    def __init__(self, days: int = 1, ignore: list | None = None):
         super().__init__(timeout=180)
         for name, d in BIOME_PERIODS:
             self.add_item(BiomeStatsButton(name, d, active=(d == days)))
+        self.add_item(BiomeIgnoreButton(sorted(ignore or [])))
 
 
 class BiomeStatsButton(discord.ui.Button):
@@ -3792,7 +3882,7 @@ class BiomeStatsButton(discord.ui.Button):
         await interaction.followup.send(
             embed=build_biome_stats_embed(interaction.guild, buckets,
                                           settings, self._days, unparsed),
-            view=BiomeStatsView(self._days), ephemeral=True)
+            view=BiomeStatsView(self._days, sorted(ignored_biomes(settings))), ephemeral=True)
 
 
 class BiomeBoardSelect(discord.ui.ChannelSelect):
@@ -3878,7 +3968,7 @@ _board_locks: dict[int, asyncio.Lock] = {}
 def build_biome_board_embed(guild: discord.Guild, buckets: list[dict],
                             settings: dict) -> discord.Embed:
     rare = rare_biome_names(settings)
-    agg = summarize_biomes(buckets, BIOME_ACTIVE_DAYS)
+    agg = summarize_biomes(buckets, BIOME_ACTIVE_DAYS, ignored_biomes(settings))
 
     embed = discord.Embed(title="🌋 희귀 바이옴 실시간 카운터",
                           color=discord.Color.gold())
@@ -4298,6 +4388,11 @@ class LinkGuard(commands.Cog):
                 print(f"[LinkGuard] 희귀 바이옴 복사 실패: "
                       f"{type(e).__name__}: {e}", flush=True)
 
+        if biome_name and biome_name.upper() in ignored_biomes(settings):
+            biome_name = None       # 운영진이 '바이옴 아님' 으로 정한 이름 — 세지 않습니다
+            ignored_name = True
+        else:
+            ignored_name = False
         if biome_name:
             # ⚠️ `bits` 는 **봇이 새로 덧붙인** 멘션만 담습니다. 원본 본문에
             # 이미 `<@&역할>` 이나 `@everyone` 이 있으면 덧붙일 것이 없어
@@ -4313,7 +4408,7 @@ class LinkGuard(commands.Cog):
                 schedule_board_refresh(guild, settings)
             except Exception as e:
                 print(f"[LinkGuard] 바이옴 기록 실패: {type(e).__name__}: {e}", flush=True)
-        else:
+        elif not ignored_name:
             # **못 읽은 제목을 그냥 버리지 않습니다.** 여기까지 왔다는 것은
             # 개인서버 링크가 든 매크로 알림이라는 뜻인데 이름을 못 뽑았다면,
             # 그 매크로가 올리는 바이옴은 그때부터 통계에서 통째로 빠집니다.
@@ -4716,7 +4811,7 @@ class LinkGuard(commands.Cog):
         await interaction.followup.send(
             embed=build_biome_stats_embed(interaction.guild, buckets, settings, 1,
                                           unparsed),
-            view=BiomeStatsView(1), ephemeral=True)
+            view=BiomeStatsView(1, sorted(ignored_biomes(settings))), ephemeral=True)
 
     @app_commands.command(name="링크보호설정", description="[관리자 전용] 웹훅 임베드의 링크를 인증 유저 전용으로 보호합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.

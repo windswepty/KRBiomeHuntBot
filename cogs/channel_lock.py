@@ -396,11 +396,14 @@ class LockPanelView(discord.ui.View):
         self.add_item(AddChannelSelect(cog))
         self.add_item(RemoveChannelSelect(cog, guild, doc))
         self.toggle.label = "자동 잠금 끄기" if doc.get("enabled") else "자동 잠금 켜기"
+        self.toggle.emoji = "🔴" if doc.get("enabled") else "🟢"
         self.toggle.style = (discord.ButtonStyle.danger if doc.get("enabled")
                              else discord.ButtonStyle.success)
         self.announce.label = "안내 끄기" if doc.get("announce") else "안내 켜기"
 
-    @discord.ui.button(label="켜기", emoji="⏻", row=2)
+    # ⚠️ 이모지는 디스코드가 아는 것만 됩니다. `⏻`(전원 기호)는 유니코드 문자일
+    #    뿐이라 **패널 전송 자체가 400 으로 거부**되어 /채널잠금설정 이 안 열렸습니다.
+    @discord.ui.button(label="켜기", emoji="🟢", row=2)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await _require_admin(interaction):
             return

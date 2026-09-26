@@ -253,6 +253,109 @@ async def main():
     note(any(f.name == "🕒 시각" for f in emb.fields), "/봇업데이트 화면에 시각 칸이 뜸",
          emb.title)
 
+    print("\n=== 11. 재시작하고 돌아오면 그 메시지를 '완료' 로 고침 ===")
+    import io, contextlib, time as _t
+    U.NOTICE_FILE = __import__("pathlib").Path(WORK) / "data" / ".restart_notice.json"
+    TOKEN = "aW50ZXJhY3Rpb246MTIzNDU2Nzg5OmZha2V0b2tlbg" * 3
+    edits = []
+
+    async def fake_edit(app, token, embed):
+        edits.append((app, token, embed))
+        return True
+
+    real_edit = U.edit_original
+    U.edit_original = fake_edit
+    try:
+        it = Inter()
+        it.application_id, it.token = 1531611325493678132, TOKEN
+        info = await U.check_updates()
+        view = U.UpdateView(info)
+        n = len(restarts)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            await view.restart_btn.callback(it)
+            await asyncio.sleep(0.05)
+        note(len(restarts) == n + 1 and U.NOTICE_FILE.exists(),
+             "재시작 직전에 고칠 메시지를 파일로 남김")
+        note("돌아오면" in (it.response.edited or {}).get("embed").description,
+             "누른 사람에게 '돌아오면 바뀝니다' 라고 알림")
+
+        # --- 새 프로세스 ---
+        with contextlib.redirect_stdout(out):
+            await U.Updater(None).on_ready()
+        note(len(edits) == 1 and edits[0][1] == TOKEN and "재시작 완료" in edits[0][2].title,
+             "**다시 켜지면 '✅ 재시작 완료' 로 고침**", edits[0][2].title if edits else "")
+        note(any(f.name == "🕒 시각" for f in edits[0][2].fields), "완료 메시지에 시각 칸")
+        note(not U.NOTICE_FILE.exists(), "고친 뒤 토큰 파일을 지움")
+        with contextlib.redirect_stdout(out):
+            await U.Updater(None).on_ready()          # 재접속으로 on_ready 가 또 불림
+        note(len(edits) == 1, "재접속으로 on_ready 가 또 불려도 한 번만 고침")
+
+        # 업데이트 → 새 버전으로 켜졌는지까지 확인
+        head_now = sh(SERVER, "rev-parse", "HEAD")
+        for target, want in ((head_now, "업데이트 완료"), ("0" * 40, "버전이 예상과 다릅니다")):
+            U.save_restart_notice(it, "update", "a" * 40, target)
+            edits.clear()
+            await U.announce_back()
+            got = edits[0][2].title if edits else ""
+            note(want in got, f"업데이트 뒤 → '{want}'", got)
+
+        # 15분이 지나면 토큰이 죽으므로 고치지 않고 파일만 정리
+        U.save_restart_notice(it, "restart")
+        data = __import__("json").loads(U.NOTICE_FILE.read_text(encoding="utf-8"))
+        data["at"] -= 20 * 60
+        U.NOTICE_FILE.write_text(__import__("json").dumps(data), encoding="utf-8")
+        edits.clear()
+        with contextlib.redirect_stdout(out):
+            done = await U.announce_back()
+        note(not done and not edits and not U.NOTICE_FILE.exists(),
+             "15분이 지났으면 고치지 않고 파일만 지움")
+
+        # 파일이 깨졌어도 봇 기동은 계속
+        U.NOTICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        U.NOTICE_FILE.write_text("{깨짐", encoding="utf-8")
+        with contextlib.redirect_stdout(out):
+            await U.Updater(None).on_ready()
+        note(not U.NOTICE_FILE.exists(), "깨진 파일도 예외 없이 정리")
+
+        # 토큰이 없는 대역(=저장 실패)이어도 재시작은 그대로
+        bare = Inter()
+        n = len(restarts)
+        with contextlib.redirect_stdout(out):
+            await U.UpdateView(info).restart_btn.callback(bare)
+            await asyncio.sleep(0.05)
+        note(len(restarts) == n + 1, "알림을 못 남겨도 재시작은 됨")
+        note(TOKEN not in out.getvalue() and TOKEN[:20] not in out.getvalue(),
+             "로그에 토큰이 한 글자도 안 남음")
+    finally:
+        U.edit_original = real_edit
+
+    # 진짜 주소 모양 — discord.py 의 edit_original_response 와 같은 경로
+    called = {}
+
+    class FakeResp:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class FakeSession:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def patch(self, url, json=None):
+            called["url"], called["json"] = url, json
+            return FakeResp()
+
+    real_cs = U.aiohttp.ClientSession
+    U.aiohttp.ClientSession = FakeSession
+    try:
+        ok = await U.edit_original(42, "tok", U.discord.Embed(title="x"))
+    finally:
+        U.aiohttp.ClientSession = real_cs
+    note(ok and called["url"].endswith("/webhooks/42/tok/messages/@original")
+         and called["json"]["components"] == [],
+         "PATCH /webhooks/{앱}/{토큰}/messages/@original · 버튼 제거", called.get("url", ""))
+
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
     for x in F.FAILS:
         print("   -", x)

@@ -20,10 +20,12 @@
 import os
 import re
 import sys
+import json
 import time
 import asyncio
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -46,6 +48,13 @@ _lock = asyncio.Lock()
 PROCESS_STARTED = time.time()
 # 받은 시각이 재시작보다 이만큼 늦으면 '받고 재시작 안 함' 으로 봅니다
 STALE_GRACE = 60
+
+# 재시작 뒤 '✅ 재시작 완료' 로 고칠 메시지. 새로 뜬 프로세스는 이전 프로세스의
+# 메모리를 모르므로 파일로 넘깁니다. **상호작용 토큰이 들어 있어** 권한을 600 으로
+# 두고, 쓰고 나면 바로 지우고, 로그에 남기지 않습니다. 토큰은 15분만 유효합니다.
+NOTICE_FILE = REPO_DIR / "data" / ".restart_notice.json"
+NOTICE_TTL = 14 * 60
+API_BASE = "https://discord.com/api/v10"
 
 
 async def run(*args, timeout: float = GIT_TIMEOUT, env: dict | None = None) -> tuple[int, str]:
@@ -226,6 +235,95 @@ async def apply_update(target: str) -> dict:
     return {"ok": True, "step": "", "detail": detail, "old": old}
 
 
+def save_restart_notice(interaction, kind: str, old: str = "", target: str = "") -> None:
+    """재시작 직전에, 돌아와서 고칠 메시지를 적어 둡니다. 실패해도 재시작은 합니다."""
+    try:
+        data = {"app": int(interaction.application_id), "token": interaction.token,
+                "kind": kind, "old": old, "target": target, "at": time.time(),
+                "by": str(interaction.user)}
+        NOTICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(NOTICE_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except (OSError, TypeError, ValueError, AttributeError) as e:
+        print(f"[Updater] 재시작 알림 저장 실패(재시작은 계속): {type(e).__name__}", flush=True)
+
+
+def take_restart_notice() -> dict | None:
+    """적어 둔 것을 꺼내고 **파일은 늘 지웁니다**(다음 재시작에 옛 메시지를 고치지 않게).
+    15분이 지나 토큰이 죽었으면 None."""
+    try:
+        with open(NOTICE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        print(f"[Updater] 재시작 알림 읽기 실패: {type(e).__name__}", flush=True)
+        data = None
+    try:
+        NOTICE_FILE.unlink()
+    except OSError as e:
+        print(f"[Updater] 재시작 알림 파일 삭제 실패: {type(e).__name__}", flush=True)
+    if not isinstance(data, dict) or not data.get("token"):
+        return None
+    if time.time() - float(data.get("at", 0)) > NOTICE_TTL:
+        print("[Updater] 재시작이 15분을 넘겨 완료 메시지를 고치지 못했습니다", flush=True)
+        return None
+    return data
+
+
+async def edit_original(app_id: int, token: str, embed: discord.Embed) -> bool:
+    """상호작용의 원래 응답을 고칩니다 — discord.py 의 edit_original_response 와
+    같은 주소입니다. 앱 ID 와 토큰만 있으면 되므로 **재시작한 프로세스도** 됩니다."""
+    url = f"{API_BASE}/webhooks/{app_id}/{token}/messages/@original"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+            async with s.patch(url, json={"embeds": [embed.to_dict()], "components": []}) as r:
+                if r.status < 300:
+                    return True
+                print(f"[Updater] 완료 메시지 수정 실패: HTTP {r.status}", flush=True)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[Updater] 완료 메시지 수정 실패: {type(e).__name__}", flush=True)
+    return False
+
+
+def build_back_embed(notice: dict, head: str, times: dict | None) -> discord.Embed:
+    took = max(0, int(time.time() - float(notice.get("at", time.time()))))
+    if notice.get("kind") == "update":
+        target = notice.get("target") or ""
+        if head and target and head.startswith(target[:12]):
+            embed = discord.Embed(
+                title="✅ 업데이트 완료",
+                description=(f"`{_short(notice.get('old'))}` → `{_short(head)}` 새 코드로 "
+                             f"돌아왔습니다. ({took}초 걸림)\n"
+                             "-# 새 명령어는 디스코드에서 `Ctrl+R` 을 누르면 보입니다."),
+                color=discord.Color.green())
+        else:
+            # 재시작은 됐는데 버전이 다르면 그대로 믿으면 안 됩니다
+            embed = discord.Embed(
+                title="⚠️ 다시 켜졌지만 버전이 예상과 다릅니다",
+                description=(f"기대한 버전 `{_short(target)}` · 지금 버전 `{_short(head)}`\n"
+                             "`/봇업데이트` 로 다시 확인해 주세요."),
+                color=discord.Color.orange())
+    else:
+        embed = discord.Embed(
+            title="✅ 재시작 완료",
+            description=f"봇이 다시 켜졌습니다. ({took}초 걸림) · 지금 버전 `{_short(head)}`",
+            color=discord.Color.green())
+    return _add_times(embed, times)
+
+
+async def announce_back() -> bool:
+    """봇이 다시 켜지면 불립니다. 고칠 메시지가 없으면 아무것도 안 합니다."""
+    notice = take_restart_notice()
+    if not notice:
+        return False
+    _, head = await git("rev-parse", "HEAD")
+    times = await version_times()
+    return await edit_original(notice["app"], notice["token"],
+                               build_back_embed(notice, head, times))
+
+
 def restart_soon(reason: str) -> None:
     """응답이 도착할 시간을 주고 끝냅니다. systemd 가 5초 뒤 다시 띄웁니다.
 
@@ -345,9 +443,9 @@ class UpdateView(discord.ui.View):
             title="✅ 적용 완료 — 재시작합니다",
             description=(f"`{_short(res['old'])}` → `{_short(self.target)}` ({res['detail']})\n"
                          "약 10~30초 뒤 새 코드로 돌아옵니다.\n"
-                         "-# 봇 상태 채널의 버전이 바뀌었는지 확인하세요. 새 명령어는 디스코드에서 "
-                         "`Ctrl+R` 을 누르면 보입니다."),
+                         "-# 돌아오면 이 메시지가 **✅ 업데이트 완료** 로 바뀝니다."),
             color=discord.Color.green()), view=None)
+        save_restart_notice(interaction, "update", res["old"], self.target)
         restart_soon(f"/봇업데이트 ({interaction.user}) → {_short(self.target)}")
 
     @discord.ui.button(label="재시작만", style=discord.ButtonStyle.secondary, emoji="🔄")
@@ -356,14 +454,25 @@ class UpdateView(discord.ui.View):
             return
         await interaction.response.edit_message(embed=discord.Embed(
             title="🔄 재시작합니다",
-            description="코드는 그대로 두고 봇만 다시 켭니다. 약 10~30초 걸립니다.",
+            description=("코드는 그대로 두고 봇만 다시 켭니다. 약 10~30초 걸립니다.\n"
+                         "-# 돌아오면 이 메시지가 **✅ 재시작 완료** 로 바뀝니다."),
             color=discord.Color.blurple()), view=None)
+        save_restart_notice(interaction, "restart")
         restart_soon(f"/봇업데이트 재시작만 ({interaction.user})")
 
 
 class Updater(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # on_ready 는 재접속마다 다시 불리지만, 파일을 꺼내면서 지우므로 한 번만 고칩니다
+        try:
+            await announce_back()
+        except Exception as e:
+            # 메시지 내용은 남기지 않습니다 — 주소(= 토큰)가 섞일 수 있습니다
+            print(f"[Updater] 재시작 완료 알림 실패: {type(e).__name__}", flush=True)
 
     @app_commands.command(name="봇업데이트",
                           description="[관리자 전용] GitHub 의 새 코드를 받아 봇을 재시작합니다.")

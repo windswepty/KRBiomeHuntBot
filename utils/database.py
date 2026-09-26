@@ -1804,7 +1804,10 @@ FULL_BACKUP_GZIP_OVER = 8 * 1024 * 1024
 #
 # 빼면 백업이 41MB → 2MB 가 되고, 압축도 필요 없어지고, 복원도 즉시 끝납니다.
 # **무엇이 빠졌는지는 `_meta.excluded` 에 남겨 복원하는 사람이 알 수 있게 합니다.**
-FULL_BACKUP_EXCLUDE = ("protected_links",)
+#
+# `oauth_pending` 도 뺍니다 — 30분짜리 로그인 대기라 되돌릴 가치가 없고,
+# 백업 파일에 PKCE verifier 가 실릴 이유도 없습니다.
+FULL_BACKUP_EXCLUDE = ("protected_links", "oauth_pending")
 
 
 def _encode_bson(o):

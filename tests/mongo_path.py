@@ -23,7 +23,7 @@ DB_COLS = ["users_col", "settings_col", "shop_col", "gacha_col", "logs_col",
 
 VDB_COLS = ["verify_col", "linkguard_col", "plink_col", "clicklog_col",
             "watermark_col", "guardkey_col", "usage_col", "logref_col",
-            "roblox_col", "oauth_col"]
+            "roblox_col", "oauth_col", "oauth_pending_col"]
 
 
 class UpdateOne:

@@ -279,7 +279,7 @@ class VerifyPanelView(discord.ui.View):
                         value="아래 버튼을 누르거나 `/로블록스연동` 을 사용해 주세요.",
                         inline=False
                     )
-                    embed.set_footer(text="이 링크는 10분 뒤 만료됩니다 · 연동 후 다시 [인증하기]를 눌러 주세요")
+                    embed.set_footer(text=f"이 링크는 {roblox_oauth.PENDING_TTL // 60}분 뒤 만료됩니다 · 연동 후 다시 [인증하기]를 눌러 주세요")
                     view.add_item(discord.ui.Button(
                         label="로블록스로 로그인", url=url,
                         style=discord.ButtonStyle.link, emoji="🎮"))

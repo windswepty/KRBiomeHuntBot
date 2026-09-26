@@ -53,6 +53,11 @@ MAX_PENDING = 2000
 USED_TTL = 900             # 15분
 MAX_USED = 2000
 
+# 재시작을 넘기는 저장소입니다. 메모리만 쓰면 로그인 도중 봇이 재시작할 때
+# 돌아온 사람이 `unknown` 으로 실패합니다(2026-09-25 실측, 재시작 9초 뒤).
+# 봇이 `set_store()` 로 꽂아 주고, 없으면(테스트 · 봇 기동 전) 메모리만 씁니다.
+STORE_TIMEOUT = 5          # 콜백이 DB 를 기다리는 최대 시간(초)
+
 _lock = threading.Lock()
 # state_id -> {"guild_id", "user_id", "verifier", "expires"}
 _pending: dict[str, dict] = {}
@@ -94,8 +99,8 @@ def _purge_locked(now: float) -> None:
 def start(guild_id: int, user_id: int) -> tuple[str, str]:
     """로그인 URL과 state_id 를 만듭니다.
 
-    PKCE 를 씁니다. code_verifier 는 브라우저에 노출되지 않도록 서버 메모리에
-    두고, 브라우저에는 그것을 가리키는 임의의 state_id 만 보냅니다.
+    PKCE 를 씁니다. code_verifier 는 브라우저에 노출되지 않도록 서버(메모리 +
+    DB)에 두고, 브라우저에는 그것을 가리키는 임의의 state_id 만 보냅니다.
     """
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(
@@ -112,6 +117,7 @@ def start(guild_id: int, user_id: int) -> tuple[str, str]:
             "verifier": verifier,
             "expires": now + PENDING_TTL,
         }
+    _store_put(state_id, int(guild_id), int(user_id), verifier)
 
     params = {
         "client_id": client_id(),
@@ -134,8 +140,10 @@ def take_pending_detailed(state_id: str) -> tuple[dict | None, str]:
 
       · `used`    새로고침하거나 뒤로 갔다 다시 온 것 — 고칠 것이 없습니다
       · `expired` 로그인이 오래 걸린 것 — `PENDING_TTL` 을 봐야 합니다
-      · `unknown` 봇 재시작으로 날아갔거나(메모리에만 둡니다) 옛 링크를
-                  다시 누른 것 — 안내 문구를 봐야 합니다
+      · `unknown` 메모리에도 DB 에도 없음 — 옛 링크를 다시 눌렀거나,
+                  DB 에 못 적은 채 재시작한 것 — 안내 문구를 봐야 합니다
+
+    메모리를 먼저 봅니다. 없으면(재시작 뒤) DB 에서 꺼냅니다.
     """
     now = time.monotonic()
     if not state_id:
@@ -147,11 +155,30 @@ def take_pending_detailed(state_id: str) -> tuple[dict | None, str]:
             # expired 가 unknown 으로 바뀌어 원인이 흐려집니다.
             _used[state_id] = now + USED_TTL
         _purge_locked(now)
-        if info is None:
-            return None, ("used" if state_id in _used else "unknown")
+        seen = state_id in _used
+
+    if info is not None:
+        # DB 쪽도 '씀' 으로 바꿉니다(기다리지 않음). 안 바꾸면 재시작 뒤
+        # 같은 주소가 한 번 더 통과합니다 — 1회용이 깨집니다.
+        _store_take(state_id, wait=False)
         if info["expires"] <= now:
             return None, "expired"
         return info, "ok"
+    if seen:
+        return None, "used"
+
+    stored, status = _store_take(state_id, wait=True)
+    if status == "used":
+        return None, "used"
+    if stored is None:
+        return None, "unknown"
+    with _lock:
+        _used[state_id] = now + USED_TTL
+    if stored["expires_at"] <= time.time():
+        return None, "expired"
+    return {"guild_id": stored["guild_id"], "user_id": stored["user_id"],
+            "verifier": stored["verifier"],
+            "expires": now + (stored["expires_at"] - time.time())}, "ok"
 
 
 def take_pending(state_id: str) -> dict | None:
@@ -320,6 +347,43 @@ def clear() -> None:
         # 이것도 비웁니다 — 안 비우면 앞 시험이 쓴 state 때문에
         # 뒤 시험에서 `unknown` 이 `used` 로 보입니다.
         _used.clear()
+
+
+# ── 로그인 대기 저장소 다리 ──────────────────────────────────────────
+#
+# put(state_id, guild_id, user_id, verifier, expires_at, purge_at) — 기다리지 않음
+# take(state_id, wait) -> (정보 | None, "ok" | "used" | "missing" | "skipped")
+#
+# **저장소가 실패해도 로그인은 메모리로 계속됩니다.** 재시작 대비일 뿐이라
+# 이게 터져서 버튼 생성이나 콜백이 막히면 고친 것보다 나빠집니다.
+
+_store = None
+
+
+def set_store(put, take) -> None:
+    global _store
+    _store = (put, take)
+
+
+def _store_put(state_id: str, guild_id: int, user_id: int, verifier: str) -> None:
+    if _store is None:
+        return
+    wall = time.time()
+    try:
+        _store[0](state_id, guild_id, user_id, verifier,
+                  wall + PENDING_TTL, wall + PENDING_TTL + USED_TTL)
+    except Exception as e:
+        print(f"[RobloxOAuth] 로그인 대기 저장 실패: {type(e).__name__}: {e}", flush=True)
+
+
+def _store_take(state_id: str, wait: bool) -> tuple:
+    if _store is None:
+        return None, "missing"
+    try:
+        return _store[1](state_id, wait)
+    except Exception as e:
+        print(f"[RobloxOAuth] 로그인 대기 조회 실패: {type(e).__name__}: {e}", flush=True)
+        return None, "missing"
 
 
 # ── 저장 다리 (Flask 스레드 → asyncio 봇) ─────────────────────────────

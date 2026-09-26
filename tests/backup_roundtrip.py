@@ -263,9 +263,13 @@ async def main():
          "protected_links 가 백업에 담기지 않음",
          str(list(payload["data"].keys()))[:70])
     note("users" in payload["data"], "정작 중요한 것은 그대로 담김")
-    note(payload["_meta"].get("excluded") == ["protected_links"],
+    # oauth_pending(30분짜리 로그인 대기 · PKCE verifier)도 뺍니다.
+    excl = payload["_meta"].get("excluded") or []
+    note({"protected_links", "oauth_pending"} <= set(excl),
          "무엇을 뺐는지 _meta 에 남김 (복원하는 사람이 알아야 합니다)",
-         str(payload["_meta"].get("excluded")))
+         str(excl))
+    note("oauth_pending" not in payload["data"],
+         "로그인 대기(verifier)가 백업에 담기지 않음")
 
     print("")
     print("=== ⚠️ 실제로 올라가는 형식(gzip)을 복원 도구가 읽어야 합니다 ===")

@@ -27,6 +27,7 @@ from utils.verify_db import (
     get_verify_settings, get_linkguard_settings, get_usage_summary,
     get_link_usage, get_protected_link, get_log_reference,
     record_oauth_result, get_oauth_results,
+    save_oauth_pending, consume_oauth_pending,
     KST,
 )
 
@@ -105,7 +106,8 @@ def _login_embed_and_view(guild_id: int, user_id: int,
                "　 예전에 받은 버튼에는 그때의 주소가 박혀 있습니다.\n"
                "② 그래도 뜨면 버튼을 **꾹 눌러 주소를 복사**해 크롬·사파리에서  열어 보세요."),
         inline=False)
-    embed.set_footer(text="이 링크는 10분 뒤 만료됩니다")
+    # 실제 제한 시간에서 읽습니다. 30분으로 늘린 뒤에도 '10분' 이 남아 있었습니다.
+    embed.set_footer(text=f"이 링크는 {roblox_oauth.PENDING_TTL // 60}분 뒤 만료됩니다")
 
     view = discord.ui.View(timeout=None)
     url, _ = roblox_oauth.start(guild_id, user_id)
@@ -1219,6 +1221,44 @@ def _make_saver(bot, loop):
     return bridge
 
 
+def _make_store(loop):
+    """로그인 대기 정보를 DB 에 둡니다 — 재시작해도 로그인이 이어지게.
+
+    저장은 기다리지 않습니다(버튼 생성이 늦어지면 안 됩니다). 꺼내기는
+    Flask 스레드가 결과를 기다리되 `STORE_TIMEOUT` 까지만 기다립니다.
+    """
+    def _logged(fut):
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"[RobloxLink] 로그인 대기 저장소 오류: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    def put(state_id, guild_id, user_id, verifier, expires_at, purge_at):
+        asyncio.run_coroutine_threadsafe(
+            save_oauth_pending(state_id, guild_id, user_id, verifier,
+                               expires_at, purge_at), loop
+        ).add_done_callback(_logged)
+
+    def take(state_id, wait=True):
+        if wait:
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                # 루프 스레드에서 자기 루프를 기다리면 영원히 멈춥니다
+                return None, "missing"
+        fut = asyncio.run_coroutine_threadsafe(
+            consume_oauth_pending(state_id), loop)
+        if not wait:
+            fut.add_done_callback(_logged)
+            return None, "skipped"
+        return fut.result(timeout=roblox_oauth.STORE_TIMEOUT)
+
+    return put, take
+
+
 def _make_recorder(loop):
     """로그인 결과를 봇 루프에서 DB 에 셉니다. **기다리지 않습니다.**
 
@@ -1244,6 +1284,7 @@ async def setup(bot):
     loop = asyncio.get_running_loop()
     roblox_oauth.set_saver(_make_saver(bot, loop))
     roblox_oauth.set_recorder(_make_recorder(loop))
+    roblox_oauth.set_store(*_make_store(loop))
     if roblox_oauth.enabled():
         print("[RobloxLink] 로블록스 연동: 활성화 (OAuth)", flush=True)
     else:

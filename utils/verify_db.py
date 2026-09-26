@@ -28,6 +28,7 @@ USAGE_FILE = os.path.join(DATA_DIR, "link_usage.json")
 LOGREF_FILE = os.path.join(DATA_DIR, "log_references.json")
 ROBLOX_FILE = os.path.join(DATA_DIR, "roblox_links.json")
 OAUTH_FILE = os.path.join(DATA_DIR, "oauth_events.json")
+OAUTH_PENDING_FILE = os.path.join(DATA_DIR, "oauth_pending.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 KST = timezone(timedelta(hours=9))
@@ -43,6 +44,7 @@ _logref_lock = asyncio.Lock()
 _roblox_lock = asyncio.Lock()
 _biome_lock = asyncio.Lock()
 _oauth_lock = asyncio.Lock()
+_oauth_pending_lock = asyncio.Lock()
 
 verify_col = None
 linkguard_col = None
@@ -55,6 +57,7 @@ logref_col = None
 roblox_col = None
 biome_col = None
 oauth_col = None
+oauth_pending_col = None
 
 if MONGO_URI:
     try:
@@ -73,6 +76,7 @@ if MONGO_URI:
         roblox_col = _db["roblox_links"]
         biome_col = _db["biome_events"]
         oauth_col = _db["oauth_events"]
+        oauth_pending_col = _db["oauth_pending"]
 
         # 인덱스는 없어도 기능은 동작하므로, 생성에 실패해도 Mongo 연결 자체를
         # 포기하지 않도록 별도의 try로 감쌉니다. create_index는 멱등이라
@@ -130,6 +134,10 @@ if MONGO_URI:
             oauth_col.create_index(
                 "updated", name="oauth_ttl", expireAfterSeconds=30 * 24 * 3600
             )
+            # 로그인 대기(state). 문서마다 지울 시각을 따로 적어 둡니다.
+            oauth_pending_col.create_index(
+                "purge_at", name="oauth_pending_ttl", expireAfterSeconds=0
+            )
         except Exception as e:
             print(f"MongoDB index setup warning: {e}", flush=True)
 
@@ -147,6 +155,7 @@ if MONGO_URI:
         roblox_col = None
         biome_col = None
         oauth_col = None
+        oauth_pending_col = None
 
 
 def _utcnow():
@@ -1696,3 +1705,91 @@ async def get_oauth_results(since_days: int = 7) -> dict:
             except (TypeError, ValueError):
                 continue
     return {"counts": counts, "first_day": first}
+
+
+# ── 로블록스 로그인 대기 (state) ─────────────────────────────────────
+#
+# [로블록스로 로그인] 을 누른 뒤 돌아오기까지 들고 있어야 하는 것(누가 ·
+# 어느 서버 · PKCE verifier)입니다. 예전에는 **메모리에만** 두어서, 그 사이
+# 봇이 재시작하면 돌아온 사람이 `unknown` 으로 실패했습니다(2026-09-25
+# 실측: 재시작 9초 뒤 1건). `/봇업데이트` 로 재시작이 쉬워져 더 잦아질
+# 자리라 DB 에도 둡니다. 메모리가 여전히 먼저이고, 이건 재시작 대비입니다.
+#
+#   _id = state_id   { guild_id, user_id, verifier, expires_at, used, purge_at }
+#
+# - **꺼내는 것은 원자적으로** — `used: False` 를 필터에 넣습니다. 새로고침이
+#   동시에 두 번 와도 한 번만 통과합니다(1회용).
+# - 꺼내면 verifier 를 지웁니다. 문서는 `used` 판정용으로 `purge_at` 까지만
+#   남습니다 — 지우면 재시작 뒤 새로고침이 `used` 가 아니라 `unknown` 으로
+#   보여 원인이 다시 흐려집니다.
+# - 전체 백업에서 뺍니다(`FULL_BACKUP_EXCLUDE`). 30분짜리라 되돌릴 가치가
+#   없고, 백업 파일에 verifier 가 실릴 이유도 없습니다.
+
+
+def _pending_out(row: dict) -> dict:
+    return {"guild_id": int(row.get("guild_id", 0)),
+            "user_id": int(row.get("user_id", 0)),
+            "verifier": str(row.get("verifier") or ""),
+            "expires_at": float(row.get("expires_at", 0) or 0)}
+
+
+async def save_oauth_pending(state_id: str, guild_id: int, user_id: int,
+                             verifier: str, expires_at: float,
+                             purge_at: float) -> None:
+    """로그인 대기 하나를 저장합니다. 시각은 **벽시계**(time.time) 입니다 —
+    monotonic 은 재시작하면 처음부터 다시 셉니다."""
+    doc = {"guild_id": int(guild_id), "user_id": int(user_id),
+           "verifier": verifier, "expires_at": float(expires_at),
+           "used": False}
+
+    if oauth_pending_col is not None:
+        try:
+            await _db(oauth_pending_col.insert_one,
+                      {"_id": state_id, **doc,
+                       "purge_at": datetime.fromtimestamp(purge_at, timezone.utc)})
+            return
+        except Exception as e:
+            print(f"MongoDB save_oauth_pending error: {e}, using local file.", flush=True)
+
+    async with _oauth_pending_lock:
+        rows = _read_json(OAUTH_PENDING_FILE)
+        now = time.time()
+        rows = {k: v for k, v in rows.items()
+                if float(v.get("purge_at", 0) or 0) > now}
+        rows[state_id] = {**doc, "purge_at": float(purge_at)}
+        _write_json(OAUTH_PENDING_FILE, rows)
+
+
+async def consume_oauth_pending(state_id: str) -> tuple:
+    """state 를 **한 번만** 꺼냅니다.
+
+    돌려주는 것: (정보 또는 None, "ok" | "used" | "missing")
+    만료 판정은 호출부가 `expires_at` 으로 합니다 — 만료된 것도 '쓴 것' 으로
+    남겨야 새로고침이 `used` 로 보입니다.
+    """
+    if oauth_pending_col is not None:
+        try:
+            before = await _db(oauth_pending_col.find_one_and_update,
+                               {"_id": state_id, "used": False},
+                               {"$set": {"used": True},
+                                "$unset": {"verifier": ""}})
+            if before is not None:
+                return _pending_out(before), "ok"
+            seen = await _db(oauth_pending_col.find_one,
+                             {"_id": state_id}, {"_id": 1})
+            return None, ("used" if seen else "missing")
+        except Exception as e:
+            print(f"MongoDB consume_oauth_pending error: {e}, using local file.", flush=True)
+
+    async with _oauth_pending_lock:
+        rows = _read_json(OAUTH_PENDING_FILE)
+        row = rows.get(state_id)
+        if row is None or float(row.get("purge_at", 0) or 0) <= time.time():
+            return None, "missing"
+        if row.get("used"):
+            return None, "used"
+        out = _pending_out(row)
+        row["used"] = True
+        row.pop("verifier", None)
+        _write_json(OAUTH_PENDING_FILE, rows)
+        return out, "ok"

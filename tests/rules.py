@@ -390,7 +390,9 @@ def check_docs_budget():
     **또 여기에 쌓으면 같은 일이 반복됩니다.** 새 지뢰는 LESSONS 에 적으세요.
     """
     budget = 52000
-    claude = (PROJ / "CLAUDE.md").read_bytes()
+    # 저장소 안의 크기로 잽니다. Windows(autocrlf)는 체크아웃 때 줄마다
+    # \r 을 붙여 776줄이면 776 B 가 부풀고, 멀쩡한 파일이 초과로 보입니다.
+    claude = (PROJ / "CLAUDE.md").read_bytes().replace(b"\r\n", b"\n")
     lessons = PROJ / "docs" / "LESSONS.md"
     note(len(claude) <= budget,
          f"CLAUDE.md 가 예산 안에 있음 ({len(claude):,} / {budget:,} B)",

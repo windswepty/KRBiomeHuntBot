@@ -642,7 +642,7 @@ class ChannelLock(commands.Cog):
             title="🔓 풀었습니다", description=f"{ch.mention} — 다시 채팅할 수 있습니다.{note}",
             color=discord.Color.green()), ephemeral=True)
 
-    @app_commands.command(name="채널잠금설정", description="매일 지정한 시간에 채널을 잠급니다")
+    @app_commands.command(name="채널잠금설정", description="[관리자 전용] 매일 지정한 시간에 채널을 잠급니다")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)

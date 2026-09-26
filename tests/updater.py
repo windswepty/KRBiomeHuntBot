@@ -213,6 +213,46 @@ async def main():
                           timeout=20)
     note(rc != 0, "실패로 끝남 (멈춰서 기다리지 않음)", f"rc={rc}")
 
+    print("\n=== 10. 마지막 업데이트 · 재시작 시각 ===")
+    # 받은 시각은 reflog 에서 읽습니다 — 진짜 git 이 남긴 값과 맞는지 봅니다
+    before = int(__import__("time").time())
+    await asyncio.sleep(1.1)           # 초 단위라 앞 단계와 구분되게
+    push("fix: 시각 확인용", {"cogs/beta.py": "VALUE = 3\n"})
+    info = await U.check_updates()
+    res = await U.apply_update(info["remote"])
+    note(res["ok"], "업데이트 적용", res.get("detail", "")[:60])
+    t = await U.version_times()
+    commit_ts = int(sh(SERVER, "log", "-1", "--format=%ct", "HEAD"))
+    note(t["committed"] == commit_ts, "지금 버전을 만든 시각 = git 커밋 시각",
+         f"{t['committed']} / {commit_ts}")
+    note(t["applied"] is not None and t["applied"] >= before,
+         "**마지막 업데이트 = 방금 받은 시각** (처음 clone 시각이 아님)",
+         f"{t['applied']} ≥ {before}")
+    note(t["started"] == U.PROCESS_STARTED, "마지막 재시작 = 봇이 뜬 시각")
+
+    # 받은 뒤 재시작을 안 했으면 경고 — 옛 코드로 돌고 있다는 뜻입니다
+    stale = dict(t, started=t["applied"] - 3600)
+    e = U.build_check_embed({"blocked": "", "total": 0, "local": "a" * 12, "times": stale})
+    names = [f.name for f in e.fields]
+    note(any("재시작하지 않았습니다" in n for n in names) and e.color == U.discord.Color.orange(),
+         "받고 재시작 안 함 → 주황 경고", str(names))
+    fresh = dict(t, started=t["applied"] + 5)
+    e = U.build_check_embed({"blocked": "", "total": 0, "local": "a" * 12, "times": fresh})
+    val = e.fields[0].value if e.fields else ""
+    note(not any("재시작하지 않았습니다" in f.name for f in e.fields)
+         and "마지막 업데이트" in val and f"<t:{t['applied']}:f>" in val,
+         "재시작까지 했으면 경고 없이 시각만", val[:60])
+    e = U.build_check_embed({"blocked": "", "total": 0, "local": "a" * 12,
+                             "times": {"committed": None, "applied": None, "started": 0}})
+    note(not e.fields, "시각을 못 읽으면 칸을 통째로 뺌 (빈 칸 · 오류 없음)")
+
+    # /봇업데이트 명령어가 실제로 시각을 붙이는지
+    it = Inter()
+    await U.Updater.update.callback(U.Updater(None), it)
+    emb = it.followup.sent[-1]["embed"]
+    note(any(f.name == "🕒 시각" for f in emb.fields), "/봇업데이트 화면에 시각 칸이 뜸",
+         emb.title)
+
     print(f"\n  실패 {len(F.FAILS)}건 / 성공 {len(F.OKS)}건")
     for x in F.FAILS:
         print("   -", x)

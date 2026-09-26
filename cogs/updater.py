@@ -18,7 +18,9 @@
 """
 
 import os
+import re
 import sys
+import time
 import asyncio
 from pathlib import Path
 
@@ -38,6 +40,12 @@ MAX_LISTED = 15
 
 # 동시에 두 명이 누르면 fetch · merge 가 엉킵니다
 _lock = asyncio.Lock()
+
+# 이 프로세스가 뜬 시각(= 마지막 재시작). cog 는 기동할 때 한 번 불러옵니다.
+# health 의 booted_at 은 monotonic 이라 화면에 시각으로 쓸 수 없습니다.
+PROCESS_STARTED = time.time()
+# 받은 시각이 재시작보다 이만큼 늦으면 '받고 재시작 안 함' 으로 봅니다
+STALE_GRACE = 60
 
 
 async def run(*args, timeout: float = GIT_TIMEOUT, env: dict | None = None) -> tuple[int, str]:
@@ -118,6 +126,42 @@ async def check_updates() -> dict:
     return info
 
 
+async def version_times() -> dict:
+    """지금 버전을 **만든** 시각 · 서버에 **받은** 시각 · 봇을 **재시작한** 시각.
+
+    받은 시각은 reflog(HEAD 가 움직인 기록)에서 읽습니다. `git pull` 이든
+    `/봇업데이트` 든 HEAD 가 이 커밋으로 온 순간이 남습니다. 맨 위에서부터
+    지금 커밋이 이어지는 동안 거슬러 올라가, **처음 이 커밋이 된 순간**을 씁니다.
+    (업데이트가 실패해 되돌린 경우는 되돌린 시각이 됩니다 — 그때 다시 이
+    버전이 된 것이 맞습니다.) 못 읽으면 None 이고, 화면은 그 줄만 뺍니다.
+    """
+    out = {"committed": None, "applied": None, "started": PROCESS_STARTED}
+    rc, head = await git("rev-parse", "HEAD")
+    if rc != 0:
+        return out
+    rc, ct = await git("log", "-1", "--format=%ct", "HEAD")
+    if rc == 0 and ct.strip().isdigit():
+        out["committed"] = int(ct.strip())
+    rc, log = await git("log", "-g", "--date=unix", "--format=%H %gd", "-n", "50", "HEAD")
+    if rc == 0:
+        applied = None
+        for line in log.splitlines():
+            sha, _, sel = line.strip().partition(" ")
+            if sha != head:
+                break
+            m = re.search(r"\{(\d+)\}", sel)
+            if m:
+                applied = int(m.group(1))
+        out["applied"] = applied
+    return out
+
+
+def stale_restart(times: dict) -> bool:
+    """새 코드를 받은 뒤 재시작하지 않았는가 — 그러면 봇은 **옛 코드로** 돌고 있습니다."""
+    applied = times.get("applied")
+    return bool(applied) and applied > times.get("started", 0) + STALE_GRACE
+
+
 def _modules_to_check() -> list[str]:
     """새 코드에서 실제로 불러올 모듈 전부 (main.py 는 기동 자체라 제외)."""
     mods = []
@@ -193,19 +237,47 @@ def restart_soon(reason: str) -> None:
 
 # ── 화면 ───────────────────────────────────────────────────────────────
 
+def _add_times(embed: discord.Embed, times: dict | None) -> discord.Embed:
+    """마지막 업데이트 · 재시작 시각. 디스코드 시각 표기라 보는 사람의 시간대로 나옵니다."""
+    if not times:
+        return embed
+
+    def ts(t):
+        return f"<t:{int(t)}:f> (<t:{int(t)}:R>)"
+
+    lines = []
+    if times.get("applied"):
+        lines.append(f"📥 **마지막 업데이트** {ts(times['applied'])}")
+    if times.get("committed"):
+        lines.append(f"🛠️ 지금 버전을 만든 시각 {ts(times['committed'])}")
+    if times.get("started"):
+        lines.append(f"🔄 마지막 재시작 {ts(times['started'])}")
+    if lines:
+        embed.add_field(name="🕒 시각", value="\n".join(lines), inline=False)
+    if stale_restart(times):
+        # 받아만 두고 재시작하지 않아 며칠간 옛 코드로 돈 적이 있습니다
+        embed.add_field(
+            name="⚠️ 새 코드를 받은 뒤 재시작하지 않았습니다",
+            value="지금 봇은 **받기 전의 옛 코드로** 돌고 있습니다. 아래 **재시작만** 을 누르세요.",
+            inline=False)
+        embed.color = discord.Color.orange()
+    return embed
+
+
 def build_check_embed(info: dict) -> discord.Embed:
+    times = info.get("times")
     if info["blocked"]:
-        return discord.Embed(
+        return _add_times(discord.Embed(
             title="⛔ 업데이트할 수 없는 상태입니다",
             description=info["blocked"] + "\n\n-# 이 경우는 SSH 로 서버에 들어가 확인해야 합니다 "
                                           "(RUNBOOK.md 참고).",
-            color=discord.Color.orange())
+            color=discord.Color.orange()), times)
     if not info["total"]:
         embed = discord.Embed(title="✅ 이미 최신입니다",
                               description=f"지금 버전 `{_short(info['local'])}` = GitHub main",
                               color=discord.Color.green())
         embed.set_footer(text="🔄 재시작만 할 수도 있습니다")
-        return embed
+        return _add_times(embed, times)
     lines = "\n".join(f"• `{c[:7]}` {c[8:][:90]}" for c in info["commits"])
     more = info["total"] - len(info["commits"])
     embed = discord.Embed(
@@ -223,7 +295,7 @@ def build_check_embed(info: dict) -> discord.Embed:
                         value="`requirements.txt` 가 바뀌어 설치부터 합니다 (몇 분 걸릴 수 있음).",
                         inline=False)
     embed.set_footer(text="적용 전에 새 코드를 전부 불러와 봅니다 · 실패하면 되돌리고 재시작하지 않습니다")
-    return embed
+    return _add_times(embed, times)
 
 
 async def _admin(interaction: discord.Interaction) -> bool:
@@ -302,6 +374,7 @@ class Updater(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with _lock:
             info = await check_updates()
+            info["times"] = await version_times()
         await interaction.followup.send(embed=build_check_embed(info), view=UpdateView(info),
                                         ephemeral=True)
 

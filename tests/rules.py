@@ -329,6 +329,7 @@ DB_AWAITS = {
     "list_point_snapshots", "get_biome_buckets", "get_backup_settings",
     "get_quest_progress", "get_boost", "_db",
     "get_mod_settings", "get_user_cases", "get_active_warnings",
+    "get_lock_doc",
 }
 
 # 규칙을 어기는 것이 **맞는** 자리 (모달은 첫 응답이어야 해서 defer 불가 등).

@@ -8,6 +8,8 @@
   mod_settings  길드별 설정 + 케이스 번호 카운터 (`case_seq`)
   mod_cases     처벌 기록 하나하나 (_id = "길드:케이스번호")
   mod_users     유저별 유효 경고 수 (_id = "길드:유저")
+  channel_locks 채널 잠금 (_id = 길드) — 자동 잠금 설정 · 수동 잠금 · 잠그기
+                전의 원래 권한 (/잠금 · /채널잠금설정)
 
 **처벌 기록에는 TTL 을 걸지 않습니다.** 몇 달 전 경고가 사라지면 누적
 처벌이 무의미해지고, 이의 제기 때 근거를 댈 수 없습니다.
@@ -26,12 +28,14 @@ DATA_DIR = "data"
 MOD_SETTINGS_FILE = os.path.join(DATA_DIR, "mod_settings.json")
 MOD_CASES_FILE = os.path.join(DATA_DIR, "mod_cases.json")
 MOD_USERS_FILE = os.path.join(DATA_DIR, "mod_users.json")
+LOCK_FILE = os.path.join(DATA_DIR, "channel_locks.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 KST = timezone(timedelta(hours=9))
 
 _settings_lock = asyncio.Lock()
 _cases_lock = asyncio.Lock()
+_lockdoc_lock = asyncio.Lock()
 
 # pymongo 의 ReturnDocument.AFTER. 연결 블록 안에서만 정의하면 폴백일 때
 # NameError 가 나므로 밖에 둡니다.
@@ -40,6 +44,7 @@ _AFTER = None
 mod_settings_col = None
 mod_cases_col = None
 mod_users_col = None
+channel_lock_col = None
 
 if MONGO_URI:
     try:
@@ -50,6 +55,7 @@ if MONGO_URI:
         mod_settings_col = _mdb["mod_settings"]
         mod_cases_col = _mdb["mod_cases"]
         mod_users_col = _mdb["mod_users"]
+        channel_lock_col = _mdb["channel_locks"]
         _AFTER = _ReturnDocument.AFTER
         try:
             # 유저 검색이 이 순서로 찾습니다 (없으면 풀스캔)
@@ -65,6 +71,7 @@ if MONGO_URI:
         mod_settings_col = None
         mod_cases_col = None
         mod_users_col = None
+        channel_lock_col = None
 
 
 async def _db(fn, *args, **kwargs):
@@ -414,3 +421,103 @@ async def remove_warnings(guild_id: int, user_id: int, cases: list | None,
     if done:
         await _bump_active(guild_id, user_id, -len(done))
     return done
+
+
+# ── 채널 잠금 (/잠금 · /잠금해제 · /채널잠금설정) ─────────────────────
+#
+# 길드마다 문서 하나입니다.
+#
+#   설정      enabled · start · end · channel_ids · announce   (자동 잠금)
+#   locked    {채널: {saved, at, notice_id}}  실제로 잠가 둔 채널과 **원래 권한**
+#   manual    {채널: {until, by, reason}}     /잠금 으로 잠근 것 (until 없으면 무기한)
+#   open_until {채널: 시각}                   자동 잠금 시간 중 /잠금해제 한 것
+#
+# ⚠️ **원래 권한(`saved`)은 권한을 바꾸기 전에 저장합니다.** 바꾼 뒤 저장이
+# 실패하면 무엇으로 되돌릴지 몰라 그 채널이 **영영 잠깁니다.** 반대로 먼저
+# 저장하고 바꾸기가 실패하면, 다음 주기에 같은 `saved` 로 다시 시도합니다.
+# 재시작해도 7시에 풀리는 것도 이게 DB 에 있기 때문입니다.
+
+DEFAULT_LOCK_SETTINGS = {
+    "enabled": False,
+    "start": "00:00",       # KST
+    "end": "07:00",
+    "channel_ids": [],
+    "announce": True,       # 잠글 때 채널에 안내를 올리고, 풀 때 지웁니다
+}
+LOCK_STATE_ROOTS = ("locked", "manual", "open_until")
+MAX_LOCK_CHANNELS = 25
+
+
+async def get_lock_doc(guild_id: int) -> dict:
+    """설정 + 상태를 한 번에. 없는 키는 기본값으로 채웁니다."""
+    key = str(guild_id)
+    doc = None
+    if channel_lock_col is not None:
+        try:
+            doc = await _db(channel_lock_col.find_one, {"_id": key})
+        except Exception as e:
+            print(f"MongoDB get_lock_doc error: {e}, using local file.", flush=True)
+            async with _lockdoc_lock:
+                doc = _read_json(LOCK_FILE).get(key)
+    else:
+        async with _lockdoc_lock:
+            doc = _read_json(LOCK_FILE).get(key)
+    doc = doc or {}
+    out = {k: doc.get(k, v) for k, v in DEFAULT_LOCK_SETTINGS.items()}
+    out["channel_ids"] = [int(c) for c in (out.get("channel_ids") or [])]
+    for root in LOCK_STATE_ROOTS:
+        out[root] = dict(doc.get(root) or {})
+    return out
+
+
+async def save_lock_settings(guild_id: int, changes: dict) -> None:
+    """**바뀐 설정 키만** `$set`. 상태(locked 등)는 여기로 건드리지 않습니다 —
+    통째로 덮으면 잠가 둔 채널의 원래 권한이 날아가 풀 수 없게 됩니다."""
+    changes = {k: v for k, v in changes.items() if k in DEFAULT_LOCK_SETTINGS}
+    if not changes:
+        return
+    await _lock_update(guild_id, set_=changes)
+
+
+async def set_lock_state(guild_id: int, root: str, channel_id: int, value) -> None:
+    """상태 한 칸을 바꿉니다(`value` 가 None 이면 지움). 다른 채널은 건드리지 않습니다."""
+    if root not in LOCK_STATE_ROOTS:
+        raise ValueError(f"모르는 상태 칸: {root}")
+    path = f"{root}.{int(channel_id)}"
+    if value is None:
+        await _lock_update(guild_id, unset=[path])
+    else:
+        await _lock_update(guild_id, set_={path: value})
+
+
+async def _lock_update(guild_id: int, set_: dict | None = None,
+                       unset: list | None = None) -> None:
+    key = str(guild_id)
+    if channel_lock_col is not None:
+        try:
+            update = {}
+            if set_:
+                update["$set"] = set_
+            if unset:
+                update["$unset"] = {p: "" for p in unset}
+            await _db(channel_lock_col.update_one, {"_id": key}, update, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB channel lock update error: {e}, using local file.", flush=True)
+    async with _lockdoc_lock:
+        all_rows = _read_json(LOCK_FILE)
+        row = all_rows.get(key) or {}
+        for path, value in (set_ or {}).items():
+            cur = row
+            parts = path.split(".")
+            for p in parts[:-1]:
+                cur = cur.setdefault(p, {})
+            cur[parts[-1]] = value
+        for path in unset or []:
+            cur = row
+            parts = path.split(".")
+            for p in parts[:-1]:
+                cur = cur.get(p) or {}
+            cur.pop(parts[-1], None)
+        all_rows[key] = row
+        _write_json(LOCK_FILE, all_rows)

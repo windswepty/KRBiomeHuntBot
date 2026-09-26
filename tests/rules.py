@@ -381,6 +381,46 @@ def check_defer():
          " / ".join(bad[:4]) if bad else "")
 
 
+# 이모지 영역(U+1F000~) 밖의 기호 중 **디스코드가 이모지로 받아 준 것**.
+# 운영 로그(2026-09-01~)에서 `Invalid emoji` 가 한 번도 안 난 것만 있습니다.
+# `⏻`(전원 기호)는 이모지처럼 보여도 그냥 문자라 패널 전송이 **400 으로 통째로
+# 거부**되어 /채널잠금설정 이 안 열렸습니다. 새 기호는 디스코드에서 버튼이
+# 실제로 뜨는 걸 본 뒤에 여기 더하세요.
+KNOWN_BMP_EMOJI = set("↩⏸▶◀☀♻⚖⚠⚡✅✉✏✖❌❓➕➖⬆")
+_EMOJI_JOINERS = {0xFE0F, 0xFE0E, 0x200D, 0x20E3}
+
+
+def check_emoji():
+    print("")
+    print("=== ⑩ 버튼·메뉴 이모지는 디스코드가 아는 것만 ===")
+    print("    (모르는 기호 하나로 메시지 전송이 통째로 거부됩니다)")
+    bad = []
+    for p in FILES:
+        if p.parts[-2] != "cogs":
+            continue
+        tree, _ = parse(p)
+        for n in ast.walk(tree):
+            vals = []
+            if isinstance(n, ast.keyword) and n.arg == "emoji":
+                vals = [n.value]
+            elif isinstance(n, ast.Assign) and any(
+                    isinstance(t, ast.Attribute) and t.attr == "emoji" for t in n.targets):
+                vals = [n.value]
+            for v in vals:
+                for c in ast.walk(v):
+                    if not (isinstance(c, ast.Constant) and isinstance(c.value, str)):
+                        continue
+                    for ch in c.value:
+                        cp = ord(ch)
+                        if ch.isascii() or cp in _EMOJI_JOINERS or cp >= 0x1F000:
+                            continue
+                        if ch not in KNOWN_BMP_EMOJI:
+                            bad.append(f"{rel(p)}:{c.lineno}  {c.value!r} (U+{cp:04X})")
+    note(not bad, f"확인 안 된 이모지 기호 {len(bad)}건")
+    for b in bad[:10]:
+        print("     ", b)
+
+
 def check_docs_budget():
     """CLAUDE.md 가 다시 부풀지 않는지 봅니다.
 
@@ -414,6 +454,7 @@ check_points()
 check_guild_only()
 check_secrets_ignored()
 check_defer()
+check_emoji()
 check_docs_budget()
 
 print(f"\n  실패 {len(FAILS)}건 / 성공 {len(OKS)}건")

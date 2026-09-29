@@ -125,6 +125,24 @@ async def test_warn():
     note("DM 을 막아 둔" in text_of(last_embed(it))
          and len(await mdb.get_active_warnings(GUILD.id, closed.id)) == 1,
          "DM 이 막혀도 경고는 기록되고 그 사실을 알려 줌")
+    note("어떤 봇도" in text_of(last_embed(it)),
+         "**우리 봇 고장이 아니라는 것**까지 알려 줌 (디스코드가 거부 · Dyno 도 같음)")
+
+    print("\n  50007 이 아닌 거부는 '막아 둔 유저' 로 뭉개지 않습니다")
+    import io, contextlib
+
+    class Odd:
+        id = 8105
+
+        async def send(self, **k):
+            raise discord.Forbidden(type("R", (), {"status": 403, "reason": ""})(),
+                                    {"code": 50001, "message": "Missing Access"})
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _, status = await M.safe_dm(Odd(), discord.Embed(title="x"))
+    note(status == "failed" and "code=50001" in buf.getvalue(),
+         "다른 코드는 '전송 실패' + 로그에 코드", f"{status} · {buf.getvalue().strip()[:60]}")
 
 
 async def test_auto():

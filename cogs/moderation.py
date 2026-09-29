@@ -52,7 +52,12 @@ PERM_LABEL = {"moderate_members": "멤버 타임아웃", "kick_members": "멤버
 
 DM_STATUS = {
     "sent": "✅ DM 전송됨",
-    "closed": "🚫 DM 을 막아 둔 유저라 못 보냈습니다",
+    # 유저가 '서버 멤버 DM 허용' 을 끄거나 봇을 차단하면 디스코드가 50007 로
+    # 거부합니다. **우회할 방법이 없습니다** (Dyno 도 같음). 이 한 줄이 없으면
+    # 운영진은 우리 봇 고장인 줄 압니다(2026-09-29 문의).
+    "closed": ("🚫 DM 을 막아 둔 유저라 못 보냈습니다\n"
+               "-# 유저가 서버 멤버 DM 을 끄거나 봇을 차단하면 디스코드가 거부합니다 "
+               "(Dyno 등 어떤 봇도 못 보냅니다)"),
     "failed": "⚠️ DM 전송 실패",
     "off": "— DM 꺼짐",
     "absent": "— 서버에 없는 유저라 DM 을 보낼 수 없습니다",
@@ -236,8 +241,14 @@ async def safe_dm(user, embed: discord.Embed, view=None):
             kw["view"] = view
         msg = await asyncio.wait_for(user.send(**kw), timeout=5)
         return msg, "sent"
-    except discord.Forbidden:
-        return None, "closed"
+    except discord.Forbidden as e:
+        # 50007 = 유저가 DM 을 막음. 다른 코드는 우리 쪽 문제일 수 있어 따로 남깁니다
+        # (예전에는 전부 '막아 둔 유저' 로 뭉개 원인을 볼 수 없었습니다).
+        if getattr(e, "code", None) == 50007:
+            return None, "closed"
+        print(f"[Moderation] DM 거부({getattr(user, 'id', '?')}): code={getattr(e, 'code', '?')}",
+              flush=True)
+        return None, "failed"
     except (discord.HTTPException, asyncio.TimeoutError, OSError) as e:
         print(f"[Moderation] DM 전송 실패({getattr(user, 'id', '?')}): "
               f"{type(e).__name__}: {e}", flush=True)

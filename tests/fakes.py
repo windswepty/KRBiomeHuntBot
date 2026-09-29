@@ -165,8 +165,9 @@ class Member:
 
     async def send(self, *a, **k):
         if getattr(self, "dm_closed", False):
+            # 실제 디스코드처럼 코드 50007 을 붙입니다 — 봇이 코드로 원인을 가릅니다
             raise discord.Forbidden(type("R", (), {"status": 403, "reason": ""})(),
-                                    "Cannot send messages to this user")
+                                    {"code": 50007, "message": "Cannot send messages to this user"})
         self.dms.append(k or {"pos": a})
         m = Msg(700 + len(self.dms), None, None)
         m.dm_of = self

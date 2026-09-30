@@ -120,6 +120,10 @@ DEFAULT_MOD_SETTINGS = {
     "support_link": "",
     # DM 에 덧붙일 문구 (예: "이의 제기는 서포트 서버에서 받습니다")
     "ban_dm_message": "",
+    # 밴할 때 그 유저의 최근 며칠 치 메시지를 지울지 (0~7). **7일이 디스코드 상한**입니다
+    # — 그보다 오래된 것은 밴 API 로 지울 수 없습니다(Dyno 도 같음).
+    # /밴 의 `메시지삭제` 를 적으면 그 값이 우선합니다.
+    "ban_delete_days": 7,
     # 경고 누적 자동 처벌 [{"count": 3, "action": "timeout", "minutes": 60}, ...]
     "auto_rules": [],
 }

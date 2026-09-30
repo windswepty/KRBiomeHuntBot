@@ -332,7 +332,8 @@ async def apply_auto_rule(guild, member, rule: dict, count: int, last_reason: st
         return f"⚠️ 자동 {ACTION_LABEL.get(action, action)} 실패 — {blocker}"
     try:
         if action == "ban":
-            res = await execute_ban(guild, me, member, reason, settings, 0, auto=True)
+            res = await execute_ban(guild, me, member, reason, settings,
+                                    ban_delete_days(settings), auto=True)
             if not res["ok"]:
                 return f"⚠️ 자동 밴 실패 — {res['error']}"
             return (f"🔨 **자동 밴** (케이스 `#{res['case']['case']}`) · "
@@ -861,6 +862,10 @@ def build_dm_settings_embed(settings: dict) -> discord.Embed:
                     inline=True)
     embed.add_field(name="⚠️ 경고 DM", value="🟢 켜짐" if settings.get("warn_dm") else "⚫ 꺼짐",
                     inline=True)
+    days = ban_delete_days(settings)
+    embed.add_field(name="🧹 밴할 때 메시지 삭제",
+                    value=(f"최근 **{days}일** 치" if days else "지우지 않음")
+                    + "\n-# 7일이 디스코드 상한입니다", inline=True)
     embed.add_field(name="🛟 서포트 서버 링크",
                     value=link or "없음 — **✏️ 문구·링크 수정** 에서 넣어 주세요",
                     inline=False)
@@ -900,9 +905,32 @@ class BanDmModal(discord.ui.Modal, title="✉️ 밴 DM 문구·링크"):
                                                  view=BanDmView(settings))
 
 
+class BanDeleteSelect(discord.ui.Select):
+    """밴할 때 지울 기간. 7일이 디스코드 상한이라 그 이상은 두지 않습니다."""
+
+    CHOICES = ((0, "지우지 않음"), (1, "최근 1일"), (3, "최근 3일"), (7, "최근 7일 (최대)"))
+
+    def __init__(self, settings: dict):
+        now = ban_delete_days(settings)
+        super().__init__(
+            placeholder="🧹 밴할 때 지울 메시지 기간", row=2,
+            options=[discord.SelectOption(label=label, value=str(d), default=(d == now))
+                     for d, label in self.CHOICES])
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await _require(interaction, "administrator"):
+            return
+        await interaction.response.defer()
+        await save_mod_settings(interaction.guild.id, {"ban_delete_days": int(self.values[0])})
+        settings = await get_mod_settings(interaction.guild.id)
+        await interaction.edit_original_response(embed=build_dm_settings_embed(settings),
+                                                 view=BanDmView(settings))
+
+
 class BanDmView(discord.ui.View):
     def __init__(self, settings: dict):
         super().__init__(timeout=600)
+        self.add_item(BanDeleteSelect(settings))
         self.ban_toggle.label = f"밴 DM: {'켜짐' if settings.get('ban_dm') else '꺼짐'}"
         self.ban_toggle.style = (discord.ButtonStyle.success if settings.get("ban_dm")
                                  else discord.ButtonStyle.secondary)
@@ -1117,6 +1145,9 @@ def build_panel_embed(guild, settings: dict) -> discord.Embed:
         inline=True)
     embed.add_field(name="⚠️ 경고 DM",
                     value="🟢 켜짐" if settings.get("warn_dm") else "⚫ 꺼짐", inline=True)
+    days = ban_delete_days(settings)
+    embed.add_field(name="🧹 밴 시 메시지 삭제",
+                    value=f"최근 {days}일" if days else "안 함", inline=True)
     rules = sorted(settings.get("auto_rules") or [], key=lambda r: int(r.get("count", 0)))
     # 칸이 1024자를 넘으면 패널 **전송 자체가 실패**해 /경고설정 이 안 열립니다
     for i, chunk in enumerate(_chunk_lines([describe_rule(r) for r in rules]) or ["없음"]):
@@ -1235,7 +1266,21 @@ async def do_warn(guild, moderator, member, reason: str) -> discord.Embed:
          auto_line])
 
 
-async def do_ban(guild, moderator, user, reason: str, delete_days: int = 0) -> discord.Embed:
+def ban_delete_days(settings: dict, override: int | None = None) -> int:
+    """밴할 때 지울 기간(일). 명령어에 적은 값 > 설정값. 디스코드 상한 7일로 자릅니다."""
+    raw = override if override is not None else settings.get("ban_delete_days", 7)
+    try:
+        return max(0, min(7, int(raw)))
+    except (TypeError, ValueError):
+        return 7
+
+
+def delete_line(days: int) -> str:
+    return (f"🧹 최근 **{days}일** 동안 보낸 메시지를 지웠습니다" if days
+            else "🧹 메시지는 지우지 않았습니다")
+
+
+async def do_ban(guild, moderator, user, reason: str, delete_days: int | None = None) -> discord.Embed:
     problem = target_problem(guild, moderator, user)
     if not problem and not guild.me.guild_permissions.ban_members:
         problem = "봇에게 **멤버 차단** 권한이 없습니다."
@@ -1248,7 +1293,8 @@ async def do_ban(guild, moderator, user, reason: str, delete_days: int = 0) -> d
         return _result_embed("⛔ 밴할 수 없습니다", discord.Color.greyple(), [problem])
 
     settings = await get_mod_settings(guild.id)
-    res = await execute_ban(guild, moderator, user, reason, settings, delete_days)
+    days = ban_delete_days(settings, delete_days)
+    res = await execute_ban(guild, moderator, user, reason, settings, days)
     if not res["ok"]:
         return _result_embed("⚠️ 밴 실패", discord.Color.orange(),
                              [res["error"], "-# 보낸 DM 이 있었다면 회수했습니다."])
@@ -1257,6 +1303,7 @@ async def do_ban(guild, moderator, user, reason: str, delete_days: int = 0) -> d
         [f"<@{user.id}> (`{user}`) 님을 밴했습니다.",
          f"📝 {_truncate(reason, 300)}",
          DM_STATUS.get(res["dm"], res["dm"]),
+         delete_line(days),
          "-# 서포트 링크가 없습니다 — `/경고설정` → 밴 DM 설정에서 넣을 수 있습니다"
          if res["dm"] == "sent" and not settings.get("support_link") else ""])
 
@@ -1395,13 +1442,13 @@ class Moderation(commands.Cog):
 
     @app_commands.command(name="밴", description="유저를 밴합니다 (밴 직전에 사유·서포트 링크 DM).")
     @app_commands.describe(유저="밴할 유저 (서버에 없으면 ID 로)", 사유="밴 사유 (DM 과 기록에 남습니다)",
-                           메시지삭제="최근 며칠 치 메시지를 지울지 (0~7일)")
+                           메시지삭제="최근 며칠 치 메시지를 지울지 (0~7일, 비우면 설정값 · 기본 7일)")
     @app_commands.guild_only()
     @app_commands.default_permissions(ban_members=True)
     @app_commands.checks.has_permissions(ban_members=True)
     async def ban(self, interaction: discord.Interaction, 유저: discord.User,
                   사유: app_commands.Range[str, 1, 500],
-                  메시지삭제: app_commands.Range[int, 0, 7] = 0):
+                  메시지삭제: app_commands.Range[int, 0, 7] | None = None):
         await interaction.response.defer(ephemeral=True, thinking=True)
         embed = await do_ban(interaction.guild, interaction.user, 유저, 사유, 메시지삭제)
         await interaction.followup.send(embed=embed, ephemeral=True)

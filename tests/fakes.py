@@ -216,6 +216,8 @@ class Guild:
         if self.ban_fail is not None:
             raise self.ban_fail
         self.bans[user.id] = reason
+        # 밴과 함께 지운 메시지 기간 — 버리면 '며칠 치를 지웠는가' 를 검증할 수 없습니다
+        self.__dict__.setdefault("ban_delete", {})[user.id] = delete_message_seconds
 
     async def unban(self, user, reason=None):
         if user.id not in self.bans:

@@ -605,6 +605,73 @@ async def test_mongo():
     note(not leaks, "Mongo 경로가 JSON 으로 새지 않음", f"{len(leaks)}건")
 
 
+async def test_ban_delete():
+    print("\n=== 10. 밴하면 그 유저의 최근 메시지도 지움 (2026-10-01 요청) ===")
+    # 7일이 디스코드 상한 — 밴 API 의 delete_message_seconds 로 지웁니다
+    DAY = 86400
+    moder = Member(7, "운영자", False, roles=[MOD_ROLE], guild=GUILD)
+    GUILD.ban_fail = None
+
+    s = await mdb.get_mod_settings(GUILD.id)
+    note(s.get("ban_delete_days") == 7, "기본값은 7일 (디스코드 최대)", str(s.get("ban_delete_days")))
+
+    t1 = member(9101, "지울사람1")
+    e = await M.do_ban(GUILD, moder, t1, "도배")
+    note(GUILD.ban_delete.get(t1.id) == 7 * DAY, "**!ban · 기본 → 최근 7일 메시지 삭제 요청**",
+         str(GUILD.ban_delete.get(t1.id)))
+    note("최근 **7일**" in text_of(e), "결과에 몇 일 치를 지웠는지 적음")
+
+    t2 = member(9102, "남길사람")
+    it = mod_inter()
+    await M.Moderation.ban.callback(M.Moderation(None), it, t2, "x", 0)
+    note(GUILD.ban_delete.get(t2.id) == 0 and "지우지 않았습니다" in text_of(last_embed(it)),
+         "/밴 메시지삭제:0 → 지우지 않음 (적은 값이 우선)")
+
+    t3 = member(9103, "기본슬래시")
+    it = mod_inter()
+    await M.Moderation.ban.callback(M.Moderation(None), it, t3, "x")
+    note(GUILD.ban_delete.get(t3.id) == 7 * DAY, "/밴 에서 비워 두면 설정값(7일)")
+
+    print("\n  설정 화면에서 바꾸기")
+    sel = M.BanDeleteSelect(await mdb.get_mod_settings(GUILD.id))
+    note([o.value for o in sel.options] == ["0", "1", "3", "7"]
+         and next(o for o in sel.options if o.default).value == "7",
+         "선택지 0·1·3·7일, 지금 값(7)이 선택돼 있음")
+    sel._values = ["3"]
+    it = Inter(uid=7, roles=[MOD_ROLE])
+    await sel.callback(it)
+    s = await mdb.get_mod_settings(GUILD.id)
+    note(s.get("ban_delete_days") == 3 and it.response.edited, "3일로 저장 · 화면 갱신")
+    it = Inter(uid=8, admin=False, roles=[LOW_ROLE])
+    sel2 = M.BanDeleteSelect(s)
+    sel2._values = ["0"]
+    await sel2.callback(it)
+    note((await mdb.get_mod_settings(GUILD.id)).get("ban_delete_days") == 3, "관리자가 아니면 못 바꿈")
+
+    t4 = member(9104, "접두사밴")
+    cog = M.Moderation(None)
+    ctx = Ctx(moder)
+    await cog.ban_prefix.callback(cog, ctx, t4, 사유="x")
+    note(GUILD.ban_delete.get(t4.id) == 3 * DAY, "!ban 도 바뀐 설정(3일)을 따름")
+
+    t5 = member(9105, "자동밴")
+    await M.apply_auto_rule(GUILD, t5, {"count": 1, "action": "ban"}, 1, "누적",
+                            await mdb.get_mod_settings(GUILD.id))
+    note(GUILD.ban_delete.get(t5.id) == 3 * DAY, "경고 누적 **자동 밴**도 설정을 따름",
+         str(GUILD.ban_delete.get(t5.id)))
+
+    note(M.ban_delete_days({"ban_delete_days": 30}) == 7
+         and M.ban_delete_days({"ban_delete_days": "x"}) == 7
+         and M.ban_delete_days({}, 0) == 0 and M.ban_delete_days({"ban_delete_days": -2}) == 0,
+         "손으로 고친 이상한 값은 0~7 로 자름")
+    emb = M.build_dm_settings_embed(await mdb.get_mod_settings(GUILD.id))
+    note("최근 **3일**" in text_of(emb) and "디스코드 상한" in text_of(emb),
+         "밴 DM 설정 화면에 현재 값과 7일 상한 안내")
+    note("최근 3일" in text_of(M.build_panel_embed(GUILD, await mdb.get_mod_settings(GUILD.id))),
+         "/경고설정 첫 화면에도 표시")
+    await mdb.save_mod_settings(GUILD.id, {"ban_delete_days": 7})
+
+
 async def main():
     GUILD.me.guild_permissions = Perms()
     await test_warn()
@@ -615,6 +682,7 @@ async def main():
     await test_panel()
     await test_settings_ui()
     await test_prefix()
+    await test_ban_delete()
     await test_mongo()
     await drain()
 

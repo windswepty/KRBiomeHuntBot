@@ -613,7 +613,10 @@ async def test_ban_delete():
     GUILD.ban_fail = None
 
     s = await mdb.get_mod_settings(GUILD.id)
-    note(s.get("ban_delete_days") == 7, "기본값은 7일 (디스코드 최대)", str(s.get("ban_delete_days")))
+    note(s.get("ban_delete_days") == 7 and s.get("ban_delete_all") is True,
+         "기본값은 '전부' (7일 + 그보다 오래된 것)", str((s.get("ban_delete_days"), s.get("ban_delete_all"))))
+    # 오래된 메시지 정리(검색 API)는 tests/ban_purge.py 가 따로 봅니다. 여기서는 7일 이하만.
+    await mdb.save_mod_settings(GUILD.id, {"ban_delete_all": False})
 
     t1 = member(9101, "지울사람1")
     e = await M.do_ban(GUILD, moder, t1, "도배")
@@ -634,9 +637,9 @@ async def test_ban_delete():
 
     print("\n  설정 화면에서 바꾸기")
     sel = M.BanDeleteSelect(await mdb.get_mod_settings(GUILD.id))
-    note([o.value for o in sel.options] == ["0", "1", "3", "7"]
+    note([o.value for o in sel.options] == ["all", "0", "1", "3", "7"]
          and next(o for o in sel.options if o.default).value == "7",
-         "선택지 0·1·3·7일, 지금 값(7)이 선택돼 있음")
+         "선택지 전부·0·1·3·7일, 지금 값(7)이 선택돼 있음")
     sel._values = ["3"]
     it = Inter(uid=7, roles=[MOD_ROLE])
     await sel.callback(it)
@@ -669,7 +672,17 @@ async def test_ban_delete():
          "밴 DM 설정 화면에 현재 값과 7일 상한 안내")
     note("최근 3일" in text_of(M.build_panel_embed(GUILD, await mdb.get_mod_settings(GUILD.id))),
          "/경고설정 첫 화면에도 표시")
-    await mdb.save_mod_settings(GUILD.id, {"ban_delete_days": 7})
+
+    sel = M.BanDeleteSelect(await mdb.get_mod_settings(GUILD.id))
+    sel._values = ["all"]
+    await sel.callback(Inter(uid=7, roles=[MOD_ROLE]))
+    s = await mdb.get_mod_settings(GUILD.id)
+    note(s.get("ban_delete_all") is True and s.get("ban_delete_days") == 7,
+         "'전부' 를 고르면 7일 + 오래된 것까지 (두 설정이 함께 바뀜)")
+    note("**전부**" in text_of(M.build_dm_settings_embed(s))
+         and next(o for o in M.BanDeleteSelect(s).options if o.default).value == "all",
+         "화면에 '전부' · 메뉴에도 '전부' 가 선택됨")
+    await mdb.save_mod_settings(GUILD.id, {"ban_delete_days": 7, "ban_delete_all": True})
 
 
 async def main():

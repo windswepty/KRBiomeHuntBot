@@ -16,7 +16,9 @@ DM 만 받고 멀쩡히 남아 있으면 그게 더 혼란스럽습니다.
 
 import re
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9))
 
 import discord
 from discord.ext import commands
@@ -26,7 +28,7 @@ from utils.mod_db import (
     get_mod_settings, save_mod_settings, add_case, add_warning,
     get_user_cases, get_active_warnings, find_users_by_name,
     remove_warnings, AUTO_ACTIONS, TIMEOUT_MAX_MINUTES,
-    PREFIXES, DEFAULT_PREFIX,
+    PREFIXES, DEFAULT_PREFIX, get_purge_jobs, set_purge_job,
 )
 
 
@@ -336,6 +338,8 @@ async def apply_auto_rule(guild, member, rule: dict, count: int, last_reason: st
                                     ban_delete_days(settings), auto=True)
             if not res["ok"]:
                 return f"⚠️ 자동 밴 실패 — {res['error']}"
+            if settings.get("ban_delete_all", True):
+                await start_purge(guild, member.id, getattr(me, "id", 0))
             return (f"🔨 **자동 밴** (케이스 `#{res['case']['case']}`) · "
                     f"{DM_STATUS.get(res['dm'], res['dm'])}")
         if action == "timeout":
@@ -777,6 +781,8 @@ async def do_unban(interaction: discord.Interaction, user_id: int, reason: str) 
                              description=f"디스코드 오류 ({e.status}). 잠시 후 다시 시도하세요.",
                              color=discord.Color.orange())
 
+    # 실수로 밴했다 푸는 경우 — 오래된 메시지 정리를 **바로** 멈춥니다
+    await stop_purge(guild.id, user_id)
     cases = await get_user_cases(guild.id, user_id, limit=50)
     last_ban = current_ban_case(cases)
     name = next((c["user_name"] for c in cases if c.get("user_name")), str(user_id))
@@ -864,8 +870,11 @@ def build_dm_settings_embed(settings: dict) -> discord.Embed:
                     inline=True)
     days = ban_delete_days(settings)
     embed.add_field(name="🧹 밴할 때 메시지 삭제",
-                    value=(f"최근 **{days}일** 치" if days else "지우지 않음")
-                    + "\n-# 7일이 디스코드 상한입니다", inline=True)
+                    value=("**전부** (오래된 것까지)\n-# 7일보다 오래된 것은 백그라운드에서 찾아 지웁니다"
+                           if settings.get("ban_delete_all", True)
+                           else (f"최근 **{days}일** 치" if days else "지우지 않음")
+                           + "\n-# 7일이 디스코드 상한 · 그보다 오래된 것까지는 '전부'"),
+                    inline=True)
     embed.add_field(name="🛟 서포트 서버 링크",
                     value=link or "없음 — **✏️ 문구·링크 수정** 에서 넣어 주세요",
                     inline=False)
@@ -908,20 +917,24 @@ class BanDmModal(discord.ui.Modal, title="✉️ 밴 DM 문구·링크"):
 class BanDeleteSelect(discord.ui.Select):
     """밴할 때 지울 기간. 7일이 디스코드 상한이라 그 이상은 두지 않습니다."""
 
-    CHOICES = ((0, "지우지 않음"), (1, "최근 1일"), (3, "최근 3일"), (7, "최근 7일 (최대)"))
+    CHOICES = (("all", "전부 (7일보다 오래된 것까지)"), ("0", "지우지 않음"), ("1", "최근 1일"),
+               ("3", "최근 3일"), ("7", "최근 7일"))
 
     def __init__(self, settings: dict):
-        now = ban_delete_days(settings)
+        now = "all" if settings.get("ban_delete_all", True) else str(ban_delete_days(settings))
         super().__init__(
-            placeholder="🧹 밴할 때 지울 메시지 기간", row=2,
-            options=[discord.SelectOption(label=label, value=str(d), default=(d == now))
-                     for d, label in self.CHOICES])
+            placeholder="🧹 밴할 때 지울 메시지", row=2,
+            options=[discord.SelectOption(label=label, value=v, default=(v == now))
+                     for v, label in self.CHOICES])
 
     async def callback(self, interaction: discord.Interaction):
         if not await _require(interaction, "administrator"):
             return
         await interaction.response.defer()
-        await save_mod_settings(interaction.guild.id, {"ban_delete_days": int(self.values[0])})
+        v = self.values[0]
+        # '전부' = 최근 7일은 밴이 지우고, 그보다 오래된 것은 검색해서 지웁니다
+        await save_mod_settings(interaction.guild.id, {
+            "ban_delete_days": 7 if v == "all" else int(v), "ban_delete_all": v == "all"})
         settings = await get_mod_settings(interaction.guild.id)
         await interaction.edit_original_response(embed=build_dm_settings_embed(settings),
                                                  view=BanDmView(settings))
@@ -1147,7 +1160,8 @@ def build_panel_embed(guild, settings: dict) -> discord.Embed:
                     value="🟢 켜짐" if settings.get("warn_dm") else "⚫ 꺼짐", inline=True)
     days = ban_delete_days(settings)
     embed.add_field(name="🧹 밴 시 메시지 삭제",
-                    value=f"최근 {days}일" if days else "안 함", inline=True)
+                    value=("전부" if settings.get("ban_delete_all", True)
+                           else (f"최근 {days}일" if days else "안 함")), inline=True)
     rules = sorted(settings.get("auto_rules") or [], key=lambda r: int(r.get("count", 0)))
     # 칸이 1024자를 넘으면 패널 **전송 자체가 실패**해 /경고설정 이 안 열립니다
     for i, chunk in enumerate(_chunk_lines([describe_rule(r) for r in rules]) or ["없음"]):
@@ -1280,6 +1294,166 @@ def delete_line(days: int) -> str:
             else "🧹 메시지는 지우지 않았습니다")
 
 
+# ── 7일보다 오래된 메시지까지 지우기 ─────────────────────────────────────
+#
+# 밴 API 는 최근 7일만 지웁니다. 그보다 오래된 것은 **메시지 검색 API**
+# (GET /guilds/{id}/messages/search?author_id=…, 봇 사용 가능 — 실측 2026-10-01)
+# 로 찾아 하나씩 지웁니다. 채널 347개를 훑는 것보다 훨씬 빠릅니다.
+#
+# ⚠️ 지운 메시지는 되돌릴 수 없습니다. 그래서
+#   · 25개(한 장)마다 **아직 밴 상태인지** 봅니다 — 실수로 밴했다 풀면 멈춥니다.
+#   · 진행 위치를 DB 에 둡니다 — 재시작해도 이어서, 처음부터 다시 하지 않습니다.
+#   · 한 서버에 한 작업씩 — 여러 명을 한꺼번에 밴해도 레이트리밋이 몰리지 않게.
+
+PURGE_PAGE = 25
+PURGE_202_TRIES = 10            # 검색 색인 준비 중(202) 재시도
+PURGE_UNKNOWN_TRIES = 5         # 밴 상태 확인이 실패할 때 재시도
+PURGE_UNKNOWN_WAIT = 30
+_purge_tasks: dict = {}         # (길드, 유저) → Task
+_purge_sems: dict = {}
+
+
+async def search_user_messages(http, guild_id: int, user_id: int,
+                               before: int | None = None) -> tuple[list, int]:
+    """그 유저의 메시지를 최신순으로 25개. `before` 보다 오래된 것만."""
+    params = {"author_id": str(user_id), "limit": str(PURGE_PAGE), "sort_by": "timestamp",
+              "sort_order": "desc", "include_nsfw": "true"}
+    if before:
+        params["max_id"] = str(before)
+    route = discord.http.Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild_id)
+    for _ in range(PURGE_202_TRIES):
+        data = await http.request(route, params=params)
+        # 색인 준비 중이면 2xx(202) 로 이 모양이 옵니다 — 오류가 아니라 '잠시 뒤'
+        if isinstance(data, dict) and data.get("code") == 110000:
+            wait = float(data.get("retry_after") or 0) or 2.0
+            await asyncio.sleep(min(max(wait, 1.0), 60))
+            continue
+        rows = []
+        for m in (data or {}).get("messages") or []:
+            if isinstance(m, list):      # 예전 응답은 [메시지] 로 감싸 옵니다
+                m = m[0] if m else None
+            if isinstance(m, dict) and m.get("id") and m.get("channel_id"):
+                rows.append(m)
+        return rows, int((data or {}).get("total_results") or 0)
+    raise RuntimeError("메시지 검색 색인이 아직 준비되지 않았습니다")
+
+
+async def run_purge(guild, user_id: int, job: dict) -> dict:
+    """찾아서 지우기를 끝날 때까지. 결과 {deleted, gone, failed, stopped}."""
+    http = guild._state.http
+    stats = {"deleted": int(job.get("deleted") or 0), "gone": int(job.get("gone") or 0),
+             "failed": int(job.get("failed") or 0), "stopped": ""}
+    before = int(job["before"]) if job.get("before") else None
+    unknown = 0
+    while True:
+        state, _ = await fetch_ban_state(guild, user_id)
+        if state == "clear":
+            stats["stopped"] = "unbanned"        # 실수였다면 여기서 멈춥니다
+            return stats
+        if state != "banned":
+            unknown += 1
+            if unknown >= PURGE_UNKNOWN_TRIES:
+                raise RuntimeError("밴 상태를 확인할 수 없어 멈춤 (다음 재시작 때 이어서)")
+            await asyncio.sleep(PURGE_UNKNOWN_WAIT)
+            continue
+        unknown = 0
+        rows, _ = await search_user_messages(http, guild.id, user_id, before)
+        if not rows:
+            return stats
+        for m in rows:
+            try:
+                await http.delete_message(int(m["channel_id"]), int(m["id"]),
+                                          reason="밴한 유저의 오래된 메시지 정리")
+                stats["deleted"] += 1
+            except discord.NotFound:
+                stats["gone"] += 1               # 이미 지워짐(색인이 늦음)
+            except discord.HTTPException as e:
+                stats["failed"] += 1
+                if stats["failed"] <= 3:
+                    print(f"[Moderation] 메시지 삭제 실패(채널 {m['channel_id']}): "
+                          f"code={getattr(e, 'code', '?')}", flush=True)
+        # 가장 오래된 것보다 더 오래된 쪽으로 — 매 장마다 줄어들어 반드시 끝납니다
+        before = min(int(m["id"]) for m in rows)
+        job.update(before=str(before), deleted=stats["deleted"], gone=stats["gone"],
+                   failed=stats["failed"])
+        # 밴 해제가 기록을 지웠다면 되살리지 않습니다 (only_if_exists)
+        await set_purge_job(guild.id, user_id, job, only_if_exists=True)
+
+
+def purge_result_embed(user_id: int, stats: dict) -> discord.Embed:
+    if stats.get("stopped") == "unbanned":
+        return discord.Embed(
+            title="⏹️ 오래된 메시지 정리를 멈췄습니다",
+            description=(f"<@{user_id}> 님의 밴이 풀려 멈췄습니다. "
+                         f"그 전까지 **{stats['deleted']:,}건**을 지웠습니다."),
+            color=discord.Color.greyple())
+    embed = discord.Embed(
+        title="🧹 오래된 메시지 정리 완료",
+        description=f"<@{user_id}> 님이 보낸 메시지 **{stats['deleted']:,}건**을 지웠습니다.",
+        color=discord.Color.dark_grey())
+    extra = []
+    if stats.get("gone"):
+        extra.append(f"이미 없던 것 {stats['gone']:,}건")
+    if stats.get("failed"):
+        extra.append(f"⚠️ 못 지운 것 {stats['failed']:,}건 (보관된 스레드 · 권한 없는 채널 등)")
+    if extra:
+        embed.add_field(name="참고", value="\n".join(extra), inline=False)
+    return embed
+
+
+async def _purge_worker(guild, user_id: int, job: dict) -> None:
+    key = (guild.id, int(user_id))
+    try:
+        async with _purge_sems.setdefault(guild.id, asyncio.Semaphore(1)):
+            print(f"[Moderation] {user_id} 의 오래된 메시지 정리 시작", flush=True)
+            stats = await run_purge(guild, int(user_id), job)
+            await set_purge_job(guild.id, user_id, None)
+            print(f"[Moderation] {user_id} 정리 끝: 삭제 {stats['deleted']} · 없음 "
+                  f"{stats['gone']} · 실패 {stats['failed']} {stats['stopped']}", flush=True)
+            await send_log(guild, await get_mod_settings(guild.id),
+                           purge_result_embed(int(user_id), stats))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # 작업은 DB 에 남아 있어 다음 재시작 때 이어서 합니다
+        print(f"[Moderation] {user_id} 정리 중단(재시작 때 이어서): "
+              f"{type(e).__name__}: {e}", flush=True)
+    finally:
+        _purge_tasks.pop(key, None)
+
+
+async def start_purge(guild, user_id: int, by: int = 0, resume: dict | None = None) -> bool:
+    """오래된 메시지 정리를 백그라운드로 시작합니다. 이미 돌고 있으면 False."""
+    key = (guild.id, int(user_id))
+    task = _purge_tasks.get(key)
+    if task is not None and not task.done():
+        return False
+    job = dict(resume) if resume else {"started": datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
+                                       "by": int(by), "before": None,
+                                       "deleted": 0, "gone": 0, "failed": 0}
+    if not resume:
+        await set_purge_job(guild.id, user_id, job)     # 먼저 남깁니다 — 재시작 대비
+    _purge_tasks[key] = asyncio.create_task(_purge_worker(guild, int(user_id), job))
+    return True
+
+
+async def stop_purge(guild_id: int, user_id: int) -> None:
+    """밴 해제 때 — 도는 작업을 멈추고 기록을 지웁니다."""
+    task = _purge_tasks.pop((guild_id, int(user_id)), None)
+    if task is not None and not task.done():
+        task.cancel()
+    await set_purge_job(guild_id, user_id, None)
+
+
+def purge_line(settings: dict, started: bool) -> str:
+    if not started:
+        return ""
+    where = ("끝나면 로그 채널에 알립니다" if settings.get("log_channel_id")
+             else "로그 채널을 정하면 끝났을 때 알림을 받습니다")
+    return (f"🧹 7일보다 **오래된 메시지**도 찾아 지우는 중입니다 (백그라운드 · {where})\n"
+            "-# 밴을 풀면 멈춥니다")
+
+
 async def do_ban(guild, moderator, user, reason: str, delete_days: int | None = None) -> discord.Embed:
     problem = target_problem(guild, moderator, user)
     if not problem and not guild.me.guild_permissions.ban_members:
@@ -1298,12 +1472,17 @@ async def do_ban(guild, moderator, user, reason: str, delete_days: int | None = 
     if not res["ok"]:
         return _result_embed("⚠️ 밴 실패", discord.Color.orange(),
                              [res["error"], "-# 보낸 DM 이 있었다면 회수했습니다."])
+    # /밴 에 기간을 직접 적었으면 그 선택을 따릅니다(오래된 것까지는 안 지움)
+    started = False
+    if delete_days is None and settings.get("ban_delete_all", True):
+        started = await start_purge(guild, user.id, getattr(moderator, "id", 0))
     return _result_embed(
         f"🔨 밴 | 케이스 #{res['case']['case']}", discord.Color.red(),
         [f"<@{user.id}> (`{user}`) 님을 밴했습니다.",
          f"📝 {_truncate(reason, 300)}",
          DM_STATUS.get(res["dm"], res["dm"]),
          delete_line(days),
+         purge_line(settings, started),
          "-# 서포트 링크가 없습니다 — `/경고설정` → 밴 DM 설정에서 넣을 수 있습니다"
          if res["dm"] == "sent" and not settings.get("support_link") else ""])
 
@@ -1428,6 +1607,18 @@ PREFIX_USAGE = {
 class Moderation(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """재시작 전에 하던 '오래된 메시지 정리' 를 이어서 합니다.
+        메모리에만 두면 재시작 한 번에 조용히 멈춥니다(on_ready 가 또 불려도
+        start_purge 가 이미 도는 것은 건너뜁니다)."""
+        for guild in self.bot.guilds:
+            try:
+                for uid, job in (await get_purge_jobs(guild.id)).items():
+                    await start_purge(guild, int(uid), resume=job)
+            except Exception as e:
+                print(f"[Moderation] 정리 작업 이어하기 실패: {type(e).__name__}: {e}", flush=True)
 
     @app_commands.command(name="경고", description="유저에게 경고를 줍니다 (누적되면 자동 처벌).")
     @app_commands.describe(유저="경고할 유저", 사유="경고 사유 (DM 과 기록에 남습니다)")

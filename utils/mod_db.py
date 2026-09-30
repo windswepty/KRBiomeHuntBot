@@ -124,6 +124,9 @@ DEFAULT_MOD_SETTINGS = {
     # — 그보다 오래된 것은 밴 API 로 지울 수 없습니다(Dyno 도 같음).
     # /밴 의 `메시지삭제` 를 적으면 그 값이 우선합니다.
     "ban_delete_days": 7,
+    # 7일보다 **오래된** 메시지까지 지울지. 밴 API 로는 안 되므로 메시지 검색
+    # API 로 찾아 하나씩 지웁니다(백그라운드 · 재시작해도 이어서 · 밴을 풀면 멈춤).
+    "ban_delete_all": True,
     # 경고 누적 자동 처벌 [{"count": 3, "action": "timeout", "minutes": 60}, ...]
     "auto_rules": [],
 }
@@ -527,3 +530,57 @@ async def _lock_update(guild_id: int, set_: dict | None = None,
             cur.pop(parts[-1], None)
         all_rows[key] = row
         _write_json(LOCK_FILE, all_rows)
+
+
+# ── 오래된 메시지 지우기 작업 (밴 뒤 백그라운드) ────────────────────────
+#
+# mod_settings 문서의 `purge_jobs.<유저>` 에 둡니다. 작업은 몇 분~몇 시간 걸릴 수
+# 있어서, **재시작하면 이어서 하도록** DB 에 남깁니다(메모리에만 두면 재시작 한
+# 번에 조용히 멈춥니다). 설정 키가 아니라 save_mod_settings 로는 건드리지 않습니다.
+
+async def get_purge_jobs(guild_id: int) -> dict:
+    key = str(guild_id)
+    doc = None
+    if mod_settings_col is not None:
+        try:
+            doc = await _db(mod_settings_col.find_one, {"_id": key}, {"purge_jobs": 1})
+        except Exception as e:
+            print(f"MongoDB get_purge_jobs error: {e}, using local file.", flush=True)
+            async with _settings_lock:
+                doc = _read_json(MOD_SETTINGS_FILE).get(key)
+    else:
+        async with _settings_lock:
+            doc = _read_json(MOD_SETTINGS_FILE).get(key)
+    return dict((doc or {}).get("purge_jobs") or {})
+
+
+async def set_purge_job(guild_id: int, user_id: int, value, only_if_exists: bool = False) -> None:
+    """작업 하나를 쓰거나(value) 지웁니다(None). 다른 작업은 건드리지 않습니다.
+
+    ⚠️ 진행 위치를 쓸 때는 `only_if_exists=True` — **아직 작업이 있을 때만** 씁니다.
+    밴 해제가 기록을 지운 직후에 진행 쓰기가 도착하면, 지운 작업이 되살아나
+    재시작 때 다시 돕니다(검증이 잡았습니다). 판정은 DB 가 원자적으로 합니다.
+    """
+    key, path = str(guild_id), f"purge_jobs.{int(user_id)}"
+    if mod_settings_col is not None:
+        try:
+            if value is None:
+                await _db(mod_settings_col.update_one, {"_id": key}, {"$unset": {path: ""}})
+            elif only_if_exists:
+                await _db(mod_settings_col.update_one,
+                          {"_id": key, path: {"$exists": True}}, {"$set": {path: value}})
+            else:
+                await _db(mod_settings_col.update_one, {"_id": key},
+                          {"$set": {path: value}}, upsert=True)
+            return
+        except Exception as e:
+            print(f"MongoDB set_purge_job error: {e}, using local file.", flush=True)
+    async with _settings_lock:
+        all_rows = _read_json(MOD_SETTINGS_FILE)
+        jobs = all_rows.setdefault(key, {}).setdefault("purge_jobs", {})
+        uid = str(int(user_id))
+        if value is None:
+            jobs.pop(uid, None)
+        elif not only_if_exists or uid in jobs:
+            jobs[uid] = value
+        _write_json(MOD_SETTINGS_FILE, all_rows)

@@ -27,6 +27,12 @@ _blacklist_lock = asyncio.Lock()
 _boost_lock = asyncio.Lock()
 KST = timezone(timedelta(hours=9))
 
+# 호박 깨기 보상(포인트 N배) · 시즌 포인트. **벌어서 받는** 세 경로(출석 · 채팅 ·
+# 퀘스트)에만 겁니다 — 관리자 지급 · 환불 · 뽑기 경품은 그대로입니다(환불이
+# 2배가 되거나 뽑기로 포인트를 불리면 경제가 깨집니다). event_db 는 이 모듈을
+# 부르지 않습니다(순환 import 방지).
+from utils.event_db import point_multiplier, apply_multiplier, credit_earned
+
 # 퀘스트 진행도는 유저×날짜라 계속 늘어납니다. **양쪽 경로 모두에** 상한을
 # 겁니다 (Mongo 는 TTL 인덱스, JSON 은 _trim_quest_progress_local).
 # ⚠️ 이 상수는 아래 인덱스 생성보다 **먼저** 정의돼야 합니다. 뒤에 두면
@@ -361,12 +367,22 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
     str_key = _get_user_key(guild_id, user_id)
     today, yesterday = get_today_str(), get_yesterday_str()
     settings = await get_checkin_settings(guild_id)
-    base = int(settings.get("base", 100))
+    # 호박 보상 배율 — 기본 · 연속 보너스 · 마일스톤 전부에 곱합니다
+    mult = await point_multiplier(guild_id)
+    base = apply_multiplier(int(settings.get("base", 100)), mult)
 
     def _result(ok, points, streak):
         b, bo, ms = streak_reward(streak, settings) if ok else (0, 0, 0)
+        b, bo, ms = (apply_multiplier(x, mult) for x in (b, bo, ms))
         return {"ok": ok, "points": points, "streak": streak,
-                "base": b, "bonus": bo, "milestone": ms, "gained": b + bo + ms}
+                "base": b, "bonus": bo, "milestone": ms, "gained": b + bo + ms,
+                "mult": mult}
+
+    async def _done(ok, points, streak):
+        res = _result(ok, points, streak)
+        if ok:
+            res["season"] = await credit_earned(guild_id, user_id, res["gained"])
+        return res
 
     if users_col is not None:
         try:
@@ -401,14 +417,14 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
 
             streak = int(doc.get("streak", 1) or 1)
             _, bonus, milestone = streak_reward(streak, settings)
-            extra = bonus + milestone
+            extra = apply_multiplier(bonus, mult) + apply_multiplier(milestone, mult)
             if extra > 0:
                 bumped = await _db(users_col.find_one_and_update,
                                    {"_id": str_key}, {"$inc": {"points": extra}},
                                    return_document=_AFTER)
                 if bumped is not None:
                     doc = bumped
-            return _result(True, doc.get("points", 0), streak)
+            return await _done(True, doc.get("points", 0), streak)
         except Exception as e:
             print(f"MongoDB checkin error: {e}, using local file.", flush=True)
 
@@ -424,15 +440,18 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
     _, bonus, milestone = streak_reward(streak, settings)
     user_info["last_checkin"] = today
     user_info["streak"] = streak
-    user_info["points"] = user_info.get("points", 0) + base + bonus + milestone
+    user_info["points"] = (user_info.get("points", 0) + base + apply_multiplier(bonus, mult)
+                           + apply_multiplier(milestone, mult))
     await save_data(data)
-    return _result(True, user_info["points"], streak)
+    return await _done(True, user_info["points"], streak)
 
 async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0) -> tuple[int, bool, int, float]:
     """Returns (new_points, awarded, earned_points, boost_mult)"""
     str_key = _get_user_key(guild_id, user_id)
     boost_mult = await get_channel_boost(guild_id, channel_id) if channel_id > 0 else 1.0
-    earned_points = max(1, int(round(10 * boost_mult)))
+    # 채널 부스트 × 호박 보상 배율 (둘 다 캐시라 채팅마다 DB 를 읽지 않습니다)
+    event_mult = await point_multiplier(guild_id)
+    earned_points = max(1, int(round(10 * boost_mult * event_mult)))
 
     if users_col is not None:
         try:
@@ -459,6 +478,7 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
                                    {"$inc": {"points": earned_points}},
                                    return_document=_AFTER)
                 new_points = (bumped or {}).get("points", new_points + earned_points)
+                await credit_earned(guild_id, user_id, earned_points)
             return new_points, awarded, earned_points, boost_mult
         except Exception as e:
             print(f"MongoDB chat process error: {e}, using local file.", flush=True)
@@ -474,6 +494,8 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
         awarded = True
 
     await save_data(data)
+    if awarded:
+        await credit_earned(guild_id, user_id, earned_points)
     return user_info["points"], awarded, earned_points, boost_mult
 
 async def get_user_points(guild_id: int, user_id: int) -> int:
@@ -2537,12 +2559,23 @@ async def get_quest_progress(guild_id: int, user_id: int,
 
 async def claim_quest(guild_id: int, user_id: int, quest_id: str,
                       reward: int, weekly: bool = False,
-                      period: str | None = None) -> bool:
+                      period: str | None = None, out: dict | None = None) -> bool:
     """보상을 지급합니다. 이미 받았으면 False (포인트는 나가지 않습니다).
 
     '아직 안 받음'을 **필터 조건**에 넣어 서버 측에서 판정합니다.
     버튼을 연타해도 두 번 지급되지 않습니다.
+
+    호박 보상 배율이 걸려 있으면 곱해서 주고, 같은 양을 시즌 포인트로도 줍니다.
+    실제로 준 양은 `out` 에 담습니다(화면에 설정값 그대로 쓰면 2배가 안 보입니다).
     """
+    async def _pay():
+        mult = await point_multiplier(guild_id)
+        paid = apply_multiplier(int(reward), mult)
+        if paid > 0:
+            await add_user_points(guild_id, user_id, paid)
+        season = await credit_earned(guild_id, user_id, paid)
+        if out is not None:
+            out.update(paid=paid, mult=mult, season=season)
     key = _quest_key(guild_id, user_id,
                      period or (quest_week() if weekly else quest_day()))
     if quest_prog_col is not None:
@@ -2567,8 +2600,7 @@ async def claim_quest(guild_id: int, user_id: int, quest_id: str,
             # 여기까지 온 것은 진짜 이상입니다. 포인트 보호를 우선해 막습니다.
             print(f"MongoDB claim_quest error: {e}", flush=True)
             return False
-        if reward > 0:
-            await add_user_points(guild_id, user_id, reward)
+        await _pay()
         return True
 
     async with _quest_lock:
@@ -2584,8 +2616,7 @@ async def claim_quest(guild_id: int, user_id: int, quest_id: str,
         row.setdefault("claimed", []).append(quest_id)
         with open(QUEST_PROG_FILE, "w", encoding="utf-8") as f:
             json.dump(allp, f, ensure_ascii=False)
-    if reward > 0:
-        await add_user_points(guild_id, user_id, reward)
+    await _pay()
     return True
 
 

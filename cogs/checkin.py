@@ -472,9 +472,14 @@ class CheckIn(commands.Cog):
             if result["milestone"]:
                 parts.append(f"🎉 특별 보상 **+{result['milestone']:,} P**")
 
+            desc = f"오늘 출석으로 **+{result['gained']:,} P** 를 획득하셨습니다!"
+            if result.get("mult", 1.0) > 1:
+                desc += f"\n🎃 호박 보상으로 **{result['mult']:g}배** 적용"
+            if result.get("season"):
+                desc += f"\n🏆 시즌 포인트 **+{result['season']:,}**"
             embed = discord.Embed(
                 title="✅ 출석체크 완료!",
-                description=f"오늘 출석으로 **+{result['gained']:,} P** 를 획득하셨습니다!",
+                description=desc,
                 color=discord.Color.green()
             )
             embed.add_field(name="🔥 연속 출석", value=f"**{streak}일째**", inline=True)

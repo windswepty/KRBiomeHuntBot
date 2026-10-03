@@ -114,15 +114,20 @@ class QuestView(discord.ui.View):
                         button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         total, names, roles_given, role_failed = 0, [], [], []
+        season_total, mult = 0, 1.0
         for c in self.claimable:
             # claim_quest 가 '아직 안 받음'을 서버 측에서 판정합니다.
             # 연타해도 두 번 지급되지 않습니다.
+            paid = {}
             if not await claim_quest(interaction.guild.id, interaction.user.id,
                                      c["id"], int(c.get("points", 0) or 0),
                                      weekly=bool(c.get("weekly")),
-                                     period=c.get("period")):
+                                     period=c.get("period"), out=paid):
                 continue
-            total += int(c.get("points", 0) or 0)
+            # 설정값이 아니라 **실제로 준 양** (호박 보상 배율 반영)
+            total += int(paid.get("paid", c.get("points", 0)) or 0)
+            season_total += int(paid.get("season", 0) or 0)
+            mult = max(mult, float(paid.get("mult", 1.0) or 1.0))
             names.append(c["name"])
 
             # 역할 보상. 포인트 지급은 이미 끝났으므로, 역할이 실패해도
@@ -151,6 +156,10 @@ class QuestView(discord.ui.View):
 
         total_points = await get_user_points(interaction.guild.id, interaction.user.id)
         desc = f"**+{total:,} P** 를 획득하셨습니다!" if total else "보상을 받았습니다!"
+        if mult > 1:
+            desc += f"\n🎃 호박 보상으로 **{mult:g}배** 적용"
+        if season_total:
+            desc += f"\n🏆 시즌 포인트 **+{season_total:,}**"
         embed = discord.Embed(title="🎁 퀘스트 보상 수령", description=desc,
                               color=discord.Color.green())
         embed.add_field(name="완료한 퀘스트",

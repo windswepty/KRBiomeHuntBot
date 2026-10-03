@@ -7,6 +7,9 @@ from utils.database import (
     get_user_points, deduct_user_points, add_user_points, add_activity_log,
     consume_shop_stock
 )
+from utils.event_db import (
+    get_season, season_state, spend_season_points, add_season_points, get_season_points,
+)
 
 
 def parse_role_mentions(text: str) -> str:
@@ -25,6 +28,140 @@ def format_stock_str(stock: int) -> str:
     else:
         return f"{stock:,}개 남음"
 
+
+
+# 낼 포인트. 시즌 포인트는 시즌 기간에만(utils/event_db.py).
+POINTS, SEASON = "points", "season"
+
+
+async def buy_item(interaction: discord.Interaction, settings: dict, item: dict,
+                   currency: str, respond) -> None:
+    """상품 하나 구매. 기본 포인트도 시즌 포인트도 **이 함수 하나**로 삽니다.
+
+    두 갈래로 두면 한쪽에만 검사가 들어가 다른 쪽으로 우회됩니다(뽑기에서 겪음).
+    `respond(embed)` 로 결과를 보냅니다 — 선택 메뉴는 새 메시지, 포인트 고르기
+    버튼은 그 창을 결과로 바꿉니다(다시 눌러 두 번 사지 않게).
+    """
+    guild_id = interaction.guild.id
+    uid = interaction.user.id
+    stock = item.get("stock", -1)
+    item_name = item["name"]
+    price = item["price"]
+    reward_role_id = item.get("reward_role_id", 0)
+    season = currency == SEASON
+    unit = "시즌 포인트" if season else "P"
+
+    # 포인트 차감 시도 — 잔액 검사를 **필터 조건**에 넣은 원자 차감입니다
+    if season:
+        success, remaining = await spend_season_points(guild_id, uid, price)
+        if not success and season_state(await get_season(guild_id, fresh=True)) != "active":
+            await respond(discord.Embed(title="⚠️ 시즌 기간이 아닙니다",
+                                        description="지금은 시즌 포인트를 쓸 수 없습니다.",
+                                        color=discord.Color.red()))
+            return
+    else:
+        success, remaining = await deduct_user_points(guild_id, uid, price)
+    if not success:
+        mark = "🏆" if season else "💰"
+        await respond(discord.Embed(
+            title="⚠️ 포인트 부족",
+            description=f"**{item_name}** 상품을 구매하기 위해 **{price:,} {unit}**가 필요합니다.\n\n"
+                        f"{mark} **현재 보유**: **{remaining:,} {unit}**",
+            color=discord.Color.red()))
+        return
+
+    # 재고 차감 — 목록 전체를 덮어쓰지 않고 **원자적으로** 1 차감합니다.
+    # 그렇게 하지 않으면 마지막 1개를 두 명이 동시에 사서 2개가 팔리고,
+    # 다른 상품의 재고 변경까지 덮어써 사라집니다.
+    if stock > 0:
+        got = await consume_shop_stock(guild_id, item.get("id"))
+        if not got:
+            # 차감과 재고 확보 사이에 다른 유저가 마지막 개를 가져갔습니다.
+            # 유저 잘못이 아니므로 **낸 포인트로** 그대로 돌려줍니다.
+            if season:
+                await add_season_points(guild_id, uid, price, only_active=False)
+            else:
+                await add_user_points(guild_id, uid, price)
+            await respond(discord.Embed(
+                title="⚠️ 방금 품절되었습니다",
+                description=f"**{item_name}** 상품의 마지막 재고가 방금 다른 유저에게 판매되었습니다.\n\n"
+                            f"차감된 **{price:,} {unit}**는 **전액 환불**되었습니다.",
+                color=discord.Color.orange()))
+            return
+
+    new_stock = stock - 1 if stock > 0 else -1
+    stock_text = format_stock_str(new_stock)
+
+    # 역할 자동 지급 시도
+    role_notice = ""
+    if reward_role_id and reward_role_id > 0:
+        role = interaction.guild.get_role(reward_role_id)
+        if role:
+            try:
+                await interaction.user.add_roles(role)
+                role_notice = f"\n🎭 **{role.mention}** 역할이 계정에 즉시 지급되었습니다!"
+            except Exception as e:
+                role_notice = f"\n⚠️ 역할 자동 부여 실패 (봇 권한/역할 순서 확인 필요: {e})"
+        else:
+            role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
+
+    tag = "시즌" if season else "P"
+    await add_activity_log(guild_id, "shop", uid, interaction.user.display_name,
+                           f"[{item_name}] 상점 상품 구매 (-{price:,}{tag})")
+
+    label = "시즌 포인트" if season else "포인트"
+    mark = "🏆" if season else "💰"
+    embed = discord.Embed(
+        title="🎉 상품 구매 완료!",
+        description=f"**{item_name}** 상품을 성공적으로 구매하셨습니다!{role_notice}\n\n"
+                    f"💳 **소모 {label}**: -{price:,} {unit}\n"
+                    f"{mark} **잔여 {label}**: **{remaining:,} {unit}**\n"
+                    f"📦 **남은 재고**: `{stock_text}`",
+        color=discord.Color.green())
+    if item.get("description"):
+        embed.add_field(name="📝 상품 설명", value=parse_role_mentions(item["description"]),
+                        inline=False)
+    embed.set_footer(text=f"{settings.get('title', '한바헌 포인트 상점')} 시스템")
+    await respond(embed)
+
+
+class CurrencyChoiceView(discord.ui.View):
+    """시즌 기간에 '기본 포인트로 / 시즌 포인트로' 를 고릅니다.
+
+    누르는 순간 상품을 **다시 읽습니다** — 고른 뒤 2분 사이 가격 · 재고가 바뀌었을
+    수 있습니다. 한 번 누르면 이 창은 결과로 바뀌고, 그 사이 또 눌러도 한 번만 삽니다.
+    """
+
+    def __init__(self, item_id):
+        super().__init__(timeout=120)
+        self.item_id = str(item_id)
+        self.used = False
+
+    async def _buy(self, interaction: discord.Interaction, currency: str):
+        if self.used:
+            await interaction.response.send_message("ℹ️ 이미 처리한 구매입니다.", ephemeral=True)
+            return
+        self.used = True
+        settings = await get_shop_settings(interaction.guild.id)
+        item = next((i for i in settings.get("items", []) if str(i.get("id")) == self.item_id), None)
+        if item is None or item.get("stock", -1) == 0:
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ 살 수 없는 상품입니다",
+                                    description="방금 품절됐거나 상점에서 빠졌습니다.",
+                                    color=discord.Color.red()), view=None)
+            return
+
+        async def respond(e):
+            await interaction.response.edit_message(embed=e, view=None)
+        await buy_item(interaction, settings, item, currency, respond)
+
+    @discord.ui.button(label="기본 포인트로", emoji="💰", style=discord.ButtonStyle.primary)
+    async def with_points(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._buy(interaction, POINTS)
+
+    @discord.ui.button(label="시즌 포인트로", emoji="🏆", style=discord.ButtonStyle.success)
+    async def with_season(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._buy(interaction, SEASON)
 
 # ── Shop Purchase View ────────────────────────────────────────────────
 
@@ -80,71 +217,21 @@ class ShopSelect(discord.ui.Select):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # 포인트 차감 시도
-        success, remaining = await deduct_user_points(guild_id, interaction.user.id, price)
-        if not success:
+        # 시즌 기간이면 어떤 포인트로 낼지 고르게 합니다
+        if season_state(await get_season(guild_id)) == "active":
+            sp = await get_season_points(guild_id, interaction.user.id)
             embed = discord.Embed(
-                title="⚠️ 포인트 부족",
-                description=f"**{item_name}** 상품을 구매하기 위해 **{price:,} P**가 필요합니다.\n\n"
-                            f"💰 **현재 보유 포인트**: **{remaining:,} P**",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+                title=f"🛒 {item_name}",
+                description=(f"어떤 포인트로 살까요? (가격 **{price:,}**)\n"
+                             f"🏆 내 시즌 포인트 **{sp:,}**"),
+                color=discord.Color.blurple())
+            await interaction.response.send_message(
+                embed=embed, view=CurrencyChoiceView(selected_item["id"]), ephemeral=True)
             return
 
-        # 재고 차감 — 목록 전체를 덮어쓰지 않고 **원자적으로** 1 차감합니다.
-        # 그렇게 하지 않으면 마지막 1개를 두 명이 동시에 사서 2개가 팔리고,
-        # 다른 상품의 재고 변경까지 덮어써 사라집니다.
-        if stock > 0:
-            got = await consume_shop_stock(guild_id, selected_item.get("id"))
-            if not got:
-                # 포인트 차감과 재고 확보 사이에 다른 유저가 마지막 개를 가져갔습니다.
-                # 유저 잘못이 아니므로 포인트를 그대로 돌려줍니다.
-                await add_user_points(guild_id, interaction.user.id, price)
-                embed = discord.Embed(
-                    title="⚠️ 방금 품절되었습니다",
-                    description=f"**{item_name}** 상품의 마지막 재고가 방금 다른 유저에게 판매되었습니다.\n\n"
-                                f"💰 차감된 **{price:,} P**는 **전액 환불**되었습니다.",
-                    color=discord.Color.orange()
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
-
-        new_stock = stock - 1 if stock > 0 else -1
-        stock_text = format_stock_str(new_stock)
-
-        # 역할 자동 지급 시도
-        role_notice = ""
-        if reward_role_id and reward_role_id > 0:
-            role = interaction.guild.get_role(reward_role_id)
-            if role:
-                try:
-                    await interaction.user.add_roles(role)
-                    role_notice = f"\n🎭 **{role.mention}** 역할이 계정에 즉시 지급되었습니다!"
-                except Exception as e:
-                    role_notice = f"\n⚠️ 역할 자동 부여 실패 (봇 권한/역할 순서 확인 필요: {e})"
-            else:
-                role_notice = f"\n⚠️ 지정된 역할(ID: `{reward_role_id}`)을 서버에서 찾을 수 없습니다."
-
-        # 로그 기록
-        await add_activity_log(guild_id, "shop", interaction.user.id, interaction.user.display_name, f"[{item_name}] 상점 상품 구매 (-{price:,}P)")
-
-        # 구매 성공
-        embed = discord.Embed(
-            title="🎉 상품 구매 완료!",
-            description=f"**{item_name}** 상품을 성공적으로 구매하셨습니다!{role_notice}\n\n"
-                        f"💳 **소모 포인트**: -{price:,} P\n"
-                        f"💰 **잔여 포인트**: **{remaining:,} P**\n"
-                        f"📦 **남은 재고**: `{stock_text}`",
-            color=discord.Color.green()
-        )
-        if selected_item.get("description"):
-            embed.add_field(name="📝 상품 설명", value=parse_role_mentions(selected_item["description"]), inline=False)
-        shop_title = settings.get("title", "한바헌 포인트 상점")
-        embed.set_footer(text=f"{shop_title} 시스템")
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
+        async def respond(e):
+            await interaction.response.send_message(embed=e, ephemeral=True)
+        await buy_item(interaction, settings, selected_item, POINTS, respond)
 
 class ShopView(discord.ui.View):
     def __init__(self, items: list[dict]):

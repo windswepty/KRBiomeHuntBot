@@ -117,9 +117,9 @@ asyncio.run(m())"
 
 | | 포인트 이코노미 | 인증 / 링크 보호 |
 | :--- | :--- | :--- |
-| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` | `verify` `link_guard` `roblox_link` |
+| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` `pumpkin` `season` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
-| 보조 모듈 | `utils/health.py`(공용) | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
+| 보조 모듈 | `utils/health.py`(공용) `utils/event_db.py` | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
 | Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` `biome_events` `oauth_events` |
 
 `verify.py` / `link_guard.py` / `roblox_link.py` / `verify_db.py`는 **`utils/database.py`를 절대 import 하지 않습니다.** 포인트를 지급·차감하지 않고 `/로그` 활동 기록에도 남기지 않습니다. 두 시스템이 공유하는 것은 **인증 역할 ID 하나뿐**입니다.

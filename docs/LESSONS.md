@@ -658,3 +658,18 @@ note(G.read_state(st[:-1] + "Z") is None, "변조 거부")   # X
 - 섹션의 오른쪽 버튼은 `children` 이 아니라 **`accessory`** 에 있습니다.
 - 스크린샷만 보고 "임베드" 라고 단정하지 마세요. 구분선 · 글 안의 `<t:…>`
   칩 · 오른쪽 큰 썸네일이 보이면 V2 입니다. (`tests/layout_v2.py`)
+
+## iOS 에서 개인서버 버튼이 앱스토어로 갔습니다 (유니버설 링크 · iPad UA)
+
+2026-10-04 제보. iOS 는 https 주소를 앱으로 넘기는 유니버설 링크를 **사람이
+직접 누른 경우에만** 씁니다. 중계 주소가 302 나 meta refresh 로 roblox.com 에
+넘기면 웹으로 열리고, 로블록스 웹은 iOS 에서 **앱스토어로 보냅니다.** 디스코드
+인앱 브라우저에서 특히 그렇습니다. 예전 테스트(`linkflow` 12번)가 iPhone 에
+"meta refresh 가 있어야 한다" 를 **정답으로 박아 두고 있었습니다.**
+
+- iOS 는 로블록스 공식 딥링크 `roblox://` 로 앱을 직접 엽니다
+  (`keep_alive.roblox_app_link`, 출처는 Roblox 문서 Deep links).
+- **iPad 는 User-Agent 에 'iPad' 가 없습니다** — iPadOS 13 부터 맥 Safari 로
+  자칭합니다. 'mobile' 판별을 통과해 302 를 받았고, 제보 화면이 바로 iPad
+  였습니다. 서버에서는 맥과 구별이 안 되므로 페이지가 `maxTouchPoints` 로 가릅니다.
+- 안드로이드는 바꾸지 않았습니다(문제 제보 없음). 바꿀 거면 실기기로 먼저.

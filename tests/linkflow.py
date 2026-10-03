@@ -232,16 +232,20 @@ async def main():
     note(r.status_code == 200, "모바일 UA → 200 브릿지 페이지", str(r.status_code))
     body = r.data.decode()
     note("#hbh-" not in body, "브릿지 페이지에서 워터마크 프래그먼트 제거됨")
-    note("privateServerLinkCode=abcdef123456" in body,
+    note("linkCode=abcdef123456" in body,
          "로블록스 링크 코드는 유지됨")
-    note("로블록스에서 열기" in body, "터치 버튼 존재")
-    note('meta http-equiv="refresh"' in body, "meta refresh 자동 이동 존재")
+    # iOS 는 https 로 자동 이동하면 앱스토어로 갑니다 — 딥링크 페이지 (tests/ios_bridge.py)
+    note("roblox://" in body and 'meta http-equiv="refresh"' not in body,
+         "iOS: 앱 딥링크 · https 자동 이동 없음")
 
     t_m2 = LT.issue(WATERMARKED, 61, GUILD.id)
     r = c.get(f"/j/{t_m2}", follow_redirects=False,
               headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8)"})
     note(r.status_code == 200, "Android UA → 200 브릿지 페이지", str(r.status_code))
-    note("#hbh-" not in r.data.decode(), "Android 에서도 프래그먼트 제거됨")
+    body = r.data.decode()
+    note("#hbh-" not in body, "Android 에서도 프래그먼트 제거됨")
+    note("로블록스에서 열기" in body, "Android: 터치 버튼 존재")
+    note('meta http-equiv="refresh"' in body, "Android: meta refresh 자동 이동 존재")
 
     print("\n  PC 에서는 302 리다이렉트, 프래그먼트 제거")
     t_p = LT.issue(WATERMARKED, 61, GUILD.id)

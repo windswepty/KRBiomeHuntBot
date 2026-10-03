@@ -1,6 +1,9 @@
 import os
+import re
+import json
 import html as _html
 import logging
+from urllib.parse import urlsplit, parse_qs
 from threading import Thread
 
 from flask import Flask, redirect, request, Response, make_response
@@ -243,6 +246,122 @@ def _mobile_bridge(roblox_url: str) -> Response:
     return Response(page, status=200, mimetype="text/html; charset=utf-8")
 
 
+# ── iOS · iPadOS: 로블록스 앱을 직접 엽니다 ──────────────────────────
+# 2026-10-04 제보: iOS 에서 버튼을 누르면 **앱스토어로 갑니다.** 경쟁(정원
+# 20명에 수십 명)에서 몇 초가 곧 자리라 치명적입니다.
+#
+# iOS 는 https 주소를 앱으로 넘기는 '유니버설 링크' 를 **사람이 직접 누른
+# 경우에만** 씁니다. 302 · meta refresh 로 넘어간 roblox.com 은 앱이 아니라
+# 웹으로 열리고, 로블록스 웹은 iOS 에서 앱스토어로 보냅니다. 디스코드 인앱
+# 브라우저(SFSafariViewController)에서는 특히 그렇습니다.
+#
+# 그래서 iOS 에서는 로블록스 공식 딥링크(`roblox://`)를 씁니다 — 사용자 지정
+# 스킴은 리다이렉트로도 앱이 열립니다("Roblox에서 열겠습니까?" 확인 한 번).
+#   공유 링크   roblox.com/share?code=X&type=Server → roblox://navigation/share_links?code=X&type=Server
+#   옛 개인서버 roblox.com/games/<place>/…?privateServerLinkCode=X → roblox://placeId=<place>&linkCode=X
+# (https://create.roblox.com/docs/production/promotion/deeplinks)
+#
+# ⚠️ **iPad 는 User-Agent 에 'iPad' 가 없습니다.** iPadOS 13 부터 맥 Safari 로
+# 자칭해서, 모바일 판별을 통과해 302 를 받고 그대로 앱스토어로 갔습니다
+# (제보 화면이 iPad 였습니다). 서버에서는 맥과 구별할 수 없어, 맥 Safari 로
+# 보이면 페이지에서 터치 화면인지 보고 갈라 보냅니다.
+_IOS_KW = ("iphone", "ipad", "ipod")
+_RBX_CODE_RE = re.compile(r'^[A-Za-z0-9_\-]{1,200}$')
+_RBX_HOST_RE = re.compile(r'^(?:www\.)?roblox\.com$', re.IGNORECASE)
+
+
+def _is_ios(ua: str) -> bool:
+    low = (ua or "").lower()
+    return any(kw in low for kw in _IOS_KW)
+
+
+def _maybe_ipad(ua: str) -> bool:
+    """맥 Safari 처럼 보이는 UA — iPadOS 일 수 있습니다(페이지에서 터치로 판별)."""
+    low = (ua or "").lower()
+    return ("macintosh" in low and "safari" in low
+            and not any(k in low for k in ("chrome", "crios", "firefox", "edg")))
+
+
+def roblox_app_link(url: str) -> str | None:
+    """로블록스 개인서버 주소 → 앱을 바로 여는 `roblox://` 딥링크. 모르는 형식이면 None.
+
+    코드는 영숫자 · `_` · `-` 만 받습니다 — 이 값이 페이지 HTML · JS 에 들어갑니다.
+    """
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not _RBX_HOST_RE.match(parts.hostname or ""):
+        return None
+    query = parse_qs(parts.query)
+    path = parts.path.rstrip("/").lower()
+
+    if path == "/share":
+        code = (query.get("code") or [""])[0]
+        kind = (query.get("type") or ["Server"])[0]
+        if _RBX_CODE_RE.match(code) and kind.isalnum():
+            return f"roblox://navigation/share_links?code={code}&type={kind}"
+        return None
+
+    m = re.match(r'^/games/(\d+)', path)
+    code = (query.get("privateServerLinkCode") or [""])[0]
+    if m and _RBX_CODE_RE.match(code):
+        return f"roblox://placeId={m.group(1)}&linkCode={code}"
+    return None
+
+
+def _js_str(value: str) -> str:
+    """JS 문자열 리터럴로 안전하게 — `</script>` 로 태그를 닫지 못하게 합니다."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
+def _ios_bridge(app_url: str, web_url: str, *, check_touch: bool = False) -> Response:
+    """iOS 에서 로블록스 **앱**을 바로 여는 페이지.
+
+    열자마자 `roblox://` 로 넘기고, 막히면 큰 버튼을 누르면 됩니다(사람이 누른
+    사용자 지정 스킴은 인앱 브라우저에서도 열립니다). https 로 자동으로 넘기는
+    meta refresh 는 **두지 않습니다** — 그게 앱스토어로 보내던 원인입니다.
+
+    `check_touch` 는 맥 Safari 로 자칭하는 iPad 용입니다. 터치 화면이 아니면
+    진짜 맥이므로 예전처럼 웹 주소로 바로 보냅니다.
+    """
+    app_s = _html.escape(app_url, quote=True)
+    web_s = _html.escape(web_url, quote=True)
+    script = (f"var app={_js_str(app_url)},web={_js_str(web_url)};"
+              + ("if(!(navigator.maxTouchPoints>1)){location.replace(web);}else{location.href=app;}"
+                 if check_touch else "location.href=app;"))
+    page = f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>개인서버 입장</title>
+<style>
+  body{{margin:0;min-height:100vh;display:flex;align-items:center;
+  justify-content:center;background:#0f1115;color:#e6e6e6;
+  font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}}
+  .card{{max-width:420px;padding:40px 32px;text-align:center;
+  background:#171a21;border:1px solid #262b36;border-radius:16px}}
+  h1{{font-size:20px;margin:0 0 12px}}
+  p{{font-size:14px;line-height:1.7;color:#9aa3b2;margin:0 0 20px}}
+  .icon{{font-size:48px;margin-bottom:16px}}
+  .btn{{display:inline-block;padding:16px 36px;background:#00b06f;color:#fff;
+  text-decoration:none;border-radius:12px;font-size:17px;font-weight:700}}
+  .btn:active{{background:#009960}}
+  .sub{{font-size:12px;color:#6b7280;margin:18px 0 0}}
+  .sub a{{color:#8b93a3}}
+</style></head>
+<body><div class="card">
+  <div class="icon">🎮</div>
+  <h1>로블록스 앱을 엽니다</h1>
+  <p>‘Roblox에서 열겠습니까?’ 가 뜨면 <b>열기</b>를 눌러 주세요.<br>
+  안 열리면 아래 버튼을 눌러 주세요.</p>
+  <a class="btn" href="{app_s}">로블록스 앱으로 열기</a>
+  <p class="sub">앱이 없거나 그래도 안 되면 <a href="{web_s}">웹 주소로 열기</a></p>
+</div>
+<script>{script}</script>
+</body></html>"""
+    return Response(page, status=200, mimetype="text/html; charset=utf-8")
+
+
 def _deliver(token: str) -> Response:
     """토큰을 실제로 소비해 로블록스로 넘깁니다."""
     url, reason = redeem(token)
@@ -252,8 +371,14 @@ def _deliver(token: str) -> Response:
     # 프래그먼트를 쿼리 파라미터의 일부로 인식해 "유효하지 않은 링크"를
     # 표시합니다. 중계 토큰이 이미 유저를 특정하므로 추적에 지장 없습니다.
     clean = url.split("#", 1)[0]
-    # 모바일 환경에서는 브릿지 페이지를 거쳐 앱 전환이 안정적으로 작동합니다.
     ua = request.headers.get("User-Agent", "")
+    # iOS · iPadOS 는 https 로 넘기면 앱스토어로 갑니다 — 딥링크로 앱을 직접 엽니다.
+    app_url = roblox_app_link(clean)
+    if app_url and _is_ios(ua):
+        return _ios_bridge(app_url, clean)
+    if app_url and _maybe_ipad(ua):
+        return _ios_bridge(app_url, clean, check_touch=True)
+    # 안드로이드는 브릿지 페이지를 거쳐 앱 전환이 안정적으로 작동합니다.
     if _is_mobile(ua):
         return _mobile_bridge(clean)
     return redirect(clean, code=302)

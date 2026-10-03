@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands, tasks
@@ -12,6 +13,35 @@ from utils.database import (
     quest_channels, channel_field, bump_event_progress,
     quest_goal_period,
 )
+
+
+GIF_LINK_RE = re.compile(r'https?://\S*(?:tenor\.com|giphy\.com|gfycat\.com|\.gif|\.gifv)',
+                         re.IGNORECASE)
+URL_RE = re.compile(r'https?://\S+')
+CUSTOM_EMOJI_RE = re.compile(r'<a?:\w+:\d+>')
+KEYCAP_RE = re.compile('[0-9#*]\ufe0f?\u20e3')     # 1️⃣ — 숫자가 남아 글자로 보이지 않게
+# 문장부호로 분류되는 이모지(‼ ⁉ 〰 〽)와, 뒤에 이모지 변형 선택자(U+FE0F)가 붙은 글자
+EMOJI_PUNCT_RE = re.compile('\\S\ufe0f|[\u203c\u2049\u3030\u303d]')
+
+
+def counts_as_chat(content: str) -> bool:
+    """채팅 포인트·퀘스트에 세는 메시지인가.
+
+    URL · 커스텀 이모지 · 유니코드 이모지를 지우고 **남는 것이 있어야** 셉니다.
+    이모지·스티커만 보내 포인트를 버는 것을 막습니다(2026-10 제보).
+
+    유니코드 이모지는 범위를 적지 않고 **문자 분류**로 지웁니다. 예전 범위식은
+    `⬆` `‼` 같은 BMP 이모지를 놓쳤고, `\\200d` 가 8진수로 읽혀 영문 `d` 까지
+    지웠습니다. 기호(S*) · 결합 표시(M*, 이모지 변형 선택자) · 서식(Cf, ZWJ)이
+    지울 대상이고, 글자 · 숫자 · 문장부호는 남습니다.
+    """
+    text = (content or "").strip()
+    if not text or GIF_LINK_RE.search(text):
+        return False
+    text = KEYCAP_RE.sub("", CUSTOM_EMOJI_RE.sub("", URL_RE.sub("", text)))
+    text = EMOJI_PUNCT_RE.sub("", text)
+    return any(not ch.isspace() and unicodedata.category(ch)[0] not in "SMC"
+               for ch in text)
 
 
 def parse_duration_to_seconds(duration_str: str) -> tuple[int, str]:
@@ -364,25 +394,10 @@ class ChatReward(commands.Cog):
         if message.attachments:
             return
 
-        # 스티커만 보낸 메시지도 채팅으로 인정합니다.
-        content = message.content.strip()
-        if not content and not message.stickers:
+        # 스티커는 글자로 치지 않습니다 — 스티커만 보낸 메시지는 content 가
+        # 비어 있어 아래 검사에서 빠집니다. 글자와 함께 보냈으면 그 글자로 셉니다.
+        if not counts_as_chat(message.content):
             return
-
-        # 텍스트가 있는 경우에만 GIF/URL 필터를 적용합니다.
-        # 스티커만 보낸 경우 content가 빈 문자열이므로 건너뜁니다.
-        if content:
-            # 2. Exclude GIF links (Tenor, Giphy, Gfycat, or .gif/.gifv URLs)
-            if re.search(r'https?://\S*(?:tenor\.com|giphy\.com|gfycat\.com|\.gif|\.gifv)', content, re.IGNORECASE):
-                return
-
-            # 3. Strip all general URLs (http://, https://)
-            without_urls = re.sub(r'https?://\S+', '', content).strip()
-
-            # If nothing remains after removing URLs, ignore.
-            # 이모지만 보낸 메시지도 채팅으로 인정합니다.
-            if not without_urls:
-                return
 
         # 블랙리스트 검사는 **가장 마지막**에 합니다.
         # 이 함수는 서버의 모든 메시지마다 호출되는데, 위 필터들은 순수 메모리

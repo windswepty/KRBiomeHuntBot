@@ -154,8 +154,13 @@ async def main():
         (".gif 링크", msg(25, "https://x.com/a.gif"), False),
         ("링크만 있는 메시지", msg(26, "https://naver.com"), False),
         ("일반 채팅", msg(27, "안녕"), True),
-        ("이모지만", msg(28, "😀"), True),
-        ("스티커만", msg(29, "", stickers=True), True),
+        ("이모지만", msg(28, "😀"), False),
+        ("스티커만", msg(29, "", stickers=True), False),
+        ("이모지 여러 개 + 공백", msg(40, "😀 👍🏻 ❤️ ⬆️ ‼️ 1️⃣ 🇰🇷 👨‍👩‍👧"), False),
+        ("커스텀 이모지만", msg(41, "<:pepe:123456789> <a:dance:987654321>"), False),
+        ("스티커 + 글자", msg(42, "ㅋㅋ", stickers=True), True),
+        ("이모지 + 글자", msg(43, "좋아요 😀"), True),
+        ("영문 d 하나 (옛 필터가 지우던 글자)", msg(44, "d"), True),
         ("링크 + 글자", msg(30, "이거 봐 https://naver.com 좋지"), True),
     ]
     for label, m, want in cases:
@@ -166,6 +171,14 @@ async def main():
         got = after > before
         note(got == want,
              f"{label}: {'적립됨' if want else '무시됨'}", f"{before} → {after}")
+
+    print("")
+    print("  이모지만 · 글자 섞임을 문장 단위로 가립니다 (counts_as_chat)")
+    for text, want in [("😀😀😀", False), ("‼️⁉️", False), ("〰", False), ("✅", False),
+                       ("#️⃣ 9️⃣", False), ("🙏🏽", False), ("ㅋ", True), ("?", True),
+                       ("ok 👍", True), ("123", True), ("<@123> 안녕", True),
+                       ("https://tenor.com/x 하하", False), ("dd", True)]:
+        note(CR.counts_as_chat(text) == want, f"{text!r} → {'셈' if want else '안 셈'}")
 
     print("")
     print("  DM 은 guild 가 None 이라 그냥 넘어가야 합니다")

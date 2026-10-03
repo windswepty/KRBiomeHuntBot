@@ -176,6 +176,8 @@ def extract_component_links(message) -> list[str]:
                     walk(child, depth + 1)
             except TypeError:
                 continue
+        # 컴포넌트 V2 의 섹션은 오른쪽 버튼을 `accessory` 에 둡니다
+        walk(getattr(node, "accessory", None), depth + 1)
 
     try:
         for row in getattr(message, "components", None) or []:
@@ -184,6 +186,125 @@ def extract_component_links(message) -> list[str]:
         print(f"[LinkGuard] 컴포넌트 링크 추출 오류: {e}", flush=True)
 
     return list(dict.fromkeys(found))
+
+
+# ── 컴포넌트 V2 메시지 → 임베드 ─────────────────────────────────────
+# SolRich v1.2.1 같은 매크로는 임베드가 아니라 **컴포넌트 V2**(컨테이너 ·
+# 글 칸 · 구분선 · 썸네일)로 보냅니다. 화면에는 임베드처럼 보이지만
+# `message.embeds` 는 **비어 있고 글은 전부 `message.components` 안**에
+# 있습니다. 임베드만 보던 동안 이런 메시지는
+#   ① 재게시하면 **버튼 하나만** 남고 내용이 통째로 사라졌고
+#   ② 바이옴 이름을 못 읽어 **희귀 바이옴 알림 멘션이 안 나갔습니다.**
+# (2026-10-04 실제로 희귀 바이옴이 버튼 하나로만 올라왔습니다)
+#
+# 그래서 글 칸을 모아 **임베드 하나로 옮겨** 담고, 이후는 임베드와
+# 똑같이 다룹니다 — 링크 제거 · 바이옴 판정 · 멘션 끌어올리기 전부.
+# V2 로 그대로 다시 짜지 않는 이유: V2 메시지는 본문(content)을 못 가져서
+# 알림 멘션을 실을 자리가 없습니다.
+LAYOUT_SUBTEXT_RE = re.compile(r'^-#\s+')
+LAYOUT_HEADING_RE = re.compile(r'^#{1,3}\s+(.+?)\s*$')
+LAYOUT_TIMESTAMP_RE = re.compile(r'<t:(-?\d+)(?::[tTdDfFR])?>')
+
+
+def layout_embed(message) -> discord.Embed | None:
+    """컴포넌트 V2 메시지의 글 · 그림 · 색을 임베드 하나로 옮깁니다. 없으면 None.
+
+    - 첫 제목 줄(`#` `##` `###`)은 **제목**으로 — 바이옴 판정이 제목을 먼저 봅니다.
+    - 작은 글씨 줄(`-# `)은 **바닥글**로 — 매크로 이름 · 계정 이름 · 버전이
+      들어가는 자리라, 본문에 섞으면 바이옴 판정에 매크로·계정 이름이 섞입니다
+      (`embed_texts(meta=False)` 가 바닥글을 빼는 것과 같은 이유).
+    - 바닥글은 마크다운이 안 되므로 `<t:…>` 는 떼어 임베드 시각으로 옮깁니다.
+    """
+    texts: list[str] = []
+    thumb = image = None
+    colour = None
+
+    def walk(node, depth: int = 0):
+        nonlocal thumb, image, colour
+        if node is None or depth > 6:
+            return
+        content = getattr(node, "content", None)
+        if isinstance(content, str) and content.strip():
+            texts.append(content)
+        if colour is None:
+            c = getattr(node, "accent_colour", None)
+            if isinstance(c, discord.Colour):
+                colour = c
+        url = getattr(getattr(node, "media", None), "url", None)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            if type(node).__name__.startswith("Thumbnail"):
+                thumb = thumb or url
+            else:
+                image = image or url
+        for attr in ("children", "items"):
+            sub = getattr(node, attr, None)
+            if not sub:
+                continue
+            try:
+                for child in sub:
+                    walk(child, depth + 1)
+            except TypeError:
+                continue
+        walk(getattr(node, "accessory", None), depth + 1)
+
+    try:
+        for top in getattr(message, "components", None) or []:
+            walk(top)
+    except Exception as e:
+        print(f"[LinkGuard] 컴포넌트 V2 읽기 오류: {e}", flush=True)
+        return None
+    if not texts:
+        return None
+
+    title = None
+    body: list[str] = []
+    meta: list[str] = []
+    stamp = None
+    for line in "\n".join(texts).splitlines():
+        if LAYOUT_SUBTEXT_RE.match(line):
+            sub = LAYOUT_SUBTEXT_RE.sub("", line)
+            m = LAYOUT_TIMESTAMP_RE.search(sub)
+            if m and stamp is None:
+                try:
+                    stamp = datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
+                except (ValueError, OverflowError, OSError):
+                    pass
+            sub = LAYOUT_TIMESTAMP_RE.sub("", sub).strip(" ·•|-")
+            if sub:
+                meta.append(sub)
+            continue
+        m = LAYOUT_HEADING_RE.match(line)
+        if title is None and m:
+            title = m.group(1)[:256]
+            continue
+        body.append(line)
+
+    description = "\n".join(body).strip()
+    if len(description) > 4000:
+        description = description[:3999] + "…"
+    embed = discord.Embed(title=title, description=description or None,
+                          colour=colour, timestamp=stamp)
+    if meta:
+        embed.set_footer(text=" · ".join(meta)[:2048])
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    if image:
+        embed.set_image(url=image)
+    return embed
+
+
+def message_embeds(message) -> list:
+    """읽을 임베드 전부 — 진짜 임베드 + 컴포넌트 V2 를 옮긴 것.
+
+    **임베드를 보는 곳은 전부 이걸 씁니다.** 한 곳만 `message.embeds` 를
+    보면 V2 매크로에서 그 기능만 조용히 빠집니다(링크 보호는 됐는데
+    바이옴 알림만 안 나간 것이 바로 그 경우였습니다).
+    """
+    out = list(getattr(message, "embeds", None) or [])
+    extra = layout_embed(message)
+    if extra is not None:
+        out.append(extra)
+    return out
 
 
 def link_key(url: str) -> str:
@@ -456,7 +577,7 @@ def extract_embed_mentions(message) -> tuple[list[int], bool, bool]:
     role_ids: list[int] = []
     everyone = here = False
 
-    for embed in getattr(message, "embeds", None) or []:
+    for embed in message_embeds(message):
         for text in embed_texts(embed):
             for raw in ROLE_MENTION_RE.findall(text):
                 try:
@@ -529,7 +650,7 @@ def detect_biome_name(message) -> str | None:
     바이옴을 1~3종 넣었다 빼므로, 목록을 코드에 적으면 이벤트가 열릴
     때마다 사람이 손봐야 합니다. 형식만 알면 이름은 뭐든 읽습니다.
     """
-    for embed in getattr(message, "embeds", None) or []:
+    for embed in message_embeds(message):
         try:
             data = embed.to_dict() or {}
         except Exception:
@@ -578,7 +699,7 @@ def unparsed_biome_title(message) -> str | None:
     있게 되고, **늘 켜진 경고는 없는 것보다 나쁩니다** — 익숙해져서 진짜
     신호를 놓칩니다. 실측으로 보호본의 25%가 그런 것이었습니다.
     """
-    for embed in getattr(message, "embeds", None) or []:
+    for embed in message_embeds(message):
         try:
             data = embed.to_dict() or {}
         except Exception:
@@ -618,7 +739,7 @@ def biome_haystack(message) -> str:
     (매크로 이름과 버전이라 바이옴과 무관하고, 섞으면 오검출이 납니다).
     """
     parts: list[str] = []
-    for embed in getattr(message, "embeds", None) or []:
+    for embed in message_embeds(message):
         parts.extend(embed_texts(embed, meta=False))
     return " ".join(parts)
 
@@ -4198,7 +4319,7 @@ class LinkGuard(commands.Cog):
 
         sanitized_embeds: list[discord.Embed] = []
         all_links: list[str] = []
-        for embed in message.embeds:
+        for embed in message_embeds(message):
             clean, links = sanitize_embed(embed, locked_text, only_roblox)
             sanitized_embeds.append(clean)
             all_links.extend(links)
@@ -4510,7 +4631,7 @@ class LinkGuard(commands.Cog):
             links: list[str] = []
             # 보호할 때와 **같은 경로**로 모읍니다 — 여기서만 다르게 훑으면
             # 어느 한쪽이 놓치는 링크가 생깁니다.
-            for embed in message.embeds:
+            for embed in message_embeds(message):
                 _, got = sanitize_embed(embed, locked, only_roblox)
                 links.extend(got)
             _, got = strip_links(message.content or "", locked, only_roblox)

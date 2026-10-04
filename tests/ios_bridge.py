@@ -100,6 +100,12 @@ async def main():
     note(r.status_code == 302 and r.headers.get("Location") == SHARE, "PC: 302", str(r.status_code))
     r = open_with(SHARE, MAC_CHROME)
     note(r.status_code == 302, "맥 크롬: 302 (iPad 일 수 없음)", str(r.status_code))
+    ipad_chrome = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                   "(KHTML, like Gecko) CriOS/129.0 Version/18.0 Safari/604.1")
+    r = open_with(SHARE, ipad_chrome)
+    body = r.get_data(as_text=True)
+    note(r.status_code == 200 and "roblox://" in body and "maxTouchPoints" not in body,
+         "iPad 크롬 데스크톱 모드(CriOS): 앱 딥링크", str(r.status_code))
     r = open_with("https://www.roblox.com/games/1/x?foo=1", IPHONE)
     note("roblox://" not in r.get_data(as_text=True), "모르는 형식이면 딥링크 없이 예전 방식")
 

@@ -204,6 +204,21 @@ def extract_component_links(message) -> list[str]:
 LAYOUT_SUBTEXT_RE = re.compile(r'^-#\s+')
 LAYOUT_HEADING_RE = re.compile(r'^#{1,3}\s+(.+?)\s*$')
 LAYOUT_TIMESTAMP_RE = re.compile(r'<t:(-?\d+)(?::[tTdDfFR])?>')
+# 본문 안의 제목 줄(인용 안 포함). 임베드 제목은 따로 있으므로 굵은 글씨로
+# 낮춥니다 — 안 낮추면 `> ### Support Server` 같은 홍보 줄이 제목보다 커집니다.
+LAYOUT_BODY_HEADING_RE = re.compile(r'^((?:>\s*)?)#{1,3}\s+(.+?)\s*$')
+
+
+def _plain_footer(text: str) -> str:
+    """바닥글용으로 마크다운을 벗깁니다 — **바닥글은 마크다운을 안 그립니다.**
+
+    SolRich 의 작은 글씨 줄은 `**[leetaese](https://…/profile)** • \\`3959…\\``
+    처럼 링크 · 굵게 · 코드가 섞여 있어, 그대로 넣으면 기호가 날것으로 보입니다.
+    """
+    text = MD_LINK_RE.sub(lambda m: m.group(1), text)
+    text = URL_RE.sub("", text)
+    text = re.sub(r'(\*\*|__|\*|`|~~|\|\|)', "", text)
+    return re.sub(r'\s{2,}', " ", text).strip(" ·•|-")
 
 
 def layout_embed(message) -> discord.Embed | None:
@@ -269,7 +284,7 @@ def layout_embed(message) -> discord.Embed | None:
                     stamp = datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
                 except (ValueError, OverflowError, OSError):
                     pass
-            sub = LAYOUT_TIMESTAMP_RE.sub("", sub).strip(" ·•|-")
+            sub = _plain_footer(LAYOUT_TIMESTAMP_RE.sub("", sub))
             if sub:
                 meta.append(sub)
             continue
@@ -277,7 +292,7 @@ def layout_embed(message) -> discord.Embed | None:
         if title is None and m:
             title = m.group(1)[:256]
             continue
-        body.append(line)
+        body.append(LAYOUT_BODY_HEADING_RE.sub(r'\1**\2**', line))
 
     description = "\n".join(body).strip()
     if len(description) > 4000:

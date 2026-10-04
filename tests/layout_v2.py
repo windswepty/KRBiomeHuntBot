@@ -59,9 +59,12 @@ def solrich(channel, title, *, account="leetaese", url=None, where="row"):
         text(f"-# {account} · `3959176513`"),
         {"type": 9, "components": [text(body)], "accessory": accessory},
         {"type": 14, "divider": True, "spacing": 1},
-        text(f"> [Support Server]({SUPPORT})"),
+        text(f"> ### [Support Server]({SUPPORT})\n"
+             "> Macro made by [youtube.com/@Finnerich](https://youtube.com/@Finnerich)"),
         {"type": 14, "divider": True, "spacing": 1},
-        text(f"-# SolRich v1.2.1 · <t:{STAMP}:F>"),
+        # 실제 바닥글 모양(2026-10-04 화면) — 링크 · 굵게 · 코드가 섞여 있습니다
+        text(f"-# **[{account}](https://www.roblox.com/users/3959176513/profile)** • "
+             f"`3959176513` • **SolRich v1.2.1** • <t:{STAMP}:R>"),
     ]
     if url and where == "row":
         children.append({"type": 1, "components": [button(url)]})
@@ -114,6 +117,12 @@ async def main():
     note(e is not None and "SolRich v1.2.1" in (e.footer.text or "")
          and "<t:" not in (e.footer.text or ""), "작은 글씨 → 바닥글 (<t:…> 는 떼어 냄)",
          repr(e and e.footer.text))
+    foot = (e.footer.text or "") if e is not None else ""
+    note(not any(x in foot for x in ("**", "`", "[", "](", "http")),
+         "**바닥글에 마크다운 기호가 날것으로 남지 않음** (바닥글은 마크다운을 안 그림)", repr(foot))
+    note("leetaese" in foot and "3959176513" in foot, "글자는 남음", repr(foot))
+    note("**[Support Server]" in (e.description or "") and "###" not in (e.description or ""),
+         "본문 안 제목 줄은 굵은 글씨로 낮춤 (제목보다 커지지 않게)", repr(e and e.description))
     note(e is not None and e.timestamp is not None and int(e.timestamp.timestamp()) == STAMP,
          "<t:…> 는 임베드 시각으로")
     note(e is not None and e.thumbnail.url == THUMB, "썸네일 유지")

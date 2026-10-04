@@ -265,7 +265,9 @@ def _mobile_bridge(roblox_url: str) -> Response:
 # 자칭해서, 모바일 판별을 통과해 302 를 받고 그대로 앱스토어로 갔습니다
 # (제보 화면이 iPad 였습니다). 서버에서는 맥과 구별할 수 없어, 맥 Safari 로
 # 보이면 페이지에서 터치 화면인지 보고 갈라 보냅니다.
-_IOS_KW = ("iphone", "ipad", "ipod")
+# CriOS · FxiOS · EdgiOS 는 iOS 용 크롬 · 파이어폭스 · 엣지에만 있습니다.
+# iPad 데스크톱 모드에서는 'iPad' 없이 이것만 남습니다.
+_IOS_KW = ("iphone", "ipad", "ipod", "crios", "fxios", "edgios")
 _RBX_CODE_RE = re.compile(r'^[A-Za-z0-9_\-]{1,200}$')
 _RBX_HOST_RE = re.compile(r'^(?:www\.)?roblox\.com$', re.IGNORECASE)
 

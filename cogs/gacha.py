@@ -36,6 +36,31 @@ def format_stock_str(stock: int) -> str:
         return f"{stock:,}개 남음"
 
 
+def pct_str(p, exact: bool = False) -> str:
+    """확률을 화면용 글자로. 기본은 소수 둘째 자리(`2.00`).
+
+    `0.00001%` 처럼 아주 작은 확률을 `.2f` 로 찍으면 **`0.00%`** 가 되어,
+    유저는 "절대 안 나오는 상품" 으로 읽고 관리자는 설정이 날아간 줄 압니다.
+    그래서 0.01 보다 작으면 0 이 아닌 자리까지 보여 줍니다. 파이썬 기본
+    표기(`1e-05`)도 쓰지 않습니다.
+
+    `exact=True` 는 합계용입니다 — `99.998%` 가 `100.00%` 로 보이면서
+    "100%가 아니라 뽑기 불가" 라고 나오면 무엇을 고칠지 알 수 없습니다.
+    """
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "0.00"
+    if exact or 0 < abs(p) < 0.01:
+        s = f"{p:.10f}".rstrip("0")
+        whole, _, frac = s.partition(".")
+        s = f"{whole}.{frac.ljust(2, '0')}"
+        if float(s) == 0 and p:
+            s = f"{p:.3g}"          # 1e-10 보다 작은 값 — 0 으로 보이게 두지 않습니다
+        return s
+    return f"{p:.2f}"
+
+
 def get_total_percent(items: list[dict]) -> float:
     return sum(float(item.get("percent", item.get("weight", 0))) for item in items)
 
@@ -287,7 +312,7 @@ class GachaPlayView(discord.ui.View):
                     title="⚠️ 뽑기 실행 불가",
                     description="관리자가 설정한 전체 뽑기 항목들의 **확률 합이 100%가 아니어서** "
                                 "현재 뽑기를 진행할 수 없습니다.\n\n"
-                                f"📊 **현재 확률 합계**: `{get_total_percent(items):.2f}%` "
+                                f"📊 **현재 확률 합계**: `{pct_str(get_total_percent(items), exact=True)}%` "
                                 "(100%로 설정되어야 함)",
                     color=discord.Color.red()),
                 ephemeral=True)
@@ -663,7 +688,7 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
         items.append(new_item)                # 아래 확률 합계 계산용
 
         current_total = get_total_percent(items)
-        status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다! (뽑기 플레이 가능)" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{current_total:.2f}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
+        status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다! (뽑기 플레이 가능)" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{pct_str(current_total, exact=True)}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
 
         role_info = ""
         if role_id > 0:
@@ -673,7 +698,7 @@ class AddGachaItemModal(discord.ui.Modal, title="➕ 뽑기 당첨 항목 및 �
         stock_str = format_stock_str(stock)
         embed = discord.Embed(
             title="✅ 뽑기 항목 추가 완료",
-            description=f"**{new_item['name']}** 항목(확률: **{percent}%** | 재고: `{stock_str}`{role_info})이 추가되었습니다.\n\n{status_msg}",
+            description=f"**{new_item['name']}** 항목(확률: **{pct_str(percent)}%** | 재고: `{stock_str}`{role_info})이 추가되었습니다.\n\n{status_msg}",
             color=discord.Color.green() if abs(current_total - 100.0) < 0.001 else discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -686,7 +711,7 @@ class DeleteGachaItemSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"{item['name']} [{format_stock_str(item.get('stock', -1))}]",
                 value=str(item["id"]),
-                description=f"확률: {item.get('percent', item.get('weight', 0))}% | 역할 ID: {item.get('reward_role_id', 0)}",
+                description=f"확률: {pct_str(item.get('percent', item.get('weight', 0)))}% | 역할 ID: {item.get('reward_role_id', 0)}",
                 emoji="🗑️"
             )
             for item in sorted_items
@@ -705,7 +730,7 @@ class DeleteGachaItemSelect(discord.ui.Select):
 
         item_name = deleted_item["name"] if deleted_item else "선택 항목"
         current_total = get_total_percent(new_items)
-        status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다!" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{current_total:.2f}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
+        status_msg = "✅ 전체 확률 합계가 **100%**로 완벽합니다!" if abs(current_total - 100.0) < 0.001 else f"⚠️ 현재 총 확률 합계가 **{pct_str(current_total, exact=True)}%**입니다. (100%로 맞춰야 뽑기 생성 가능)"
 
         embed = discord.Embed(
             title="🗑️ 뽑기 항목 삭제 완료",
@@ -781,7 +806,7 @@ class RefillGachaItemStockSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"{item['name'][:25]} [{format_stock_str(item.get('stock', -1))}]",
                 value=str(item["id"]),
-                description=f"현재 재고: {format_stock_str(item.get('stock', -1))} | 확률: {item.get('percent', item.get('weight', 0))}%",
+                description=f"현재 재고: {format_stock_str(item.get('stock', -1))} | 확률: {pct_str(item.get('percent', item.get('weight', 0)))}%",
                 emoji="📦" if item.get('stock', -1) != 0 else "🚫"
             )
             for item in sorted_items
@@ -923,7 +948,7 @@ class GachaSettingsSelect(discord.ui.Select):
                 )
             else:
                 total_pct = get_total_percent(items)
-                status_str = "✅ **100.00%** (뽑기 정상 가동 가능)" if abs(total_pct - 100.0) < 0.001 else f"⚠️ **{total_pct:.2f}%** (100%가 되지 않아 뽑기 생성 불가!)"
+                status_str = "✅ **100.00%** (뽑기 정상 가동 가능)" if abs(total_pct - 100.0) < 0.001 else f"⚠️ **{pct_str(total_pct, exact=True)}%** (100%가 되지 않아 뽑기 생성 불가!)"
 
                 embed = discord.Embed(
                     title=f"📊 {gacha_title} 확률표 및 재고 현황",
@@ -950,7 +975,7 @@ class GachaSettingsSelect(discord.ui.Select):
 
                     embed.add_field(
                         name=f"🎲 {item['name']}",
-                        value=f"• **확률**: `{pct:.2f}%` | **재고**: `{stock_str}`{extra_str}",
+                        value=f"• **확률**: `{pct_str(pct)}%` | **재고**: `{stock_str}`{extra_str}",
                         inline=False
                     )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1012,7 +1037,7 @@ class Gacha(commands.Cog):
         if is_all_sold_out:
             status_line = "⚠️ 현재 모든 뽑기 상품의 재고가 소진되어 뽑기를 진행할 수 없습니다."
         elif not is_ready:
-            status_line = f"⚠️ 현재 전체 확률 합계가 **{total_pct:.2f}%**로 100%가 되지 않아 뽑기를 진행할 수 없습니다."
+            status_line = f"⚠️ 현재 전체 확률 합계가 **{pct_str(total_pct, exact=True)}%**로 100%가 되지 않아 뽑기를 진행할 수 없습니다."
         else:
             status_line = "✅ 현재 뽑기를 플레이하실 수 있습니다."
 
@@ -1037,7 +1062,7 @@ class Gacha(commands.Cog):
             stock_str = format_stock_str(item.get("stock", -1))
             role_id = item.get("reward_role_id", 0)
 
-            info_lines = [f"• **확률**: `{pct:.2f}%` | **재고**: `{stock_str}`"]
+            info_lines = [f"• **확률**: `{pct_str(pct)}%` | **재고**: `{stock_str}`"]
             if role_id > 0:
                 role = interaction.guild.get_role(role_id)
                 role_info = role.mention if role else f"ID: {role_id}"
@@ -1083,7 +1108,7 @@ class Gacha(commands.Cog):
         items = settings.get("items", [])
 
         total_pct = get_total_percent(items)
-        status_str = "✅ **100%** (뽑기 생성 완료)" if is_valid_100_percent(items) else f"⚠️ **{total_pct:.2f}%** (100%를 맞춰야 유저들이 뽑기 가능)"
+        status_str = "✅ **100%** (뽑기 생성 완료)" if is_valid_100_percent(items) else f"⚠️ **{pct_str(total_pct, exact=True)}%** (100%를 맞춰야 유저들이 뽑기 가능)"
 
         embed = discord.Embed(
             title="⚙️ 럭키 뽑기, 역할 및 재고 설정 관리",

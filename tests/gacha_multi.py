@@ -85,6 +85,14 @@ async def main():
     note(G.bulk_discount(s) == 100, "할인폭이 계산됨", str(G.bulk_discount(s)))
 
     print("")
+    print("=== 1-2. 아주 작은 확률이 0.00% 로 보이면 안 됩니다 ===")
+    for v, want in [(0.00001, "0.00001"), (0.005, "0.005"), (1e-12, "1e-12"),
+                    (2, "2.00"), (54, "54.00"), (0, "0.00")]:
+        note(G.pct_str(v) == want, f"{v} → {want}%", G.pct_str(v))
+    note(G.pct_str(99.998, exact=True) == "99.998",
+         "합계 99.998 이 100.00 으로 보이지 않음", G.pct_str(99.998, exact=True))
+    note(G.pct_str(100, exact=True) == "100.00", "합계 100 은 100.00")
+
     print("=== 2. 10회 뽑기 기본 ===")
     s = await setup_gacha(items(("꽝", 90.0, -1, 0, 0), ("대박", 10.0, -1, 50, 0)),
                           price=100, price_10=900)

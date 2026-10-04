@@ -225,9 +225,10 @@ def layout_embed(message) -> discord.Embed | None:
     """컴포넌트 V2 메시지의 글 · 그림 · 색을 임베드 하나로 옮깁니다. 없으면 None.
 
     - 첫 제목 줄(`#` `##` `###`)은 **제목**으로 — 바이옴 판정이 제목을 먼저 봅니다.
-    - 작은 글씨 줄(`-# `)은 **바닥글**로 — 매크로 이름 · 계정 이름 · 버전이
-      들어가는 자리라, 본문에 섞으면 바이옴 판정에 매크로·계정 이름이 섞입니다
-      (`embed_texts(meta=False)` 가 바닥글을 빼는 것과 같은 이유).
+    - 작은 글씨 줄(`-# `)은 제목 위면 **작성자**(원본처럼 맨 위 계정 줄), 그 외는
+      **바닥글**로 — 매크로 이름 · 계정 이름 · 버전이 들어가는 자리라, 본문에 섞으면
+      바이옴 판정에 매크로·계정 이름이 섞입니다
+      (`embed_texts(meta=False)` 가 작성자 · 바닥글을 빼는 것과 같은 이유).
     - 바닥글은 마크다운이 안 되므로 `<t:…>` 는 떼어 임베드 시각으로 옮깁니다.
     """
     texts: list[str] = []
@@ -273,6 +274,7 @@ def layout_embed(message) -> discord.Embed | None:
 
     title = None
     body: list[str] = []
+    head: list[str] = []
     meta: list[str] = []
     stamp = None
     for line in "\n".join(texts).splitlines():
@@ -286,7 +288,9 @@ def layout_embed(message) -> discord.Embed | None:
                     pass
             sub = _plain_footer(LAYOUT_TIMESTAMP_RE.sub("", sub))
             if sub:
-                meta.append(sub)
+                # 제목보다 **위**의 작은 글씨(계정 줄)는 원본처럼 맨 위(작성자)에,
+                # 나머지(매크로 · 버전)는 바닥글에 둡니다. 둘 다 바이옴 판정에서 빠집니다.
+                (head if title is None and not body else meta).append(sub)
             continue
         m = LAYOUT_HEADING_RE.match(line)
         if title is None and m:
@@ -299,6 +303,10 @@ def layout_embed(message) -> discord.Embed | None:
         description = description[:3999] + "…"
     embed = discord.Embed(title=title, description=description or None,
                           colour=colour, timestamp=stamp)
+    if head:
+        # 링크는 달지 않습니다 — 로블록스 프로필 주소를 달면 sanitize_embed 가
+        # '보호할 로블록스 링크' 로 집어 가 유출 감지 색인이 오염됩니다.
+        embed.set_author(name=" · ".join(head)[:256])
     if meta:
         embed.set_footer(text=" · ".join(meta)[:2048])
     if thumb:

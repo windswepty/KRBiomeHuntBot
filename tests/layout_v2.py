@@ -121,6 +121,10 @@ async def main():
     note(not any(x in foot for x in ("**", "`", "[", "](", "http")),
          "**바닥글에 마크다운 기호가 날것으로 남지 않음** (바닥글은 마크다운을 안 그림)", repr(foot))
     note("leetaese" in foot and "3959176513" in foot, "글자는 남음", repr(foot))
+    note(e is not None and e.author.name == "leetaese · 3959176513" and not e.author.url,
+         "제목 위 계정 줄 → 원본처럼 맨 위(작성자) · 링크 없음", repr(e and e.author.name))
+    note(LG.layout_embed(solrich(ch, "Biome Started - X", url=link("q"))).author.name
+         not in (None, ""), "재게시 때 웹훅 이름으로 덮이지 않을 자리")
     note("**[Support Server]" in (e.description or "") and "###" not in (e.description or ""),
          "본문 안 제목 줄은 굵은 글씨로 낮춤 (제목보다 커지지 않게)", repr(e and e.description))
     note(e is not None and e.timestamp is not None and int(e.timestamp.timestamp()) == STAMP,

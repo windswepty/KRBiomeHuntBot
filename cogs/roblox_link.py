@@ -346,6 +346,40 @@ def split_names(text: str) -> list[str]:
     return out
 
 
+# /연동조회 에 한 번에 넣을 수 있는 개수 — 하나마다 DB 를 한 번 봅니다
+LOOKUP_MAX = 25
+
+
+def split_lookup_queries(text: str) -> list[str]:
+    """/연동조회 검색어를 여러 개로 나눕니다 (쉼표 · 줄바꿈 · 공백).
+
+    `split_names` 와 달리 **공백으로도 자릅니다.** 여기서 찾는 것은 로블록스
+    유저명 · 숫자 ID · 디스코드 ID · 멘션이라 공백이 들어갈 수 없습니다
+    (공백이 들어갈 수 있는 표시이름은 /개인서버대조 가 다룹니다).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for piece in re.split(r"[\s,;]+", text or ""):
+        tok = piece.strip().lstrip("@").strip()
+        if tok and tok.casefold() not in seen:
+            seen.add(tok.casefold())
+            out.append(tok)
+    return out
+
+
+def _chunk_lines(lines: list[str], limit: int = 1000) -> list[str]:
+    """줄 목록을 임베드 칸(1024자)에 나눠 담습니다. 비었으면 '—' 한 칸."""
+    chunks, cur = [], ""
+    for line in lines:
+        if cur and len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur}\n{line}" if cur else line[:limit]
+    if cur or not chunks:
+        chunks.append(cur or "—")
+    return chunks
+
+
 def _join_capped(items: list[str], limit: int = 900) -> str:
     """임베드 필드(1024자) 안에 들어가도록 잘라 붙입니다."""
     shown: list[str] = []
@@ -877,6 +911,13 @@ class RobloxLink(commands.Cog):
         guild = interaction.guild
         query = (검색어 or "").strip()
 
+        # 여러 개를 한 번에 붙여넣으면(게임 안 목록 등) 하나씩 따로 찾습니다.
+        # 통째로 한 검색어로 찾으면 "검색 결과 없음" 만 나옵니다(2026-10-05 제보).
+        tokens = split_lookup_queries(query)
+        if len(tokens) > 1:
+            await self._search_many(interaction, tokens)
+            return
+
         rows = await search_roblox_links(guild.id, query, limit=10)
 
         if not rows:
@@ -951,6 +992,52 @@ class RobloxLink(commands.Cog):
 
         if len(rows) >= 10:
             embed.set_footer(text="결과가 10건을 넘어 잘렸습니다 · 더 정확한 검색어를 입력해 보세요")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _search_many(self, interaction: discord.Interaction, tokens: list[str]) -> None:
+        """여러 검색어를 한 번에 — 이름마다 ✅ 연동됨 / ❌ 기록 없음 으로 나눕니다."""
+        guild = interaction.guild
+        dropped = max(0, len(tokens) - LOOKUP_MAX)
+        tokens = tokens[:LOOKUP_MAX]
+        found, missing = [], []
+        for tok in tokens:
+            rows = await search_roblox_links(guild.id, tok, limit=5)
+            # 정확히 같은 유저명이 있으면 그것만 봅니다. 'Atr' 같은 짧은 이름이
+            # 부분 일치로 남의 계정까지 끌고 오면 대조가 틀어집니다.
+            exact = [r for r in rows if r.get("matched_by") != "roblox_name"
+                     or str(r.get("roblox_name", "")).lower() == tok.lower()]
+            hits = exact or rows
+            if not hits:
+                missing.append(f"❌ `{tok}`")
+                continue
+            r = hits[0]
+            uid = r.get("user_id", "?")
+            member = guild.get_member(int(uid)) if str(uid).isdigit() else None
+            who = member.mention if member else f"`{uid}` (⚠️ 서버에 없음)"
+            more = "" if exact else " · 부분 일치"
+            if len(hits) > 1:
+                more += f" · 외 {len(hits) - 1}명"
+            found.append(f"✅ `{tok}` → **{r.get('roblox_name', '?')}** {who}{more}")
+
+        embed = discord.Embed(
+            title="🔍 연동 일괄 조회",
+            description=f"**{len(tokens)}개** 중 **{len(found)}개** 연동됨 · "
+                        f"**{len(missing)}개** 기록 없음",
+            color=discord.Color.green() if not missing else discord.Color.orange())
+        for name, lines in ((f"✅ 연동됨 ({len(found)})", found),
+                            (f"❌ 연동 기록 없음 ({len(missing)})", missing)):
+            for i, chunk in enumerate(_chunk_lines(lines)):
+                embed.add_field(name=name if i == 0 else "\u200b", value=chunk, inline=False)
+        if missing:
+            embed.add_field(
+                name="⚠️ 게임 안에서 본 이름인가요?",
+                value="연동 명단에 없는 사람이 개인서버에 들어와 있다면 **링크가 외부로 새어나갔을** "
+                      "수 있습니다.\n-# 연동을 아직 안 한 멤버일 수도 있으니 함께 확인하세요.",
+                inline=False)
+        foot = "게임 안 목록은 표시이름일 수 있습니다 · /개인서버대조 는 표시이름까지 맞춰 봅니다"
+        if dropped:
+            foot = f"한 번에 {LOOKUP_MAX}개까지만 봅니다 — {dropped}개는 빠졌습니다 · " + foot
+        embed.set_footer(text=foot)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(

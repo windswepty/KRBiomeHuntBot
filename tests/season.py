@@ -285,6 +285,103 @@ async def main():
     finally:
         SH.consume_shop_stock = real
 
+    print("\n=== 6-2. /시즌상점 · /시즌뽑기 (시즌 포인트 전용 창) ===")
+    await db.save_shop_settings(GID, {"items": [{"id": 1, "name": "한정템", "price": 100, "stock": 5,
+                                                 "reward_role_id": 0, "description": ""}]})
+    shop_cog, gacha_cog = SH.Shop(None), G.Gacha(None)
+    it = Inter(uid=53, admin=False)
+    await SH.Shop.season_shop.callback(shop_cog, it)
+    sent = it.followup.sent[-1]
+    note(sent.get("ephemeral") is True and isinstance(sent.get("view"), SH.ShopView)
+         and "🏆" in sent["embed"].fields[0].value, "시즌 중 /시즌상점: 시즌 가격으로 보임")
+    await ev.add_season_points(GID, 53, 150)
+    p53 = await db.get_user_points(GID, 53)
+    sel = sent["view"].children[0]
+    sel._values = ["1"]
+    it2 = Inter(uid=53, admin=False)
+    await sel.callback(it2)
+    note(await sp(53) == 50 and await db.get_user_points(GID, 53) == p53
+         and "구매 완료" in (it2.response.sent[-1]["embed"].title or ""),
+         "**고르면 바로 시즌 포인트로 삼** (고르는 창 없음 · 기본 포인트 그대로)", str(await sp(53)))
+
+    it = Inter(uid=53, admin=False)
+    await G.Gacha.season_roll.callback(gacha_cog, it)
+    sent = it.followup.sent[-1]
+    ids = {getattr(c, "custom_id", None) for c in sent["view"].children}
+    note(ids == {"gacha_season_btn", "gacha_season10_btn"},
+         "/시즌뽑기: 시즌 버튼만 (기본 포인트 버튼 없음)", str(ids))
+    note(not any(c.disabled for c in sent["view"].children), "시즌 중이면 누를 수 있음")
+
+    s_now = await ev.get_season(GID, fresh=True)
+    await set_period(-7200, -60)
+    for label, fn, cog_ in (("시즌상점", SH.Shop.season_shop, shop_cog),
+                            ("시즌뽑기", G.Gacha.season_roll, gacha_cog)):
+        it = Inter(uid=53, admin=False)
+        await fn.callback(cog_, it)
+        note("시즌 기간이 아닙니다" in (it.followup.sent[-1].get("content") or ""),
+             f"시즌 밖 /{label}: 일반 유저는 막힘")
+        it = Inter(uid=7, admin=True)
+        await fn.callback(cog_, it)
+        e = it.followup.sent[-1].get("embed")
+        note(e is not None and "관리자 미리보기" in e.description, f"시즌 밖 /{label}: 관리자는 미리보기")
+    v = it.followup.sent[-1]["view"]
+    note(all(c.disabled for c in v.children), "미리보기 뽑기 버튼은 잠김")
+    await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
+    ev._cache.clear()
+
+    print("\n=== 6-3. 시즌 명령어 표시 대상 (기본 권한) 전환 ===")
+    note(S.desired_season_perms(True) is None and S.desired_season_perms(False) == "8",
+         "시즌 중 → 모두 · 아니면 → 관리자만(8)")
+    for name in ("season_shop", "season_roll"):
+        cmd = getattr(SH.Shop if name == "season_shop" else G.Gacha, name)
+        note(cmd.default_permissions is not None and cmd.default_permissions.administrator,
+             f"/{cmd.name} 등록 기본값은 관리자만 (재시작 직후에도 새지 않게)")
+
+    class FakeCmd:
+        def __init__(self, name, cid, perms):
+            self.name, self.id, self.default_member_permissions = name, cid, perms
+
+    edits = []
+    remote = {1: "8", 2: "8", 3: None}       # 디스코드에 저장된 값 (재시작 직후 = 관리자만)
+
+    def as_perms(v):
+        return None if v is None else discord.Permissions(int(v))
+
+    class FakeTree:
+        async def fetch_commands(self):
+            return [FakeCmd("시즌뽑기", 1, as_perms(remote[1])),
+                    FakeCmd("시즌상점", 2, as_perms(remote[2])),
+                    FakeCmd("뽑기", 3, as_perms(remote[3]))]
+
+    class FakeHttp:
+        async def edit_global_command(self, app, cid, payload):
+            edits.append((cid, payload))
+            remote[cid] = payload["default_member_permissions"]
+
+    class FakeBot:
+        application_id = 99
+        guilds = [GUILD]
+        tree, http = FakeTree(), FakeHttp()
+
+        async def wait_until_ready(self):
+            return None
+
+    sc = S.Season(FakeBot())
+    await sc.sync_season_commands.coro(sc)
+    note(sorted(edits) == [(1, {"default_member_permissions": None}),
+                           (2, {"default_member_permissions": None})],
+         "**시즌 중이면 두 명령어만 '모두' 로** (/뽑기 는 건드리지 않음)", str(edits))
+    edits.clear()
+    await sc.sync_season_commands.coro(sc)
+    note(edits == [], "같은 상태면 다시 묻지 않음")
+    await set_period(-7200, -60)
+    await sc.sync_season_commands.coro(sc)
+    note(sorted(edits) == [(1, {"default_member_permissions": "8"}),
+                           (2, {"default_member_permissions": "8"})],
+         "시즌이 끝나면 다시 관리자만", str(edits))
+    await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
+    ev._cache.clear()
+
     print("\n=== 7. 기간이 끝나면 소멸 · 기간을 고쳐도 유지 · 초기화 ===")
     keep = await sp(21)
     await ev.save_season(GID, "1시즌 (연장)", time.time() - 3600, time.time() + 7200)

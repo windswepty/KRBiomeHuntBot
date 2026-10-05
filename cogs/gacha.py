@@ -1101,6 +1101,77 @@ class Gacha(commands.Cog):
                              season_active=season_on)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
+    @app_commands.command(name="시즌뽑기", description="시즌 포인트로 럭키 뽑기를 돌립니다. (시즌 기간에만)")
+    @app_commands.guild_only()
+    # 시즌이 아닐 때는 관리자에게만 보입니다. 시즌 중에는 cogs/season.py 의
+    # sync_season_commands 가 이 기본값을 '모두' 로 바꿉니다.
+    @app_commands.default_permissions(administrator=True)
+    async def season_roll(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        gid = interaction.guild.id
+        is_admin = interaction.user.guild_permissions.administrator
+        s = await get_season(gid)
+        active = season_state(s) == "active"
+        # 명령어 숨김은 디스코드 화면 쪽 장치라, 서버 설정으로 덮였거나 화면이 아직
+        # 안 바뀐 사람이 칠 수 있습니다 — 여기서도 막습니다.
+        if not active and not is_admin:
+            await interaction.followup.send("⚠️ 지금은 시즌 기간이 아닙니다.", ephemeral=True)
+            return
+        settings = await get_gacha_settings(gid)
+        if not settings.get("enabled", True) and not is_admin:
+            await interaction.followup.send("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다.",
+                                            ephemeral=True)
+            return
+        items = settings.get("items", [])
+        sp = await get_season_points(gid, interaction.user.id)
+        name = s.get("name") or "시즌"
+        sold_out = not [i for i in items if i.get("stock", -1) != 0]
+        ready = is_valid_100_percent(items) and not sold_out
+        if not items:
+            status = "현재 준비된 뽑기 항목이 없습니다!"
+        elif sold_out:
+            status = "⚠️ 현재 모든 뽑기 상품의 재고가 소진되었습니다."
+        elif not ready:
+            status = (f"⚠️ 전체 확률 합계가 **{pct_str(get_total_percent(items), exact=True)}%**"
+                      "로 100%가 아니라 뽑을 수 없습니다.")
+        else:
+            status = "✅ 지금 뽑을 수 있습니다."
+        embed = discord.Embed(
+            title=f"🏆 {name} 뽑기 — {settings.get('title', '럭키 뽑기')}",
+            description=(f"럭키 뽑기를 **시즌 포인트로** 돌립니다.\n\n"
+                         f"💳 **1회**: **{int(settings.get('price', 100) or 0):,} 🏆**\n"
+                         f"🎰 **{BULK_COUNT}회**: **{bulk_price(settings):,} 🏆**\n"
+                         f"🏆 **내 시즌 포인트**: **{sp:,}**\n\n{status}"),
+            color=discord.Color.gold() if ready else discord.Color.red())
+        if not active:
+            embed.description = ("👀 **관리자 미리보기** — 시즌 기간이 아니라 일반 유저에게는 이 "
+                                 "명령어가 보이지 않고, 지금은 뽑을 수 없습니다.\n\n"
+                                 + embed.description)
+        prize_unit = "🏆" if await base_points_paused(gid) else "P"
+        for item in sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0)))):
+            pct = float(item.get("percent", item.get("weight", 0)))
+            lines = [f"• **확률**: `{pct_str(pct)}%` | **재고**: "
+                     f"`{format_stock_str(item.get('stock', -1))}`"]
+            rid = item.get("reward_role_id", 0)
+            if rid > 0:
+                role = interaction.guild.get_role(rid)
+                lines.append(f"• **보상 혜택**: {role.mention if role else f'ID: {rid}'}")
+            elif item.get("reward_points", 0) > 0:
+                lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} {prize_unit}` 적립")
+            embed.add_field(name=f"🎁 {item['name']}", value="\n".join(lines), inline=False)
+        if not items:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        view = GachaPlayView(is_out_of_stock=sold_out or not active, settings=settings,
+                             season_active=True)
+        # 시즌 포인트 버튼만 남깁니다(같은 영구 View 의 custom_id 라 재시작 뒤에도 동작)
+        view.remove_item(view.roll_gacha)
+        view.remove_item(view.roll_gacha_10)
+        if not view.season_1.disabled:
+            view.season_1.style = discord.ButtonStyle.primary
+            view.season_10.style = discord.ButtonStyle.success
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
     @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 이름, 설명, 가격, 당첨 항목, 확률(총합 100%), 재고, 역할을 관리합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.
     # (실제로 /출석 이 그렇게 터졌습니다). guild_only 를 걸면 디스코드가

@@ -11,8 +11,9 @@ from utils.database import (
     check_and_clear_expired_boosts,
     bump_quest_progress, get_quest_settings, bump_server_goal,
     quest_channels, channel_field, bump_event_progress,
-    quest_goal_period,
+    quest_goal_period, BOOST_CHAT, BOOST_SEASON, boost_kind,
 )
+from utils.event_db import get_season, season_state
 
 
 GIF_LINK_RE = re.compile(r'https?://\S*(?:tenor\.com|giphy\.com|gfycat\.com|\.gif|\.gifv)',
@@ -88,16 +89,28 @@ def parse_duration_to_seconds(duration_str: str) -> tuple[int, str]:
 
 
 # ── Modals & Select Views for Channel Boost ───────────────────────────
+#
+# /채널부스트 와 /시즌부스트 가 **같은 화면**을 씁니다(kind 만 다름). 두 벌로 두면
+# 한쪽만 고쳐지고, 저장 · 만료 · 목록이 어긋납니다.
+#   chat   — 채팅 적립 전체(기본 · 시즌)에 곱함
+#   season — 시즌 포인트에만 곱함 (시즌 기간에만 효과)
+BOOST_TEXT = {
+    BOOST_CHAT: {"icon": "⚡", "name": "채널 부스트", "what": "포인트", "unit": "P"},
+    BOOST_SEASON: {"icon": "🏆", "name": "시즌 부스트", "what": "시즌 포인트", "unit": " 시즌 포인트"},
+}
+
 
 class SetChannelBoostModal(discord.ui.Modal):
-    def __init__(self, channel_id: int, channel_name: str):
-        title_str = f"⚡ #{channel_name[:20]} 부스트 설정"
-        super().__init__(title=title_str)
+    def __init__(self, channel_id: int, channel_name: str, kind: str = BOOST_CHAT):
+        t = BOOST_TEXT[kind]
+        title_str = f"{t['icon']} #{channel_name[:20]} {t['name']} 설정"
+        super().__init__(title=title_str[:45])
         self.channel_id = channel_id
         self.channel_name = channel_name
+        self.kind = kind
 
         self.multiplier_input = discord.ui.TextInput(
-            label="포인트 배율 (기본 1.0)",
+            label=f"{t['what']} 배율 (기본 1.0)",
             placeholder="예: 2 (2배 적립) 또는 3.5 (3.5배 적립)",
             default="2",
             required=True,
@@ -133,22 +146,24 @@ class SetChannelBoostModal(discord.ui.Modal):
             channel = interaction.guild.get_channel(self.channel_id)
             channel_mention = channel.mention if channel else f"<#{self.channel_id}>"
 
-            await set_channel_boost(interaction.guild.id, self.channel_id, mult, duration_seconds)
+            t = BOOST_TEXT[self.kind]
+            await set_channel_boost(interaction.guild.id, self.channel_id, mult, duration_seconds,
+                                    kind=self.kind)
 
             if mult == 1.0:
                 await add_activity_log(
                     interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-                    f"[{self.channel_name}] 채널 부스트 해제"
+                    f"[{self.channel_name}] {t['name']} 해제"
                 )
                 embed = discord.Embed(
-                    title="⚡ 채널 부스트 해제 완료",
-                    description=f"{channel_mention} 채널의 부스트가 해제(기본 10P 적립)되었습니다.",
+                    title=f"{t['icon']} {t['name']} 해제 완료",
+                    description=f"{channel_mention} 채널의 {t['name']}가 해제(기본 10{t['unit']} 적립)되었습니다.",
                     color=discord.Color.orange()
                 )
             else:
                 await add_activity_log(
                     interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-                    f"[{self.channel_name}] {mult:g}배 부스트 설정 ({time_str})"
+                    f"[{self.channel_name}] {mult:g}배 {t['name']} 설정 ({time_str})"
                 )
                 earned_pts = int(round(10 * mult))
                 ts_str = ""
@@ -156,19 +171,25 @@ class SetChannelBoostModal(discord.ui.Modal):
                     exp_ts = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
                     ts_str = f"\n⏱️ **종료 시각**: <t:{exp_ts}:R> (<t:{exp_ts}:t> 종료)"
 
+                note = ""
+                if self.kind == BOOST_SEASON and season_state(
+                        await get_season(interaction.guild.id)) != "active":
+                    # 시즌 밖에서 켜면 아무 효과가 없습니다 — 조용히 두면 '안 된다' 는 문의가 옵니다
+                    note = ("\n\n⚠️ **지금은 시즌 기간이 아닙니다.** 시즌 포인트가 쌓이지 않으므로 "
+                            "시즌이 시작돼야 효과가 납니다.")
                 embed = discord.Embed(
-                    title="⚡ 게릴라 채널 부스트 설정 완료!",
-                    description=f"🎉 {channel_mention} 채널에 **{mult:g}배** 포인트 부스트가 설정되었습니다!\n\n"
+                    title=f"{t['icon']} 게릴라 {t['name']} 설정 완료!",
+                    description=f"🎉 {channel_mention} 채널에 **{mult:g}배** {t['what']} 부스트가 설정되었습니다!\n\n"
                                 f"⏱️ **유지 시간**: {time_str}{ts_str}\n"
-                                f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다.",
+                                f"💬 채팅 10회 작성 시마다 **+{earned_pts}{t['unit']}**가 자동 적립됩니다.{note}",
                     color=discord.Color.green()
                 )
                 if channel:
                     try:
                         announce_embed = discord.Embed(
-                            title="⚡ [게릴라 이벤트] 포인트 부스트 시작!",
-                            description=f"🔥 이 채널에 **{mult:g}배** 포인트 부스트 이벤트가 시작되었습니다!\n"
-                                        f"💬 채팅 10회 작성 시마다 **+{earned_pts}P**가 자동 적립됩니다!\n"
+                            title=f"{t['icon']} [게릴라 이벤트] {t['what']} 부스트 시작!",
+                            description=f"🔥 이 채널에 **{mult:g}배** {t['what']} 부스트 이벤트가 시작되었습니다!\n"
+                                        f"💬 채팅 10회 작성 시마다 **+{earned_pts}{t['unit']}**가 자동 적립됩니다!\n"
                                         f"⏱️ **이벤트 기간**: {time_str}{ts_str}",
                             color=discord.Color.gold()
                         )
@@ -183,9 +204,10 @@ class SetChannelBoostModal(discord.ui.Modal):
 
 
 class SelectChannelForBoostSelect(discord.ui.ChannelSelect):
-    def __init__(self):
+    def __init__(self, kind: str = BOOST_CHAT):
+        self.kind = kind
         super().__init__(
-            placeholder="부스트를 설정할 채널을 선택하세요...",
+            placeholder=f"{BOOST_TEXT[kind]['name']}를 설정할 채널을 선택하세요...",
             channel_types=[discord.ChannelType.text]
         )
 
@@ -193,19 +215,21 @@ class SelectChannelForBoostSelect(discord.ui.ChannelSelect):
         selected_channel = self.values[0]
         modal = SetChannelBoostModal(
             channel_id=selected_channel.id,
-            channel_name=selected_channel.name
+            channel_name=selected_channel.name,
+            kind=self.kind
         )
         await interaction.response.send_modal(modal)
 
 
 class SelectChannelForBoostView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, kind: str = BOOST_CHAT):
         super().__init__(timeout=180)
-        self.add_item(SelectChannelForBoostSelect())
+        self.add_item(SelectChannelForBoostSelect(kind))
 
 
 class RemoveChannelBoostSelect(discord.ui.Select):
-    def __init__(self, active_boosts: list[dict], guild: discord.Guild):
+    def __init__(self, active_boosts: list[dict], guild: discord.Guild, kind: str = BOOST_CHAT):
+        self.kind = kind
         options = []
         for b in active_boosts:
             cid = int(b["channel_id"])
@@ -216,7 +240,7 @@ class RemoveChannelBoostSelect(discord.ui.Select):
                 discord.SelectOption(
                     label=f"#{ch_name} [{mult:g}배 부스트 중]",
                     value=str(cid),
-                    description="선택 시 즉시 부스트 이벤트 해제 (기본 10P 복구)",
+                    description=f"선택 시 즉시 부스트 이벤트 해제 (기본 10{BOOST_TEXT[kind]['unit']} 복구)"[:100],
                     emoji="❌"
                 )
             )
@@ -228,36 +252,39 @@ class RemoveChannelBoostSelect(discord.ui.Select):
         ch_mention = channel.mention if channel else f"<#{cid}>"
         ch_name = channel.name if channel else str(cid)
 
-        await set_channel_boost(interaction.guild.id, cid, 1.0, 0)
+        t = BOOST_TEXT[self.kind]
+        await set_channel_boost(interaction.guild.id, cid, 1.0, 0, kind=self.kind)
         await add_activity_log(
             interaction.guild.id, "admin", interaction.user.id, interaction.user.display_name,
-            f"[{ch_name}] 채널 부스트 해제"
+            f"[{ch_name}] {t['name']} 해제"
         )
         embed = discord.Embed(
-            title="❌ 채널 부스트 해제 완료",
-            description=f"{ch_mention} 채널의 부스트가 성공적으로 해제(기본 10P 복구)되었습니다.",
+            title=f"❌ {t['name']} 해제 완료",
+            description=f"{ch_mention} 채널의 {t['name']}가 성공적으로 해제(기본 10{t['unit']} 복구)되었습니다.",
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class RemoveChannelBoostView(discord.ui.View):
-    def __init__(self, active_boosts: list[dict], guild: discord.Guild):
+    def __init__(self, active_boosts: list[dict], guild: discord.Guild, kind: str = BOOST_CHAT):
         super().__init__(timeout=180)
-        self.add_item(RemoveChannelBoostSelect(active_boosts, guild))
+        self.add_item(RemoveChannelBoostSelect(active_boosts, guild, kind))
 
 
 class ChannelBoostSettingsSelect(discord.ui.Select):
-    def __init__(self, active_count: int):
+    def __init__(self, active_count: int, kind: str = BOOST_CHAT):
+        self.kind = kind
+        name = BOOST_TEXT[kind]["name"]
         options = [
             discord.SelectOption(
-                label="채널 부스트 설정 / 이벤트 시작",
+                label=f"{name} 설정 / 이벤트 시작",
                 value="set",
                 description="채널을 고르고 배율 및 기간을 입력하여 이벤트를 개최합니다.",
                 emoji="⚡"
             ),
             discord.SelectOption(
-                label="채널 부스트 해제",
+                label=f"{name} 해제",
                 value="remove",
                 description=f"현재 진행 중인 {active_count}개 부스트 중 선택 해제",
                 emoji="❌"
@@ -276,27 +303,27 @@ class ChannelBoostSettingsSelect(discord.ui.Select):
 
         if choice == "set":
             await interaction.response.send_message(
-                "⚡ **부스트를 적용할 채널을 아래에서 선택하세요.**",
-                view=SelectChannelForBoostView(),
+                f"{BOOST_TEXT[self.kind]['icon']} **부스트를 적용할 채널을 아래에서 선택하세요.**",
+                view=SelectChannelForBoostView(self.kind),
                 ephemeral=True
             )
 
         elif choice == "remove":
-            active_boosts = await get_all_active_boosts(interaction.guild.id)
+            active_boosts = await get_all_active_boosts(interaction.guild.id, kind=self.kind)
             if not active_boosts:
                 await interaction.response.send_message("⚠️ 현재 해제할 부스트 채널이 없습니다.", ephemeral=True)
                 return
             await interaction.response.send_message(
                 "❌ **부스트를 해제할 채널을 선택하세요.**",
-                view=RemoveChannelBoostView(active_boosts, interaction.guild),
+                view=RemoveChannelBoostView(active_boosts, interaction.guild, self.kind),
                 ephemeral=True
             )
 
         elif choice == "list":
-            active_boosts = await get_all_active_boosts(interaction.guild.id)
+            active_boosts = await get_all_active_boosts(interaction.guild.id, kind=self.kind)
             if not active_boosts:
                 embed = discord.Embed(
-                    title="⚡ 진행 중인 채널 부스트 현황",
+                    title=f"{BOOST_TEXT[self.kind]['icon']} 진행 중인 {BOOST_TEXT[self.kind]['name']} 현황",
                     description="현재 부스트 이벤트가 적용 중인 채널이 없습니다.",
                     color=discord.Color.gold()
                 )
@@ -328,7 +355,7 @@ class ChannelBoostSettingsSelect(discord.ui.Select):
                 lines.append(f"• {ch_str} — 🔥 **{mult:g}배** ({time_info})")
 
             embed = discord.Embed(
-                title="⚡ 진행 중인 게릴라 채널 부스트 목록",
+                title=f"{BOOST_TEXT[self.kind]['icon']} 진행 중인 게릴라 {BOOST_TEXT[self.kind]['name']} 목록",
                 description="\n\n".join(lines),
                 color=discord.Color.gold()
             )
@@ -336,9 +363,9 @@ class ChannelBoostSettingsSelect(discord.ui.Select):
 
 
 class ChannelBoostSettingsView(discord.ui.View):
-    def __init__(self, active_count: int):
+    def __init__(self, active_count: int, kind: str = BOOST_CHAT):
         super().__init__(timeout=180)
-        self.add_item(ChannelBoostSettingsSelect(active_count))
+        self.add_item(ChannelBoostSettingsSelect(active_count, kind))
 
 
 # ── Cog ───────────────────────────────────────────────────────────────
@@ -364,10 +391,11 @@ class ChatReward(commands.Cog):
                     channel = guild.get_channel(cid)
                     if channel:
                         try:
+                            t = BOOST_TEXT.get(boost_kind(b), BOOST_TEXT[BOOST_CHAT])
                             embed = discord.Embed(
-                                title="⚡ [게릴라 이벤트] 포인트 부스트 이벤트 종료!",
-                                description="🎉 준비된 게릴라 포인트 부스트 이벤트 시간이 완료되어 종료되었습니다!\n\n"
-                                            "💬 이제 채팅 10회당 기본 적립 보상(**+10P**)으로 정상 복구됩니다.",
+                                title=f"{t['icon']} [게릴라 이벤트] {t['what']} 부스트 이벤트 종료!",
+                                description=f"🎉 준비된 게릴라 {t['what']} 부스트 이벤트 시간이 완료되어 종료되었습니다!\n\n"
+                                            f"💬 이제 채팅 10회당 기본 적립 보상(**+10{t['unit']}**)으로 정상 복구됩니다.",
                                 color=discord.Color.orange()
                             )
                             await channel.send(embed=embed)
@@ -474,6 +502,28 @@ class ChatReward(commands.Cog):
         )
         view = ChannelBoostSettingsView(active_count)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(name="시즌부스트", description="[관리자 전용] 채널의 시즌 포인트 적립 배율 · 기간 · 해제를 관리합니다.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def season_boost_settings(self, interaction: discord.Interaction):
+        # DB 를 두 번 읽으므로 먼저 응답을 예약합니다(3초 제한)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        active_boosts = await get_all_active_boosts(interaction.guild.id, kind=BOOST_SEASON)
+        active = season_state(await get_season(interaction.guild.id)) == "active"
+        embed = discord.Embed(
+            title="🏆 게릴라 시즌 부스트 관리",
+            description=(f"🔥 **현재 시즌 부스트 채널**: **{len(active_boosts)}개**\n\n"
+                         "고른 채널에서 채팅으로 쌓이는 **시즌 포인트에만** 배율을 곱합니다.\n"
+                         "-# `/채널부스트` 와 같이 걸리면 두 배율이 곱해집니다.\n"
+                         + ("" if active else
+                            "\n⚠️ **지금은 시즌 기간이 아닙니다.** 설정은 되지만 시즌이 시작돼야 효과가 납니다.\n")
+                         + "\n아래 메뉴에서 원하시는 관리 기능을 선택해 주세요."),
+            color=discord.Color.gold())
+        await interaction.followup.send(embed=embed,
+                                        view=ChannelBoostSettingsView(len(active_boosts), BOOST_SEASON),
+                                        ephemeral=True)
 
 
 async def setup(bot):

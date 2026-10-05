@@ -382,6 +382,85 @@ async def main():
     await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
     ev._cache.clear()
 
+    print("\n=== 6-4. /시즌부스트 — 시즌 포인트에만 곱하는 채널 배율 ===")
+    import cogs.chat_reward as CR
+    await ev.save_season_only(GID, False)                  # 기본 · 시즌이 따로 보이게
+    ev._cache.clear()
+    await db.set_channel_boost(GID, 888, 3.0, 3600, kind=db.BOOST_SEASON)
+    note(await db.get_channel_boost(GID, 888, kind=db.BOOST_SEASON) == 3.0
+         and await db.get_channel_boost(GID, 888) == 1.0,
+         "시즌 부스트는 채널 부스트와 따로 저장")
+    u = 61
+    p0, s0 = await db.get_user_points(GID, u), await sp(u)
+    for _ in range(10):
+        await db.process_chat_message(GID, u, 888)
+    note(await db.get_user_points(GID, u) - p0 == 10 and await sp(u) - s0 == 30,
+         "**시즌 부스트 3배 채널: 기본 10 · 시즌 30**",
+         f"{await db.get_user_points(GID, u) - p0} / {await sp(u) - s0}")
+    await db.set_channel_boost(GID, 888, 2.0, 3600)            # 채널 부스트도 같이
+    p0, s0 = await db.get_user_points(GID, u), await sp(u)
+    for _ in range(10):
+        await db.process_chat_message(GID, u, 888)
+    note(await db.get_user_points(GID, u) - p0 == 20 and await sp(u) - s0 == 60,
+         "채널 부스트 2배와 겹치면 기본 20 · 시즌 60 (곱해짐)",
+         f"{await db.get_user_points(GID, u) - p0} / {await sp(u) - s0}")
+    chat_list = await db.get_all_active_boosts(GID)
+    season_list = await db.get_all_active_boosts(GID, kind=db.BOOST_SEASON)
+    note({b["channel_id"] for b in season_list} == {"888"}
+         and all(db.boost_kind(b) == "chat" for b in chat_list),
+         "/채널부스트 목록에 시즌 부스트가 섞이지 않음")
+    await db.set_channel_boost(GID, 888, 1.0, 0, kind=db.BOOST_SEASON)
+    note(await db.get_channel_boost(GID, 888, kind=db.BOOST_SEASON) == 1.0
+         and await db.get_channel_boost(GID, 888) == 2.0, "시즌 부스트만 해제 (채널 부스트는 그대로)")
+    await db.set_channel_boost(GID, 888, 1.0, 0)
+    await db.set_channel_boost(GID, 889, 2.0, 10, kind=db.BOOST_SEASON)
+    # 만료 정리는 종류를 남겨서 돌려줍니다 (종료 안내 문구가 달라야 합니다)
+    import datetime as _dt
+    real_now = db.datetime
+
+    class Later(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now.now(tz) + _dt.timedelta(seconds=60)
+    db.datetime = Later
+    try:
+        gone = await db.check_and_clear_expired_boosts()
+    finally:
+        db.datetime = real_now
+    note(any(db.boost_kind(b) == "season" and b["channel_id"] == "889" for b in gone),
+         "만료된 시즌 부스트는 kind=season 으로 돌려줌", str(gone))
+
+    rc = CR.ChatReward.__new__(CR.ChatReward)
+    it = Inter()
+    await CR.ChatReward.season_boost_settings.callback(rc, it)
+    sent = it.followup.sent[-1]
+    note(sent.get("ephemeral") and isinstance(sent.get("view"), CR.ChannelBoostSettingsView)
+         and sent["view"].children[0].kind == "season", "/시즌부스트: 관리 메뉴가 시즌 종류로 열림")
+    sel = sent["view"].children[0]
+    sel._values = ["set"]
+    it = Inter()
+    await sel.callback(it)
+    picker = it.response.sent[-1]["view"].children[0]
+    note(picker.kind == "season", "채널 고르기도 시즌 종류")
+    modal = CR.SetChannelBoostModal(890, "이벤트", kind=db.BOOST_SEASON)
+    modal.multiplier_input._value, modal.duration_input._value = "2", "30m"
+    it = Inter()
+    await modal.on_submit(it)
+    note(await db.get_channel_boost(GID, 890, kind=db.BOOST_SEASON) == 2.0
+         and await db.get_channel_boost(GID, 890) == 1.0
+         and "시즌 부스트" in it.response.sent[-1]["embed"].title,
+         "모달로 시즌 부스트 설정 → 시즌 쪽에만 저장")
+    sel._values = ["list"]
+    it = Inter()
+    await sel.callback(it)
+    note("시즌 부스트" in it.response.sent[-1]["embed"].title
+         and "890" in it.response.sent[-1]["embed"].description, "목록도 시즌 부스트만")
+    rm = CR.RemoveChannelBoostSelect(await db.get_all_active_boosts(GID, kind=db.BOOST_SEASON),
+                                     GUILD, db.BOOST_SEASON)
+    rm._values = ["890"]
+    await rm.callback(Inter())
+    note(await db.get_channel_boost(GID, 890, kind=db.BOOST_SEASON) == 1.0, "해제 메뉴로 시즌 부스트 해제")
+
     print("\n=== 7. 기간이 끝나면 소멸 · 기간을 고쳐도 유지 · 초기화 ===")
     keep = await sp(21)
     await ev.save_season(GID, "1시즌 (연장)", time.time() - 3600, time.time() + 7200)

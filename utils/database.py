@@ -463,8 +463,11 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
     # 채널 부스트 × 호박 보상 배율 (둘 다 캐시라 채팅마다 DB 를 읽지 않습니다).
     # 호박 배율은 시즌 중이면 시즌 포인트에만 붙습니다(multiplier_split).
     bm, sm = await multiplier_split(guild_id)
+    # /시즌부스트 — 시즌 포인트에만 곱합니다(채널 부스트와 곱해집니다)
+    season_boost = (await get_channel_boost(guild_id, channel_id, kind=BOOST_SEASON)
+                    if channel_id > 0 else 1.0)
     earned_points = max(1, int(round(10 * boost_mult * bm)))
-    season_points = max(1, int(round(10 * boost_mult * sm)))
+    season_points = max(1, int(round(10 * boost_mult * season_boost * sm)))
 
     if users_col is not None:
         try:
@@ -1379,12 +1382,28 @@ async def get_blacklist_users(guild_id: int) -> list[dict]:
 
 
 # ── Channel Boost Helper Functions ───────────────────────────────────
+#
+# 부스트는 두 종류입니다(2026-10-05 /시즌부스트 추가).
+#   chat   — /채널부스트. 채팅 적립 전체(기본 · 시즌)에 곱합니다. 키 = 채널 ID (예전 그대로)
+#   season — /시즌부스트. **시즌 포인트에만** 곱합니다.  키 = "season:<채널 ID>"
+# 같은 컬렉션에 두되 `kind` 로 가릅니다. 예전 문서에는 kind 가 없으므로 없으면 chat 입니다
+# — 목록 · 만료 정리에서 kind 를 안 보면 시즌 부스트가 채널 부스트로 섞여 보입니다.
+BOOST_CHAT, BOOST_SEASON = "chat", "season"
 
-async def get_channel_boost(guild_id: int, channel_id: int) -> float:
+
+def _boost_key(channel_id, kind: str = BOOST_CHAT) -> str:
+    return f"season:{channel_id}" if kind == BOOST_SEASON else str(channel_id)
+
+
+def boost_kind(doc: dict) -> str:
+    return doc.get("kind") or BOOST_CHAT
+
+
+async def get_channel_boost(guild_id: int, channel_id: int, kind: str = BOOST_CHAT) -> float:
     """채널의 현재 부스트 배율 반환 (없거나 만료되었으면 1.0)"""
     if not channel_id:
         return 1.0
-    str_cid = str(channel_id)
+    str_cid = _boost_key(channel_id, kind)
     now = datetime.now(timezone.utc)
 
     # 이것도 메시지마다 호출됩니다. 설정 변경 시 무효화하므로 안전합니다.
@@ -1418,7 +1437,7 @@ async def get_channel_boost(guild_id: int, channel_id: int) -> float:
         try:
             exp_time = datetime.fromisoformat(exp_str)
             if now > exp_time:
-                await set_channel_boost(guild_id, channel_id, 1.0, 0)
+                await set_channel_boost(guild_id, channel_id, 1.0, 0, kind=kind)
                 return 1.0
         except Exception:
             pass
@@ -1426,8 +1445,9 @@ async def get_channel_boost(guild_id: int, channel_id: int) -> float:
     return float(boost_info.get("multiplier", 1.0))
 
 
-async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, duration_seconds: int = 0) -> None:
-    str_cid = str(channel_id)
+async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float,
+                            duration_seconds: int = 0, kind: str = BOOST_CHAT) -> None:
+    str_cid = _boost_key(channel_id, kind)
     str_gid = str(guild_id)
     _boost_cache.pop(str_cid)          # 캐시 무효화 — 설정이 즉시 반영됩니다
 
@@ -1439,7 +1459,8 @@ async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, d
     data_doc = {
         "_id": str_cid,
         "guild_id": str_gid,
-        "channel_id": str_cid,
+        "channel_id": str(channel_id),
+        "kind": kind,
         "multiplier": multiplier,
         "expires_at": expires_at
     }
@@ -1471,7 +1492,7 @@ async def set_channel_boost(guild_id: int, channel_id: int, multiplier: float, d
             json.dump(all_b, f, ensure_ascii=False, indent=2)
 
 
-async def get_all_active_boosts(guild_id: int) -> list[dict]:
+async def get_all_active_boosts(guild_id: int, kind: str = BOOST_CHAT) -> list[dict]:
     str_gid = str(guild_id)
     now = datetime.now(timezone.utc)
     active = []
@@ -1494,6 +1515,8 @@ async def get_all_active_boosts(guild_id: int) -> list[dict]:
                     pass
 
     for b in raw_boosts:
+        if boost_kind(b) != kind:
+            continue
         exp_str = b.get("expires_at")
         if exp_str:
             try:

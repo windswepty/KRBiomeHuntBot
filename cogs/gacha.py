@@ -13,6 +13,7 @@ from utils.database import (
 )
 from utils.event_db import (
     get_season, season_state, spend_season_points, add_season_points, get_season_points,
+    base_points_paused,
 )
 
 # 낼 포인트. 시즌 포인트는 시즌 기간에만(utils/event_db.py).
@@ -151,16 +152,24 @@ async def perform_rolls(guild, member, settings: dict, count: int,
     refund = (total_price - (total_price * filled) // count) if filled < count else 0
     reward_points = sum(int(r.get("reward_points", 0) or 0) for r in results)
 
+    # 시즌 중 '시즌 포인트로만' 이면 **경품 포인트도 시즌 포인트로** 줍니다(얻는 포인트라서).
+    # 환불은 낸 것을 돌려주는 것이라 **낸 포인트 그대로**입니다.
+    prize_to_season = bool(reward_points) and await base_points_paused(guild.id)
+    if prize_to_season:
+        await add_season_points(guild.id, member.id, reward_points, only_active=False)
+    base_prize = 0 if prize_to_season else reward_points
+
     if currency == SEASON:
         # 환불은 시즌이 방금 끝났어도 돌려줍니다(only_active=False)
         if refund:
             await add_season_points(guild.id, member.id, refund, only_active=False)
-        season_balance = remaining + refund
-        balance = (await add_user_points(guild.id, member.id, reward_points)
-                   if reward_points else await get_user_points(guild.id, member.id))
+        season_balance = remaining + refund + (reward_points if prize_to_season else 0)
+        balance = (await add_user_points(guild.id, member.id, base_prize)
+                   if base_prize else await get_user_points(guild.id, member.id))
     else:
-        season_balance = None
-        credit = reward_points + refund
+        season_balance = (await get_season_points(guild.id, member.id)
+                          if prize_to_season else None)
+        credit = base_prize + refund
         balance = (await add_user_points(guild.id, member.id, credit)
                    if credit else remaining)
 
@@ -199,6 +208,7 @@ async def perform_rolls(guild, member, settings: dict, count: int,
         "spent": total_price - refund,
         "refund": refund,
         "reward_points": reward_points,
+        "prize_to_season": prize_to_season,
         "balance": balance,
         "season_balance": season_balance,
         "currency": currency,
@@ -379,8 +389,12 @@ class GachaPlayView(discord.ui.View):
             lines.append(f"↩️ **환불**: +{outcome['refund']:,} {unit} "
                          f"({count - filled}회분 — 재고가 부족했습니다)")
         if outcome["reward_points"]:
-            lines.append(f"🎁 **포인트 보상**: +{outcome['reward_points']:,} P")
-        if season:
+            if outcome.get("prize_to_season"):
+                lines.append(f"🎁 **포인트 보상**: 🏆 시즌 포인트 +{outcome['reward_points']:,} "
+                             "(시즌 중에는 시즌 포인트로 받습니다)")
+            else:
+                lines.append(f"🎁 **포인트 보상**: +{outcome['reward_points']:,} P")
+        if season or outcome.get("season_balance") is not None:
             lines.append(f"🏆 **남은 시즌 포인트**: **{outcome['season_balance']:,}**")
         lines.append(f"💰 **현재 총 보유 포인트**: **{outcome['balance']:,} P**")
 

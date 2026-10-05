@@ -114,7 +114,7 @@ class QuestView(discord.ui.View):
                         button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         total, names, roles_given, role_failed = 0, [], [], []
-        season_total, mult = 0, 1.0
+        season_total, mult, paused, season_mult = 0, 1.0, False, False
         for c in self.claimable:
             # claim_quest 가 '아직 안 받음'을 서버 측에서 판정합니다.
             # 연타해도 두 번 지급되지 않습니다.
@@ -128,6 +128,8 @@ class QuestView(discord.ui.View):
             total += int(paid.get("paid", c.get("points", 0)) or 0)
             season_total += int(paid.get("season", 0) or 0)
             mult = max(mult, float(paid.get("mult", 1.0) or 1.0))
+            paused = paused or bool(paid.get("paused"))
+            season_mult = season_mult or bool(paid.get("mult_season_only"))
             names.append(c["name"])
 
             # 역할 보상. 포인트 지급은 이미 끝났으므로, 역할이 실패해도
@@ -155,10 +157,17 @@ class QuestView(discord.ui.View):
             return
 
         total_points = await get_user_points(interaction.guild.id, interaction.user.id)
-        desc = f"**+{total:,} P** 를 획득하셨습니다!" if total else "보상을 받았습니다!"
+        if paused:
+            # 시즌 중 '시즌 포인트로만' — 기본 포인트는 안 들어갔으므로 P 로 적지 않습니다
+            desc = (f"🏆 시즌 포인트 **+{season_total:,}** 를 획득하셨습니다!\n"
+                    "-# 시즌 중에는 기본 포인트 대신 시즌 포인트로만 쌓입니다"
+                    if season_total else "보상을 받았습니다!")
+        else:
+            desc = f"**+{total:,} P** 를 획득하셨습니다!" if total else "보상을 받았습니다!"
         if mult > 1:
-            desc += f"\n🎃 호박 보상으로 **{mult:g}배** 적용"
-        if season_total:
+            target = "시즌 포인트 " if season_mult else ""
+            desc += f"\n🎃 호박 보상으로 **{target}{mult:g}배** 적용"
+        if season_total and not paused:
             desc += f"\n🏆 시즌 포인트 **+{season_total:,}**"
         embed = discord.Embed(title="🎁 퀘스트 보상 수령", description=desc,
                               color=discord.Color.green())

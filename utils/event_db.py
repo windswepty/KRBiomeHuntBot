@@ -412,6 +412,25 @@ async def point_multiplier(guild_id: int) -> float:
     return 1.0
 
 
+async def multiplier_split(guild_id: int) -> tuple[float, float]:
+    """호박 배율을 (기본 포인트에 곱할 것, 시즌 포인트에 곱할 것) 으로 나눕니다.
+
+    요청(2026-10-05): **호박이 깨진 뒤의 2배는 시즌 포인트로.** 시즌이 진행 중이면
+    기본 포인트는 1배, 시즌 포인트만 2배입니다(퀘스트 100 → 기본 100 · 시즌 200).
+    시즌이 아니면 시즌 포인트가 없으니 예전처럼 기본 포인트가 2배입니다 — 그러지
+    않으면 시즌 밖에서 호박을 깬 보상이 통째로 사라집니다.
+    """
+    mult = await point_multiplier(guild_id)
+    if mult <= 1.0:
+        return 1.0, 1.0
+    try:
+        active = season_state(await get_season(guild_id)) == "active"
+    except Exception as e:
+        print(f"[EventDB] 시즌 확인 실패(기본 포인트에 배율): {type(e).__name__}: {e}", flush=True)
+        active = False
+    return (1.0, mult) if active else (mult, mult)
+
+
 def apply_multiplier(amount: int, mult: float) -> int:
     """배율 적용. 반올림 — 내림이면 10P × 1.5 같은 경우 유저가 손해를 봅니다."""
     if amount <= 0 or mult == 1.0:
@@ -421,7 +440,11 @@ def apply_multiplier(amount: int, mult: float) -> int:
 
 # ── 시즌 포인트 ───────────────────────────────────────────────────────
 
-DEFAULT_SEASON = {"name": "시즌", "start": None, "end": None, "season_id": None}
+DEFAULT_SEASON = {"name": "시즌", "start": None, "end": None, "season_id": None,
+                  # True 면 시즌 중에는 기본 포인트 없이 시즌 포인트로만 쌓입니다.
+                  # 기본값이 켜짐인 것은 요청(2026-10-05: "시즌 기간에는 모든 획득 포인트를
+                  # 시즌 포인트로") 이고, /시즌설정 의 적립 방식 버튼으로 끌 수 있습니다.
+                  "season_only": True}
 
 
 async def get_season(guild_id: int, fresh: bool = False) -> dict:
@@ -646,14 +669,40 @@ async def season_stats(guild_id: int) -> dict:
     return {"users": len(mine), "total": sum(int(r.get("points", 0)) for r in mine)}
 
 
-async def credit_earned(guild_id: int, user_id: int, base_points: int) -> int:
+async def save_season_only(guild_id: int, on: bool) -> None:
+    """'시즌 중에는 시즌 포인트로만 적립' 켜기 · 끄기. 기간 · 모은 포인트는 그대로."""
+    await _save_season_doc(guild_id, {"season_only": bool(on)})
+
+
+async def base_points_paused(guild_id: int) -> bool:
+    """지금 **기본 포인트를 주지 않고 시즌 포인트로만** 쌓는가.
+
+    '시즌 포인트로만' 이 켜져 있고 **시즌이 진행 중일 때만** True 입니다 —
+    시작 전 · 끝난 뒤에는 저절로 예전처럼 기본 포인트가 들어옵니다(시즌이
+    끝났는데 아무것도 안 들어오면 안 됩니다). 읽기에 실패해도 False 입니다
+    — 확인을 못 했다고 사람들의 적립을 멈추지 않습니다.
+    """
+    try:
+        s = await get_season(guild_id)
+        return bool(s.get("season_only")) and season_state(s) == "active"
+    except Exception as e:
+        print(f"[EventDB] 시즌 전용 적립 확인 실패: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+async def credit_earned(guild_id: int, user_id: int, base_points: int,
+                        paused: bool = False) -> int:
     """'벌어서 받은' 포인트가 들어간 **뒤에** 부릅니다 — 같은 양을 시즌 포인트로.
 
     실패해도 예외를 올리지 않습니다. 시즌 적립이 터져서 출석·채팅 같은 본래
     지급이 실패한 것처럼 보이면 안 됩니다(본 지급은 이미 끝났습니다).
+
+    `paused` 는 기본 포인트를 **이미 건너뛴** 경우입니다. 그 판정과 적립 사이에
+    시즌이 끝나도 시즌 포인트는 넣습니다 — 안 넣으면 둘 다 못 받습니다.
     """
     try:
-        return await add_season_points(guild_id, user_id, base_points)
+        return await add_season_points(guild_id, user_id, base_points,
+                                       only_active=not paused)
     except Exception as e:
         print(f"[EventDB] 시즌 적립 실패: {type(e).__name__}: {e}", flush=True)
         return 0

@@ -69,13 +69,19 @@ async def main():
     await db.claim_quest(GID, 11, "q:before", 100, out=out)
     note(out.get("season") == 0 and out.get("paid") == 100, "시작 전 퀘스트: 기본 100 · 시즌 0")
 
-    print("\n=== 3. 기간 안에서는 버는 만큼 같이 쌓임 ===")
+    print("\n=== 3. 기간 안에서는 버는 만큼 같이 쌓임 ('둘 다' 방식) ===")
     await set_period(-3600, 3600)
     note(ev.season_state(await ev.get_season(GID)) == "active", "진행 중")
+    note((await ev.get_season(GID, fresh=True)).get("season_only") is True,
+         "**기본값은 '시즌 포인트로만'** (2026-10-05: 시즌 중엔 모든 획득 포인트를 시즌으로)")
+    await ev.save_season_only(GID, False)          # 이 절은 '둘 다' 방식을 봅니다
+    ev._cache.clear()
     uid = 21
     out = {}
     await db.claim_quest(GID, uid, "q:1", 100, out=out)
-    note(out == {"paid": 100, "mult": 1.0, "season": 100}, "**퀘스트 100 → 기본 100 + 시즌 100**", str(out))
+    note(out == {"paid": 100, "mult": 1.0, "season": 100, "paused": False,
+                 "mult_season_only": False},
+         "**퀘스트 100 → 기본 100 + 시즌 100**", str(out))
     r = await db.checkin_user(GID, uid)
     note(r["season"] == r["gained"] and r["gained"] > 0, "출석도 받은 만큼 시즌으로", str(r["gained"]))
     for _ in range(10):
@@ -94,10 +100,82 @@ async def main():
     ev._cache.clear()
     out = {}
     await db.claim_quest(GID, uid, "q:2x", 100, out=out)
-    note(out.get("paid") == 200 and out.get("season") == 200, "호박 2배 중이면 시즌 포인트도 2배",
-         str(out))
+    note(out.get("paid") == 100 and out.get("season") == 200 and out.get("mult_season_only"),
+         "**호박 2배는 시즌 포인트에만** (기본 100 · 시즌 200, 2026-10-05 요청)", str(out))
+    r_c = await db.checkin_user(GID, 22)
+    note(r_c["season"] == 2 * r_c["gained"] and r_c["mult_season_only"],
+         "출석도 시즌만 2배", f"{r_c['gained']} / {r_c['season']}")
+    before = await sp(uid)
+    p_before = await db.get_user_points(GID, uid)
+    for _ in range(10):
+        await db.process_chat_message(GID, uid, 0)
+    note(await sp(uid) - before == 20 and await db.get_user_points(GID, uid) - p_before == 10,
+         "채팅도 기본 10 · 시즌 20")
+    await ev.save_season_only(GID, True)
+    ev._cache.clear()
+    out = {}
+    await db.claim_quest(GID, uid, "q:2x-only", 100, out=out)
+    note(out.get("paused") and out.get("season") == 200,
+         "'시즌 포인트로만' + 호박 → 시즌 200 (기본 0)", str(out))
+    s_now = await ev.get_season(GID, fresh=True)
+    await set_period(-7200, -60)
+    out = {}
+    await db.claim_quest(GID, uid, "q:2x-off", 100, out=out)
+    note(out.get("paid") == 200 and out.get("season") == 0,
+         "시즌이 아니면 호박 2배는 기본 포인트에 (보상이 사라지지 않게)", str(out))
+    await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
+    await ev.save_season_only(GID, False)
     await ev.save_pumpkin(GID, {"boost_until": None})
     ev._cache.clear()
+
+    print("\n=== 3-2. '시즌 포인트로만' — 시즌 중 기본 포인트는 안 들어옴 (2026-10-05 요청) ===")
+    for label, users in (("JSON", None), ("Mongo", FM.FakeCollection("users"))):
+        saved_users, saved_after = db.users_col, getattr(db, "_AFTER", None)
+        if users is not None:
+            db.users_col, db._AFTER = users, FM.AFTER
+        try:
+            await ev.save_season_only(GID, True)
+            ev._cache.clear()
+            note(await ev.base_points_paused(GID), f"[{label}] 켜고 시즌 중이면 멈춤")
+            u = 141 if users is None else 142
+            await db.add_user_points(GID, u, 500)          # 이미 가진 기본 포인트
+            p0, s0 = await db.get_user_points(GID, u), await sp(u)
+            out = {}
+            await db.claim_quest(GID, u, "q:only", 100, out=out)
+            note(out.get("paused") is True and out.get("season") == 100,
+                 f"[{label}] 퀘스트 → 시즌 100", str(out))
+            r = await db.checkin_user(GID, u)
+            note(r["ok"] and r["paused"] and r["season"] == r["gained"] > 0,
+                 f"[{label}] 출석 → 시즌으로만", str(r))
+            r2 = await db.checkin_user(GID, u)
+            note(not r2["ok"], f"[{label}] **출석 연타 방지는 그대로** (기본 0 이어도 오늘 출석으로 기록)")
+            for _ in range(10):
+                await db.process_chat_message(GID, u, 0)
+            note(await db.get_user_points(GID, u) == p0,
+                 f"[{label}] **기본 포인트는 하나도 안 늘어남** (퀘스트 · 출석 · 채팅)",
+                 f"{p0} → {await db.get_user_points(GID, u)}")
+            note(await sp(u) - s0 == 100 + r["gained"] + 10, f"[{label}] 전부 시즌으로",
+                 str(await sp(u) - s0))
+            note(await db.get_user_points(GID, u) == 500, f"[{label}] 이미 가진 500 은 그대로")
+
+            # 시즌이 끝나면 저절로 기본 포인트로 돌아갑니다
+            s_now = await ev.get_season(GID, fresh=True)
+            await set_period(-7200, -60)
+            note(not await ev.base_points_paused(GID), f"[{label}] 시즌이 끝나면 멈춤 풀림")
+            out = {}
+            await db.claim_quest(GID, u, "q:after-only", 100, out=out)
+            note(out.get("paused") is False and await db.get_user_points(GID, u) == 600,
+                 f"[{label}] 끝난 뒤 퀘스트 → 기본 100 다시 들어옴", str(out))
+            await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
+            await ev.save_season_only(GID, False)
+            ev._cache.clear()
+            note(not await ev.base_points_paused(GID), f"[{label}] 끄면 둘 다 쌓이는 방식으로")
+        finally:
+            db.users_col = saved_users
+            if users is not None:
+                db._AFTER = saved_after
+    note(ev.season_state(await ev.get_season(GID, fresh=True)) == "active"
+         and not (await ev.get_season(GID)).get("season_only"), "기간 · 설정 원상복구")
 
     print("\n=== 4. 2:1 교환 ===")
     cog = S.Season(None)
@@ -149,6 +227,19 @@ async def main():
     note(res["filled"] == 2 and res["refund"] == 800 and await sp(43) == 800,
          "**품절 환불은 시즌 포인트로 돌려받음**", f"{res['filled']} · {await sp(43)}")
     await db.set_gacha_item_stock(GID, 1, -1)
+    gs = await db.get_gacha_settings(GID)
+
+    # '시즌 포인트로만' 이면 경품 포인트도 시즌으로 (모든 획득 포인트)
+    await ev.save_season_only(GID, True)
+    ev._cache.clear()
+    await db.add_user_points(GID, 44, 300)
+    s44 = await sp(44)
+    res = await G.perform_rolls(GUILD, Member(44, "경품", False, guild=GUILD), gs, 1, 100)
+    note(res["prize_to_season"] and await sp(44) - s44 == 7 and await db.get_user_points(GID, 44) == 200,
+         "**시즌 중 경품 포인트 7 → 시즌 포인트로** (기본은 100 만 빠짐)",
+         f"{await db.get_user_points(GID, 44)} / {await sp(44)}")
+    await ev.save_season_only(GID, False)
+    ev._cache.clear()
 
     v = G.GachaPlayView(settings=gs, season_active=False)
     ids = {c.custom_id for c in v.children}
@@ -246,6 +337,23 @@ async def main():
     it = Inter()
     await m.on_submit(it)
     note(it.response.sent and "적어 주세요" in it.response.sent[0]["content"], "못 읽는 시각은 거절")
+
+    print("\n=== 9. 적립 방식 버튼 ===")
+    await ev.save_season_only(GID, False)
+    s = await ev.get_season(GID, fresh=True)
+    v = S.AdminView(cog, s)
+    note("둘 다" in v.only.label, "꺼져 있으면 '둘 다'", v.only.label)
+    it = Inter(admin=False)
+    await v.only.callback(it)
+    note(not (await ev.get_season(GID, fresh=True)).get("season_only"), "관리자가 아니면 못 바꿈")
+    it = Inter()
+    await v.only.callback(it)
+    s = await ev.get_season(GID, fresh=True)
+    note(s.get("season_only") is True, "누르면 '시즌 포인트로만' 으로")
+    emb = S.build_admin_embed(s, await ev.season_stats(GID))
+    note(any("시즌 포인트로만" in f.value for f in emb.fields if f.name == "적립 방식"),
+         "설정 화면에 적립 방식 표시")
+    note("시즌 포인트로만" in S.AdminView(cog, s).only.label, "버튼 글자도 바뀜")
 
 
 asyncio.run(main())

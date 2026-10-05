@@ -23,7 +23,7 @@ from discord.ext import commands
 from utils.database import deduct_user_points, add_user_points, get_user_points, add_activity_log
 from utils.event_db import (
     get_season, save_season, reset_season, season_state, get_season_points,
-    add_season_points, season_top, season_stats, KST,
+    add_season_points, season_top, season_stats, KST, save_season_only,
 )
 
 EXCHANGE_RATE = 2           # 기본 2 → 시즌 1
@@ -85,13 +85,24 @@ def build_admin_embed(s: dict, stats: dict) -> discord.Embed:
     state = season_state(s)
     embed = discord.Embed(title="🏆 시즌 포인트 설정",
                           color=discord.Color.gold() if state == "active" else discord.Color.greyple())
+    only = bool(s.get("season_only"))
+    head = ("기간 안에는 **기본 포인트 대신 시즌 포인트로만** 쌓입니다."
+            if only else "기간 안에 **버는 포인트와 같은 양**이 시즌 포인트로도 쌓입니다.")
     embed.description = (
-        "기간 안에 **버는 포인트와 같은 양**이 시즌 포인트로도 쌓입니다.\n"
+        f"{head}\n"
         "-# 채팅 · 출석 · 퀘스트 · 호박 2배 · 채널 부스트 전부 그대로 따라갑니다. "
         "관리자 지급 · 환불은 쌓이지 않습니다.\n"
         f"-# 기본 포인트 **{EXCHANGE_RATE} → 시즌 1** 교환은 `/시즌교환`, 기간이 끝나면 **소멸**합니다.")
     embed.add_field(name="이름", value=s.get("name") or "시즌", inline=True)
     embed.add_field(name="상태", value=STATE_LABEL[state], inline=True)
+    embed.add_field(
+        name="적립 방식",
+        value=("🏆 **시즌 포인트로만** — 시즌 중에는 기본 포인트가 안 들어옵니다\n"
+               "-# 시즌이 끝나면 저절로 기본 포인트 적립으로 돌아갑니다. 이미 가진 기본 "
+               "포인트는 그대로 쓸 수 있습니다."
+               if only else
+               "💰🏆 **둘 다** — 기본 포인트와 시즌 포인트가 같이 쌓입니다"),
+        inline=False)
     embed.add_field(name="기간 (KST)", value=season_period_text(s), inline=False)
     embed.add_field(name="이번 시즌", value=f"**{stats.get('users', 0):,}명** · 총 "
                                              f"**{stats.get('total', 0):,}** 시즌 포인트", inline=False)
@@ -159,11 +170,34 @@ class AdminView(discord.ui.View):
     def __init__(self, cog, s: dict):
         super().__init__(timeout=600)
         self.cog, self.s = cog, s
+        if s.get("season_only"):
+            self.only.label = "적립: 시즌 포인트로만"
+            self.only.style = discord.ButtonStyle.success
+        else:
+            self.only.label = "적립: 기본 + 시즌 둘 다"
 
     @discord.ui.button(label="기간 · 이름", emoji="📅", style=discord.ButtonStyle.primary)
     async def period(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await _admin(interaction):
             await interaction.response.send_modal(PeriodModal(self.cog, self.s))
+
+    @discord.ui.button(label="적립 방식", emoji="🏆", style=discord.ButtonStyle.secondary)
+    async def only(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """시즌 중 기본 포인트를 끌지(시즌 포인트로만) 켤지(둘 다) 바꿉니다."""
+        if not await _admin(interaction):
+            return
+        await interaction.response.defer()
+        # 화면에 그려진 값이 아니라 **지금 저장된 값**을 뒤집습니다(다른 관리자가 바꿨을 수 있습니다)
+        cur = await get_season(interaction.guild.id, fresh=True)
+        on = not bool(cur.get("season_only"))
+        await save_season_only(interaction.guild.id, on)
+        try:
+            await add_activity_log(interaction.guild.id, "admin", interaction.user.id,
+                                   interaction.user.display_name,
+                                   "시즌 적립 방식: " + ("시즌 포인트로만" if on else "기본 + 시즌"))
+        except Exception as e:
+            print(f"[Season] 활동 기록 실패: {type(e).__name__}: {e}", flush=True)
+        await self.cog.refresh_admin(interaction)
 
     @discord.ui.button(label="시즌 포인트 초기화", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -217,8 +251,10 @@ class Season(commands.Cog):
             top = await season_top(gid, 10)
             embed.description = (f"내 시즌 포인트 **{mine:,}**\n"
                                  f"⏳ <t:{int(float(s['end']))}:R> 끝나면 소멸합니다\n"
-                                 f"-# 채팅 · 출석 · 퀘스트로 버는 만큼 쌓입니다 · "
-                                 f"`/시즌교환` 으로 기본 {EXCHANGE_RATE} → 시즌 1")
+                                 + ("-# 시즌 중에는 기본 포인트 대신 **시즌 포인트로만** 쌓입니다 · "
+                                    if s.get("season_only") else
+                                    "-# 채팅 · 출석 · 퀘스트로 버는 만큼 쌓입니다 · ")
+                                 + f"`/시즌교환` 으로 기본 {EXCHANGE_RATE} → 시즌 1")
             if top:
                 medals = ["🥇", "🥈", "🥉"]
                 lines = [f"{medals[i] if i < 3 else f'`{i + 1}.`'} <@{r['user_id']}> — "

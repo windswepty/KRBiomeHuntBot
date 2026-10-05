@@ -6,6 +6,8 @@
   · 서버에 들어온 지 **24시간** 지난 계정만 (부계정으로 몰아 치기 방지)
   · 체력 1,500만 · 기본 1,000 데미지 · **20% 확률로 2,000**
   · 깨지면 **7일간 받는 포인트 2배** — 채팅 · 출석 · 퀘스트 전부
+    (2026-10-05: 시즌 중에는 **시즌 포인트만** 2배, 시즌이 아니면 기본 포인트 2배
+     — utils/event_db.multiplier_split)
     (utils/database.py 의 세 경로가 point_multiplier 를 곱합니다)
 
 수치는 전부 /호박설정 에서 바꿉니다. 그림은 /호박이미지 로 올리고 DB 에 둡니다
@@ -60,6 +62,11 @@ def image_name(p: dict) -> str:
     return f"pumpkin.{ext if ext in ('png', 'jpg', 'jpeg', 'gif', 'webp') else 'png'}"
 
 
+# 배율이 어디에 붙는지 — 시즌 중이면 시즌 포인트에만, 아니면 기본 포인트에.
+# 패널은 시즌 상태를 모른 채 그려지므로(5분마다 갱신) 두 경우를 함께 적습니다.
+OFF_SEASON_NOTE = "시즌 기간이 아니면 기본 포인트에 대신 적용"
+
+
 def build_pumpkin_embed(p: dict, today_hits: int = 0, now: float | None = None,
                         with_image: bool = False) -> discord.Embed:
     hp, hp_max = max(0, int(p["hp"])), int(p["hp_max"])
@@ -71,8 +78,8 @@ def build_pumpkin_embed(p: dict, today_hits: int = 0, now: float | None = None,
         lines = ["💥 **호박이 깨졌습니다!**" + (f" — 마지막 한 방 <@{by}>" if by else "")]
         if boost_active(p, now):
             until = int(float(p["boost_until"]))
-            lines.append(f"🔥 **모든 포인트 {float(p['boost_mult']):g}배** — <t:{until}:f> 까지 "
-                         f"(<t:{until}:R>)\n-# 채팅 · 출석 · 퀘스트 전부")
+            lines.append(f"🔥 **받는 시즌 포인트 {float(p['boost_mult']):g}배** — <t:{until}:f> 까지 "
+                         f"(<t:{until}:R>)\n-# 채팅 · 출석 · 퀘스트 전부 · {OFF_SEASON_NOTE}")
         elif p.get("boost_until"):
             lines.append("-# 포인트 배율 기간은 끝났습니다.")
         embed.description = "\n".join(lines)
@@ -81,8 +88,8 @@ def build_pumpkin_embed(p: dict, today_hits: int = 0, now: float | None = None,
             f"❤️ **{hp:,} / {hp_max:,}**\n{hp_bar(hp, hp_max)}\n\n"
             f"🔨 하루 한 번 · 기본 **{int(p['damage']):,}** "
             f"(**{int(p['crit_percent'])}%** 확률로 **{int(p['crit_damage']):,}**)\n"
-            f"🎁 깨지면 **{int(p['boost_days'])}일간 받는 포인트 {float(p['boost_mult']):g}배** "
-            "(채팅 · 출석 · 퀘스트 전부)")
+            f"🎁 깨지면 **{int(p['boost_days'])}일간 받는 시즌 포인트 {float(p['boost_mult']):g}배** "
+            f"(채팅 · 출석 · 퀘스트 전부)\n-# {OFF_SEASON_NOTE}")
         if boost_active(p, now):
             until = int(float(p["boost_until"]))
             embed.description += f"\n🔥 지난 호박 보상 진행 중 — <t:{until}:f> 까지"
@@ -176,9 +183,10 @@ async def announce_broken(guild, member, res: dict) -> None:
         return
     until = res.get("boost_until") or p.get("boost_until")
     text = (f"🎉 {member.mention} 님이 호박을 깼습니다!\n"
-            f"🔥 지금부터 **{int(p['boost_days'])}일간 받는 포인트 {float(p['boost_mult']):g}배** "
+            f"🔥 지금부터 **{int(p['boost_days'])}일간 받는 시즌 포인트 {float(p['boost_mult']):g}배** "
             f"(채팅 · 출석 · 퀘스트 전부)"
-            + (f" — <t:{int(float(until))}:f> 까지" if until else ""))
+            + (f" — <t:{int(float(until))}:f> 까지" if until else "")
+            + f"\n-# {OFF_SEASON_NOTE}")
     try:
         await channel.send(content=text, allowed_mentions=discord.AllowedMentions(
             everyone=False, roles=False, users=[member]))

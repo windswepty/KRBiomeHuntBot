@@ -466,16 +466,24 @@ class CheckIn(commands.Cog):
         if result["ok"]:
             # 어떻게 이 숫자가 나왔는지 그대로 보여줍니다. 연속이 이득이라는
             # 걸 눈으로 봐야 다음 날 또 오게 됩니다.
-            parts = [f"기본 **{result['base']} P**"]
+            # 시즌 중 '시즌 포인트로만' 이면 기본 포인트는 안 들어왔습니다 — P 로 적으면 거짓말입니다
+            paused = bool(result.get("paused"))
+            unit = " 🏆" if paused else " P"
+            parts = [f"기본 **{result['base']}{unit}**"]
             if result["bonus"]:
-                parts.append(f"🔥 {streak}일 연속 달성 **+{result['bonus']:,} P**")
+                parts.append(f"🔥 {streak}일 연속 달성 **+{result['bonus']:,}{unit}**")
             if result["milestone"]:
-                parts.append(f"🎉 특별 보상 **+{result['milestone']:,} P**")
+                parts.append(f"🎉 특별 보상 **+{result['milestone']:,}{unit}**")
 
-            desc = f"오늘 출석으로 **+{result['gained']:,} P** 를 획득하셨습니다!"
+            if paused:
+                desc = (f"오늘 출석으로 🏆 시즌 포인트 **+{result.get('season', 0):,}** 를 "
+                        "획득하셨습니다!\n-# 시즌 중에는 기본 포인트 대신 시즌 포인트로만 쌓입니다")
+            else:
+                desc = f"오늘 출석으로 **+{result['gained']:,} P** 를 획득하셨습니다!"
             if result.get("mult", 1.0) > 1:
-                desc += f"\n🎃 호박 보상으로 **{result['mult']:g}배** 적용"
-            if result.get("season"):
+                target = "시즌 포인트 " if result.get("mult_season_only") else ""
+                desc += f"\n🎃 호박 보상으로 **{target}{result['mult']:g}배** 적용"
+            if result.get("season") and not paused:
                 desc += f"\n🏆 시즌 포인트 **+{result['season']:,}**"
             embed = discord.Embed(
                 title="✅ 출석체크 완료!",

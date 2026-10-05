@@ -31,7 +31,8 @@ KST = timezone(timedelta(hours=9))
 # 퀘스트)에만 겁니다 — 관리자 지급 · 환불 · 뽑기 경품은 그대로입니다(환불이
 # 2배가 되거나 뽑기로 포인트를 불리면 경제가 깨집니다). event_db 는 이 모듈을
 # 부르지 않습니다(순환 import 방지).
-from utils.event_db import point_multiplier, apply_multiplier, credit_earned
+from utils.event_db import (point_multiplier, apply_multiplier, credit_earned,
+                            base_points_paused, multiplier_split)
 
 # 퀘스트 진행도는 유저×날짜라 계속 늘어납니다. **양쪽 경로 모두에** 상한을
 # 겁니다 (Mongo 는 TTL 인덱스, JSON 은 _trim_quest_progress_local).
@@ -367,21 +368,30 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
     str_key = _get_user_key(guild_id, user_id)
     today, yesterday = get_today_str(), get_yesterday_str()
     settings = await get_checkin_settings(guild_id)
-    # 호박 보상 배율 — 기본 · 연속 보너스 · 마일스톤 전부에 곱합니다
-    mult = await point_multiplier(guild_id)
-    base = apply_multiplier(int(settings.get("base", 100)), mult)
+    # 호박 보상 배율 — 기본 · 연속 보너스 · 마일스톤 전부에 곱합니다.
+    # 시즌 중이면 **시즌 포인트에만** 곱합니다(bm=1, sm=2). 시즌 밖이면 기본에.
+    bm, sm = await multiplier_split(guild_id)
+    mult = max(bm, sm)
+    base = apply_multiplier(int(settings.get("base", 100)), bm)
+    # 시즌 중 '시즌 포인트로만' 이면 기본 포인트는 0 을 더합니다. **출석 처리
+    # 자체(last_checkin · 연속일수)는 그대로** 해야 연타 방지와 연속이 유지됩니다.
+    paused = await base_points_paused(guild_id)
+    pay = 0 if paused else base
 
     def _result(ok, points, streak):
-        b, bo, ms = streak_reward(streak, settings) if ok else (0, 0, 0)
-        b, bo, ms = (apply_multiplier(x, mult) for x in (b, bo, ms))
+        raw = streak_reward(streak, settings) if ok else (0, 0, 0)
+        b, bo, ms = (apply_multiplier(x, bm) for x in raw)
         return {"ok": ok, "points": points, "streak": streak,
                 "base": b, "bonus": bo, "milestone": ms, "gained": b + bo + ms,
-                "mult": mult}
+                # 시즌 포인트로 갈 양 — 호박 배율이 시즌에만 붙으면 gained 와 다릅니다
+                "season_gain": sum(apply_multiplier(x, sm) for x in raw),
+                "mult": mult, "mult_season_only": sm > bm, "paused": paused}
 
     async def _done(ok, points, streak):
         res = _result(ok, points, streak)
         if ok:
-            res["season"] = await credit_earned(guild_id, user_id, res["gained"])
+            res["season"] = await credit_earned(guild_id, user_id, res["season_gain"],
+                                                paused=paused)
         return res
 
     if users_col is not None:
@@ -391,13 +401,13 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
             # ① 어제 출석했다면 연속 이어가기
             doc = await _db(users_col.find_one_and_update,
                             {"_id": str_key, "last_checkin": yesterday},
-                            {"$inc": {"points": base, "streak": 1}, "$set": common},
+                            {"$inc": {"points": pay, "streak": 1}, "$set": common},
                             return_document=_AFTER)
             if doc is None:
                 # ② 연속이 끊겼거나 첫 출석 — streak 을 1로 초기화
                 doc = await _db(users_col.find_one_and_update,
                                 {"_id": str_key, "last_checkin": {"$ne": today}},
-                                {"$inc": {"points": base},
+                                {"$inc": {"points": pay},
                                  "$set": {**common, "streak": 1}},
                                 return_document=_AFTER)
             if doc is None:
@@ -408,7 +418,7 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
                                    int(cur.get("streak", 0) or 0))
                 doc = await _db(users_col.find_one_and_update,
                                 {"_id": str_key, "last_checkin": {"$ne": today}},
-                                {"$inc": {"points": base},
+                                {"$inc": {"points": pay},
                                  "$set": {**common, "streak": 1}},
                                 return_document=_AFTER)
                 if doc is None:
@@ -417,8 +427,8 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
 
             streak = int(doc.get("streak", 1) or 1)
             _, bonus, milestone = streak_reward(streak, settings)
-            extra = apply_multiplier(bonus, mult) + apply_multiplier(milestone, mult)
-            if extra > 0:
+            extra = apply_multiplier(bonus, bm) + apply_multiplier(milestone, bm)
+            if extra > 0 and not paused:
                 bumped = await _db(users_col.find_one_and_update,
                                    {"_id": str_key}, {"$inc": {"points": extra}},
                                    return_document=_AFTER)
@@ -440,8 +450,9 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
     _, bonus, milestone = streak_reward(streak, settings)
     user_info["last_checkin"] = today
     user_info["streak"] = streak
-    user_info["points"] = (user_info.get("points", 0) + base + apply_multiplier(bonus, mult)
-                           + apply_multiplier(milestone, mult))
+    if not paused:
+        user_info["points"] = (user_info.get("points", 0) + base + apply_multiplier(bonus, bm)
+                               + apply_multiplier(milestone, bm))
     await save_data(data)
     return await _done(True, user_info["points"], streak)
 
@@ -449,9 +460,11 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
     """Returns (new_points, awarded, earned_points, boost_mult)"""
     str_key = _get_user_key(guild_id, user_id)
     boost_mult = await get_channel_boost(guild_id, channel_id) if channel_id > 0 else 1.0
-    # 채널 부스트 × 호박 보상 배율 (둘 다 캐시라 채팅마다 DB 를 읽지 않습니다)
-    event_mult = await point_multiplier(guild_id)
-    earned_points = max(1, int(round(10 * boost_mult * event_mult)))
+    # 채널 부스트 × 호박 보상 배율 (둘 다 캐시라 채팅마다 DB 를 읽지 않습니다).
+    # 호박 배율은 시즌 중이면 시즌 포인트에만 붙습니다(multiplier_split).
+    bm, sm = await multiplier_split(guild_id)
+    earned_points = max(1, int(round(10 * boost_mult * bm)))
+    season_points = max(1, int(round(10 * boost_mult * sm)))
 
     if users_col is not None:
         try:
@@ -473,12 +486,15 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
             new_points = doc.get("points", 0)
             awarded = new_count % 10 == 0
             if awarded:
-                bumped = await _db(users_col.find_one_and_update,
-                                   {"_id": str_key},
-                                   {"$inc": {"points": earned_points}},
-                                   return_document=_AFTER)
-                new_points = (bumped or {}).get("points", new_points + earned_points)
-                await credit_earned(guild_id, user_id, earned_points)
+                # 시즌 확인은 **적립하는 열 번째에만** 합니다(캐시라도 매 채팅마다 볼 이유가 없습니다)
+                paused = await base_points_paused(guild_id)
+                if not paused:
+                    bumped = await _db(users_col.find_one_and_update,
+                                       {"_id": str_key},
+                                       {"$inc": {"points": earned_points}},
+                                       return_document=_AFTER)
+                    new_points = (bumped or {}).get("points", new_points + earned_points)
+                await credit_earned(guild_id, user_id, season_points, paused=paused)
             return new_points, awarded, earned_points, boost_mult
         except Exception as e:
             print(f"MongoDB chat process error: {e}, using local file.", flush=True)
@@ -489,13 +505,16 @@ async def process_chat_message(guild_id: int, user_id: int, channel_id: int = 0)
     user_info["chat_count"] = user_info.get("chat_count", 0) + 1
 
     awarded = False
+    paused = False
     if user_info["chat_count"] % 10 == 0:
-        user_info["points"] = user_info.get("points", 0) + earned_points
+        paused = await base_points_paused(guild_id)
+        if not paused:
+            user_info["points"] = user_info.get("points", 0) + earned_points
         awarded = True
 
     await save_data(data)
     if awarded:
-        await credit_earned(guild_id, user_id, earned_points)
+        await credit_earned(guild_id, user_id, season_points, paused=paused)
     return user_info["points"], awarded, earned_points, boost_mult
 
 async def get_user_points(guild_id: int, user_id: int) -> int:
@@ -2569,13 +2588,16 @@ async def claim_quest(guild_id: int, user_id: int, quest_id: str,
     실제로 준 양은 `out` 에 담습니다(화면에 설정값 그대로 쓰면 2배가 안 보입니다).
     """
     async def _pay():
-        mult = await point_multiplier(guild_id)
-        paid = apply_multiplier(int(reward), mult)
-        if paid > 0:
+        bm, sm = await multiplier_split(guild_id)
+        paid = apply_multiplier(int(reward), bm)
+        paused = await base_points_paused(guild_id)
+        if paid > 0 and not paused:
             await add_user_points(guild_id, user_id, paid)
-        season = await credit_earned(guild_id, user_id, paid)
+        season = await credit_earned(guild_id, user_id, apply_multiplier(int(reward), sm),
+                                     paused=paused)
         if out is not None:
-            out.update(paid=paid, mult=mult, season=season)
+            out.update(paid=paid, mult=max(bm, sm), season=season, paused=paused,
+                       mult_season_only=sm > bm)
     key = _quest_key(guild_id, user_id,
                      period or (quest_week() if weekly else quest_day()))
     if quest_prog_col is not None:

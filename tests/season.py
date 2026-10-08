@@ -103,6 +103,8 @@ async def main():
     note(out.get("paid") == 100 and out.get("season") == 200 and out.get("mult_season_only"),
          "**호박 2배는 시즌 포인트에만** (기본 100 · 시즌 200, 2026-10-05 요청)", str(out))
     r_c = await db.checkin_user(GID, 22)
+    note(r_c["season_parts"][0] == 2 * r_c["base"], "출석 항목별 시즌 양도 2배로 계산",
+         str(r_c["season_parts"]))
     note(r_c["season"] == 2 * r_c["gained"] and r_c["mult_season_only"],
          "출석도 시즌만 2배", f"{r_c['gained']} / {r_c['season']}")
     before = await sp(uid)

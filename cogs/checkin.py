@@ -469,11 +469,14 @@ class CheckIn(commands.Cog):
             # 시즌 중 '시즌 포인트로만' 이면 기본 포인트는 안 들어왔습니다 — P 로 적으면 거짓말입니다
             paused = bool(result.get("paused"))
             unit = " 🏆" if paused else " P"
-            parts = [f"기본 **{result['base']}{unit}**"]
-            if result["bonus"]:
-                parts.append(f"🔥 {streak}일 연속 달성 **+{result['bonus']:,}{unit}**")
-            if result["milestone"]:
-                parts.append(f"🎉 특별 보상 **+{result['milestone']:,}{unit}**")
+            # 시즌 포인트로만 받을 때는 **시즌 쪽 숫자**로 적습니다(호박 배율이 시즌에만 붙습니다)
+            b_, bo_, ms_ = (result.get("season_parts") if paused and result.get("season_parts")
+                            else (result["base"], result["bonus"], result["milestone"]))
+            parts = [f"기본 **{b_}{unit}**"]
+            if bo_:
+                parts.append(f"🔥 {streak}일 연속 달성 **+{bo_:,}{unit}**")
+            if ms_:
+                parts.append(f"🎉 특별 보상 **+{ms_:,}{unit}**")
 
             if paused:
                 desc = (f"오늘 출석으로 🏆 시즌 포인트 **+{result.get('season', 0):,}** 를 "

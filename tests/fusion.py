@@ -108,6 +108,8 @@ async def scenario(label, gid):
          "**증기를 얻고 불 · 물은 사라짐**", str(ids))
     note(m.added.index("증기") == 0 and m.removed[:2] == ["불", "물"],
          "**결과를 먼저 주고 재료를 뺌**", f"{m.added} / {m.removed}")
+    note(it3.response.edited and it3.response.edited.get("view", "x") is None,
+         "**성공하면 창의 버튼을 거둠** (다시 눌러 '상호작용 실패' 가 뜨지 않게)")
     e = it3.followup.sent[-1]["embed"]
     note("최초 발견" in e.title and it3.followup.sent[-1].get("ephemeral"),
          "처음 성공 → '최초 발견' 화면 (본인에게만)", e.title)

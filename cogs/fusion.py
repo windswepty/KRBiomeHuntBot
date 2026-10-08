@@ -215,7 +215,8 @@ class FuseView(discord.ui.View):
         if len(self.picked) != 2:
             await interaction.response.send_message("⚠️ 역할 두 개를 먼저 고르세요.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # 이 창 자체를 고칠 수 있게 '창 갱신' 으로 미룹니다(성공하면 버튼을 거둡니다)
+        await interaction.response.defer()
         res = await perform_fusion(interaction.guild, interaction.user, *self.picked)
         st = res["status"]
         if st == "ok":
@@ -233,6 +234,13 @@ class FuseView(discord.ui.View):
                                 value="재료 역할을 빼지 못해 그대로 남았습니다(관리자에게 알려 주세요).",
                                 inline=False)
             await interaction.followup.send(embed=embed, ephemeral=True)
+            # 역할이 바뀌었으니 이 창의 선택지는 낡았습니다. 남겨 두면 다시 눌렀을 때
+            # '상호작용 실패' 만 뜹니다 — 버튼을 거두고 /합성 을 다시 열게 합니다.
+            try:
+                await interaction.edit_original_response(
+                    content="✅ 합성 완료 — 다시 하려면 `/합성` 을 새로 열어 주세요.", view=None)
+            except discord.HTTPException as e:
+                print(f"[Fusion] 창 정리 실패: {e.status}", flush=True)
             if res.get("announce") and interaction.channel is not None:
                 try:
                     msg = (f"🏆 {interaction.user.mention} 님이 **처음으로** 합성에 성공해 "

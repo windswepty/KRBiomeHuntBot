@@ -385,6 +385,8 @@ async def checkin_user(guild_id: int, user_id: int) -> dict:
                 "base": b, "bonus": bo, "milestone": ms, "gained": b + bo + ms,
                 # 시즌 포인트로 갈 양 — 호박 배율이 시즌에만 붙으면 gained 와 다릅니다
                 "season_gain": sum(apply_multiplier(x, sm) for x in raw),
+                # 항목별 시즌 양 — '시즌 포인트로만' 일 때 지급 내역을 이 숫자로 보여 줍니다
+                "season_parts": [apply_multiplier(x, sm) for x in raw],
                 "mult": mult, "mult_season_only": sm > bm, "paused": paused}
 
     async def _done(ok, points, streak):

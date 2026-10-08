@@ -722,7 +722,9 @@ async def credit_earned(guild_id: int, user_id: int, base_points: int,
 # 키는 재료 역할 ID(2~5개)를 **정렬해서** 만듭니다 — A+B 와 B+A 는 같은 레시피입니다.
 # 두 개짜리는 예전 키(`r작은_큰`)와 같은 모양이라 기존 레시피가 그대로 맞습니다.
 
-DEFAULT_FUSION = {"enabled": True, "announce": False, "recipes": {}}
+# public: /합성 을 유저에게 보여 줄지. 처음엔 **관리자만** 봅니다(요청 2026-10-09 —
+# 레시피를 다 만들어 두고 공개하려고).
+DEFAULT_FUSION = {"enabled": True, "announce": False, "public": False, "recipes": {}}
 
 
 FUSION_MIN_INPUTS, FUSION_MAX_INPUTS = 2, 5
@@ -761,7 +763,7 @@ async def get_fusion(guild_id: int, fresh: bool = False) -> dict:
 
 async def save_fusion_settings(guild_id: int, changes: dict) -> None:
     """켜기 · 공개 알림 같은 설정. **레시피는 여기서 저장하지 않습니다**(통째 덮어쓰기 금지)."""
-    payload = {k: v for k, v in changes.items() if k in ("enabled", "announce")}
+    payload = {k: v for k, v in changes.items() if k in ("enabled", "announce", "public")}
     if not payload:
         return
     _forget("fusion", guild_id)
@@ -870,3 +872,14 @@ async def mark_recipe_discovered(guild_id: int, rk: str, user_id: int) -> bool:
         _write_json(FUSION_FILE, rows)
     _forget("fusion", guild_id)
     return True
+
+
+async def any_fusion_public(guild_ids) -> bool:
+    """봇이 들어간 서버 중 하나라도 /합성 을 공개했는가 — 전역 명령어라 한 값을 같이 씁니다."""
+    for gid in guild_ids:
+        try:
+            if (await get_fusion(gid)).get("public"):
+                return True
+        except Exception as e:
+            print(f"[EventDB] 합성 공개 여부 확인 실패 {gid}: {type(e).__name__}: {e}", flush=True)
+    return False

@@ -79,6 +79,19 @@ async def scenario(label, gid):
              f"아무도 안 만든 결과 `{n}` 은 안 보임")
     note("3개" in (e.footer.text or ""), "아직 미발견 레시피 개수 안내", e.footer.text)
 
+    print("--- /합성 은 처음엔 관리자만 (2026-10-09) ---")
+    note(FU.Fusion.fuse.default_permissions is not None
+         and FU.Fusion.fuse.default_permissions.administrator,
+         "/합성 등록 기본값은 관리자만 (재시작 직후에도 새지 않게)")
+    it = inter_for(g, m)
+    await FU.Fusion.fuse.callback(FU.Fusion(None), it)
+    note("준비 중" in (it.followup.sent[-1].get("content") or ""), "공개 전: 일반 유저는 막힘")
+    adm = Member(7, "관리자", True, roles=[R["불"], R["물"]], guild=g)
+    it = inter_for(g, adm)
+    await FU.Fusion.fuse.callback(FU.Fusion(None), it)
+    note("관리자 미리보기" in it.followup.sent[-1]["embed"].description, "공개 전: 관리자는 미리보기")
+    await ev.save_fusion_settings(gid, {"public": True})
+
     it = inter_for(g, m)
     await FU.Fusion.fuse.callback(FU.Fusion(None), it)
     sent = it.followup.sent[-1]
@@ -232,6 +245,64 @@ async def scenario(label, gid):
     await ev.save_fusion_settings(gid, {"enabled": False})
     note((await FU.perform_fusion(g, m4, 10, 11))["status"] == "off", "꺼지면 합성 안 됨")
     await ev.save_fusion_settings(gid, {"enabled": True})
+
+    print("--- 유저에게 공개 버튼 · 명령어 표시 대상 ---")
+    class FakeCmd:
+        def __init__(self, name, cid, perms):
+            self.name, self.id, self.default_member_permissions = name, cid, perms
+    remote = {1: "8", 2: None}
+    edits = []
+
+    def as_perms(v):
+        return None if v is None else discord.Permissions(int(v))
+
+    class FakeTree:
+        async def fetch_commands(self):
+            return [FakeCmd("합성", 1, as_perms(remote[1])), FakeCmd("뽑기", 2, as_perms(remote[2]))]
+
+    class FakeHttp:
+        async def edit_global_command(self, app, cid, payload):
+            edits.append((cid, payload))
+            remote[cid] = payload["default_member_permissions"]
+
+    class FakeBot:
+        application_id = 99
+        guilds = [g]
+        tree, http = FakeTree(), FakeHttp()
+
+        async def wait_until_ready(self):
+            return None
+
+    vcog = FU.Fusion(FakeBot())
+    await ev.save_fusion_settings(gid, {"public": False})
+    await vcog.apply_visibility(force=True)
+    note(edits == [], "비공개 · 이미 관리자만이면 디스코드에 안 고침")
+    admin_m = Member(7, "관리자", True, guild=g)
+    s_ = await ev.get_fusion(gid, fresh=True)
+    av = FU.AdminView(vcog, s_)
+    note(av.public.label == "유저에게 공개", "비공개면 '유저에게 공개' 버튼")
+    it = inter_for(g, admin_m)
+    await av.public.callback(it)
+    await asyncio.sleep(0.05)
+    note((await ev.get_fusion(gid, fresh=True))["public"] is True, "누르면 공개로 저장")
+    note(edits == [(1, {"default_member_permissions": None})],
+         "**누르면 /합성 이 모두에게 보이게** (/뽑기 는 안 건드림)", str(edits))
+    note("유저에게 공개" in it.response.edited["embed"].description, "설정 화면에 공개 상태 표시")
+    edits.clear()
+    av2 = FU.AdminView(vcog, await ev.get_fusion(gid, fresh=True))
+    note(av2.public.label == "유저에게 숨기기", "공개면 '유저에게 숨기기' 버튼")
+    await av2.public.callback(inter_for(g, admin_m))
+    await asyncio.sleep(0.05)
+    note(edits == [(1, {"default_member_permissions": "8"})], "다시 누르면 관리자만", str(edits))
+    it = inter_for(g, Member(8, "유저", False, guild=g))
+    await av2.public.callback(it)
+    note("관리자만" in it.response.sent[-1]["content"], "관리자가 아니면 못 바꿈")
+    # 재시작 뒤 tree.sync() 가 관리자만으로 되돌린 상황 → 주기 작업이 다시 맞춤
+    await ev.save_fusion_settings(gid, {"public": True})
+    remote[1] = "8"
+    edits.clear()
+    await vcog.apply_visibility(force=True)
+    note(edits == [(1, {"default_member_permissions": None})], "되돌려졌으면 주기 작업이 다시 공개로 맞춤")
 
     print("--- 관리자 화면 ---")
     admin = Member(7, "관리자", True, guild=g)

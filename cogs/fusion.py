@@ -15,6 +15,16 @@
 (`mark_recipe_discovered` 가 '아직 없을 때만' 을 필터로 판정).
 관리자 화면(/합성설정)은 처음부터 전부 보입니다.
 
+## /합성 은 처음에 관리자만 봅니다
+
+요청(2026-10-09): 레시피를 다 만들어 두고 공개하려고 **기본은 관리자만** 보이고,
+/합성설정 의 **👀 유저에게 공개** 버튼으로 바꿉니다. 명령어를 숨기는 길은 기본
+권한(default_member_permissions)뿐이라 봇 토큰으로 자기 명령어를 고칩니다.
+  · 누르는 즉시 바꾸고, 재시작 때 tree.sync() 가 데코레이터 값(관리자만)으로
+    되돌리므로 **10분마다 한 번 맞춥니다**(바뀔 때만 디스코드에 고칩니다).
+  · 명령어 안에서도 한 번 더 막습니다 — 화면 갱신이 늦거나 서버 설정 → 연동에서
+    따로 권한을 준 사람이 칠 수 있습니다.
+
 ## 순서가 중요합니다
 
 결과 역할을 **먼저 주고**, 그다음 재료를 뺍니다. 거꾸로 하면 결과 지급이 실패했을
@@ -26,12 +36,14 @@ import asyncio
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+from utils import health
 
 from utils.database import add_activity_log
 from utils.event_db import (
     get_fusion, save_fusion_settings, add_fusion_recipe, remove_fusion_recipe, recipe_key,
-    FUSION_MIN_INPUTS, FUSION_MAX_INPUTS,
+    FUSION_MIN_INPUTS, FUSION_MAX_INPUTS, any_fusion_public,
     mark_recipe_discovered,
 )
 
@@ -297,6 +309,7 @@ def build_admin_embed(guild, s: dict) -> discord.Embed:
     embed = discord.Embed(
         title="⚗️ 역할 합성 설정",
         description=(f"상태 **{'🟢 켜짐' if s.get('enabled', True) else '🔴 꺼짐'}** · "
+                     f"/합성 **{'👀 유저에게 공개' if s.get('public') else '🔒 관리자만'}** · "
                      f"공개 알림 **{'켜짐' if s.get('announce') else '꺼짐'}**\n"
                      "-# 유저 화면에는 재료만 보이고, 결과는 누군가 처음 만들 때 공개됩니다."),
         color=discord.Color.purple())
@@ -443,6 +456,12 @@ class AdminView(discord.ui.View):
         self.toggle.emoji = "🔴" if s.get("enabled", True) else "🟢"
         self.announce.label = f"공개 알림: {'켜짐' if s.get('announce') else '꺼짐'}"
         self.remove.disabled = not (s.get("recipes") or {})
+        if s.get("public"):
+            self.public.label, self.public.emoji = "유저에게 숨기기", "🔒"
+            self.public.style = discord.ButtonStyle.secondary
+        else:
+            self.public.label, self.public.emoji = "유저에게 공개", "👀"
+            self.public.style = discord.ButtonStyle.success
 
     @discord.ui.button(label="레시피 추가", emoji="➕", style=discord.ButtonStyle.primary)
     async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -484,10 +503,88 @@ class AdminView(discord.ui.View):
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.refresh_admin(interaction)
 
+    @discord.ui.button(label="유저에게 공개", emoji="👀", style=discord.ButtonStyle.success, row=1)
+    async def public(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _admin(interaction):
+            return
+        s = await get_fusion(interaction.guild.id, fresh=True)
+        on = not s.get("public")
+        await save_fusion_settings(interaction.guild.id, {"public": on})
+        try:
+            await add_activity_log(interaction.guild.id, "admin", interaction.user.id,
+                                   interaction.user.display_name,
+                                   "/합성 " + ("유저에게 공개" if on else "관리자만 보기"))
+        except Exception as e:
+            print(f"[Fusion] 활동 기록 실패: {type(e).__name__}: {e}", flush=True)
+        await self.cog.refresh_admin(interaction)
+        # 명령어 목록 반영은 응답 뒤에 — 디스코드 왕복이 3초 제한을 잡아먹지 않게
+        self.cog.schedule_visibility()
+
+
+def desired_perms(public: bool) -> str | None:
+    """/합성 의 기본 권한 — 공개면 None(모두), 아니면 "8"(관리자만)."""
+    return None if public else str(discord.Permissions(administrator=True).value)
+
 
 class Fusion(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._applied: str | None | bool = False      # False = 아직 모름 (처음엔 꼭 확인)
+        self._vis_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
+
+    async def cog_load(self):
+        # __init__ 이 아니라 여기서 시작합니다 — 테스트가 Fusion(None) 을 직접 만듭니다
+        self.sync_visibility.start()
+
+    async def cog_unload(self):
+        self.sync_visibility.cancel()
+
+    def schedule_visibility(self) -> None:
+        """응답 뒤 백그라운드로 맞춥니다. 실패하면 로그만 — 10분 주기가 다시 맞춥니다."""
+        async def run():
+            try:
+                await self.apply_visibility()
+            except Exception as e:
+                print(f"[Fusion] /합성 표시 대상 변경 실패(10분 안에 다시 시도): "
+                      f"{type(e).__name__}: {e}", flush=True)
+        task = asyncio.create_task(run())
+        self._tasks.add(task)                 # 참조를 잡아 둬야 중간에 수거되지 않습니다
+        task.add_done_callback(self._tasks.discard)
+
+    async def apply_visibility(self, force: bool = False) -> None:
+        """/합성 의 기본 권한을 설정(공개 여부)에 맞춥니다. 같으면 디스코드에 안 묻습니다."""
+        async with self._vis_lock:
+            want = desired_perms(await any_fusion_public(g.id for g in self.bot.guilds))
+            if want == self._applied and not force:
+                return
+            app_id = self.bot.application_id
+            if not app_id:
+                return
+            for cmd in await self.bot.tree.fetch_commands():
+                if cmd.name != "합성":
+                    continue
+                cur = cmd.default_member_permissions
+                if (None if cur is None else str(cur.value)) != want:
+                    await self.bot.http.edit_global_command(
+                        app_id, cmd.id, {"default_member_permissions": want})
+                    print(f"[Fusion] /합성 표시 대상: {'모두' if want is None else '관리자만'}",
+                          flush=True)
+            self._applied = want
+
+    @tasks.loop(minutes=10)
+    async def sync_visibility(self):
+        await self.bot.wait_until_ready()
+        if self._applied is False:
+            # 기동 직후 main 의 tree.sync() 가 끝난 뒤에 맞춥니다(먼저 하면 sync 가 덮어씁니다)
+            await asyncio.sleep(60)
+        # 10분마다 실제 값을 확인합니다 — 재동기화 · 수동 변경으로 어긋났을 수 있습니다
+        await self.apply_visibility(force=True)
+
+    @sync_visibility.error
+    async def sync_visibility_error(self, error):
+        self._applied = False
+        await health.revive_loop(self.sync_visibility, "fusion_visibility", error)
 
     async def refresh_admin(self, interaction: discord.Interaction) -> None:
         s = await get_fusion(interaction.guild.id, fresh=True)
@@ -496,14 +593,23 @@ class Fusion(commands.Cog):
 
     @app_commands.command(name="합성", description="가진 역할 2~5개를 합쳐 새 역할을 얻습니다.")
     @app_commands.guild_only()
+    # 처음엔 관리자만 보입니다 — /합성설정 의 '유저에게 공개' 가 이 값을 바꿉니다
+    @app_commands.default_permissions(administrator=True)
     async def fuse(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         s = await get_fusion(interaction.guild.id, fresh=True)
+        is_admin = interaction.user.guild_permissions.administrator
+        if not s.get("public") and not is_admin:
+            await interaction.followup.send("⚗️ 역할 합성은 아직 준비 중입니다.", ephemeral=True)
+            return
         if not s.get("enabled", True):
             await interaction.followup.send(FAIL_TEXT["off"], ephemeral=True)
             return
         recipes = s.get("recipes") or {}
         embed = build_user_embed(interaction.guild, interaction.user, s)
+        if not s.get("public"):
+            embed.description = ("👀 **관리자 미리보기** — 아직 유저에게는 `/합성` 이 보이지 않습니다. "
+                                 "`/합성설정` → **유저에게 공개** 로 바꿉니다.\n\n" + embed.description)
         # 고를 수 있는 것은 **재료를 모두 가진 레시피**뿐입니다
         have = {r.id for r in getattr(interaction.user, "roles", [])}
         ready = craftable(recipes, have)[:25]

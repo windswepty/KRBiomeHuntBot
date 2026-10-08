@@ -13,11 +13,23 @@ from utils.database import (
 )
 from utils.event_db import (
     get_season, season_state, spend_season_points, add_season_points, get_season_points,
-    base_points_paused,
+    base_points_paused, credit_earned,
 )
 
 # 낼 포인트. 시즌 포인트는 시즌 기간에만(utils/event_db.py).
 POINTS, SEASON = "points", "season"
+
+
+async def prize_unit(guild_id: int) -> str:
+    """경품 포인트가 어디로 들어가는지 — 패널 글자가 실제 적립과 같아야 합니다.
+
+    시즌 중 '시즌 포인트로만' → 🏆 · '둘 다' → P + 🏆 · 시즌 아님 → P
+    """
+    if await base_points_paused(guild_id):
+        return "🏆"
+    if season_state(await get_season(guild_id)) == "active":
+        return "P + 🏆"
+    return "P"
 
 
 def parse_role_mentions(text: str) -> str:
@@ -152,18 +164,21 @@ async def perform_rolls(guild, member, settings: dict, count: int,
     refund = (total_price - (total_price * filled) // count) if filled < count else 0
     reward_points = sum(int(r.get("reward_points", 0) or 0) for r in results)
 
-    # 시즌 중 '시즌 포인트로만' 이면 **경품 포인트도 시즌 포인트로** 줍니다(얻는 포인트라서).
+    # **시즌 중에는 경품 포인트도 시즌 포인트로** 들어갑니다(요청 2026-10-08 — 채팅 ·
+    # 출석 · 퀘스트와 같은 '얻는 포인트' 이므로 credit_earned 를 그대로 씁니다).
+    #   · '시즌 포인트로만'  → 시즌만   · '둘 다' → 기본 + 시즌   · 시즌 아님 → 기본만
     # 환불은 낸 것을 돌려주는 것이라 **낸 포인트 그대로**입니다.
-    prize_to_season = bool(reward_points) and await base_points_paused(guild.id)
-    if prize_to_season:
-        await add_season_points(guild.id, member.id, reward_points, only_active=False)
-    base_prize = 0 if prize_to_season else reward_points
+    paused = bool(reward_points) and await base_points_paused(guild.id)
+    season_prize = (await credit_earned(guild.id, member.id, reward_points, paused=paused)
+                    if reward_points else 0)
+    prize_to_season = season_prize > 0
+    base_prize = 0 if paused else reward_points
 
     if currency == SEASON:
         # 환불은 시즌이 방금 끝났어도 돌려줍니다(only_active=False)
         if refund:
             await add_season_points(guild.id, member.id, refund, only_active=False)
-        season_balance = remaining + refund + (reward_points if prize_to_season else 0)
+        season_balance = remaining + refund + season_prize
         balance = (await add_user_points(guild.id, member.id, base_prize)
                    if base_prize else await get_user_points(guild.id, member.id))
     else:
@@ -209,6 +224,7 @@ async def perform_rolls(guild, member, settings: dict, count: int,
         "refund": refund,
         "reward_points": reward_points,
         "prize_to_season": prize_to_season,
+        "base_prize": base_prize,
         "balance": balance,
         "season_balance": season_balance,
         "currency": currency,
@@ -389,7 +405,10 @@ class GachaPlayView(discord.ui.View):
             lines.append(f"↩️ **환불**: +{outcome['refund']:,} {unit} "
                          f"({count - filled}회분 — 재고가 부족했습니다)")
         if outcome["reward_points"]:
-            if outcome.get("prize_to_season"):
+            if outcome.get("prize_to_season") and outcome.get("base_prize"):
+                lines.append(f"🎁 **포인트 보상**: +{outcome['reward_points']:,} P · "
+                             f"🏆 시즌 포인트 +{outcome['reward_points']:,}")
+            elif outcome.get("prize_to_season"):
                 lines.append(f"🎁 **포인트 보상**: 🏆 시즌 포인트 +{outcome['reward_points']:,} "
                              "(시즌 중에는 시즌 포인트로 받습니다)")
             else:
@@ -1071,6 +1090,7 @@ class Gacha(commands.Cog):
         )
 
         sorted_items = sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0))))
+        unit_label = await prize_unit(interaction.guild.id)
         for item in sorted_items:
             pct = float(item.get("percent", item.get("weight", 0)))
             stock_str = format_stock_str(item.get("stock", -1))
@@ -1082,7 +1102,7 @@ class Gacha(commands.Cog):
                 role_info = role.mention if role else f"ID: {role_id}"
                 info_lines.append(f"• **보상 혜택**: {role_info}")
             elif item.get("reward_points", 0) > 0:
-                info_lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} P` 적립")
+                info_lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} {unit_label}` 적립")
 
             embed.add_field(
                 name=f"🎁 {item['name']}",
@@ -1147,7 +1167,7 @@ class Gacha(commands.Cog):
             embed.description = ("👀 **관리자 미리보기** — 시즌 기간이 아니라 일반 유저에게는 이 "
                                  "명령어가 보이지 않고, 지금은 뽑을 수 없습니다.\n\n"
                                  + embed.description)
-        prize_unit = "🏆" if await base_points_paused(gid) else "P"
+        unit_label = await prize_unit(gid)
         for item in sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0)))):
             pct = float(item.get("percent", item.get("weight", 0)))
             lines = [f"• **확률**: `{pct_str(pct)}%` | **재고**: "
@@ -1157,7 +1177,7 @@ class Gacha(commands.Cog):
                 role = interaction.guild.get_role(rid)
                 lines.append(f"• **보상 혜택**: {role.mention if role else f'ID: {rid}'}")
             elif item.get("reward_points", 0) > 0:
-                lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} {prize_unit}` 적립")
+                lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} {unit_label}` 적립")
             embed.add_field(name=f"🎁 {item['name']}", value="\n".join(lines), inline=False)
         if not items:
             await interaction.followup.send(embed=embed, ephemeral=True)

@@ -208,23 +208,25 @@ async def main():
     await ev.add_season_points(GID, 41, 300)
     base_before = await db.get_user_points(GID, 41)
     res = await G.perform_rolls(GUILD, m, gs, 1, 100, G.SEASON)
-    note(res["error"] is None and await sp(41) == 200 and res["season_balance"] == 200,
-         "**시즌 포인트 100 으로 1회**", str(await sp(41)))
-    note(await db.get_user_points(GID, 41) == base_before + 7, "당첨 포인트 보상은 **기본 포인트**로")
+    # '둘 다' 방식 · 시즌 중: 경품 7 은 기본 7 + 시즌 7 (2026-10-08: 시즌 중 뽑기 포인트도 시즌으로)
+    note(res["error"] is None and await sp(41) == 207 and res["season_balance"] == 207,
+         "**시즌 포인트 100 으로 1회** (경품 7 은 시즌으로도 들어옴)", str(await sp(41)))
+    note(await db.get_user_points(GID, 41) == base_before + 7 and res["prize_to_season"],
+         "'둘 다' 방식이면 경품은 기본 + 시즌 둘 다")
     ms = [Member(42, "동시", False, guild=GUILD)] * 10
     await ev.add_season_points(GID, 42, 300)
     rs = await asyncio.gather(*[G.perform_rolls(GUILD, mm, gs, 1, 100, G.SEASON) for mm in ms])
-    note(sum(1 for r in rs if r["error"] is None) == 3 and await sp(42) == 0,
+    note(sum(1 for r in rs if r["error"] is None) == 3 and await sp(42) == 21,
          "**시즌 300 으로 10번 동시에 → 정확히 3번**", str(sum(1 for r in rs if r["error"] is None)))
     res = await G.perform_rolls(GUILD, m, gs, 10, 1000, G.SEASON)
-    note(res["error"] == "no_points" and await sp(41) == 200, "모자라면 안 뽑히고 그대로")
+    note(res["error"] == "no_points" and await sp(41) == 207, "모자라면 안 뽑히고 그대로")
 
     await db.save_gacha_settings(GID, {"price": 100})
     await db.set_gacha_item_stock(GID, 1, 2)            # 재고 2 에 10연차 → 8회분 환불
     gs = await db.get_gacha_settings(GID)
     await ev.add_season_points(GID, 43, 1000)
     res = await G.perform_rolls(GUILD, Member(43, "환불", False, guild=GUILD), gs, 10, 1000, G.SEASON)
-    note(res["filled"] == 2 and res["refund"] == 800 and await sp(43) == 800,
+    note(res["filled"] == 2 and res["refund"] == 800 and await sp(43) == 800 + 14,
          "**품절 환불은 시즌 포인트로 돌려받음**", f"{res['filled']} · {await sp(43)}")
     await db.set_gacha_item_stock(GID, 1, -1)
     gs = await db.get_gacha_settings(GID)
@@ -235,10 +237,21 @@ async def main():
     await db.add_user_points(GID, 44, 300)
     s44 = await sp(44)
     res = await G.perform_rolls(GUILD, Member(44, "경품", False, guild=GUILD), gs, 1, 100)
-    note(res["prize_to_season"] and await sp(44) - s44 == 7 and await db.get_user_points(GID, 44) == 200,
+    note(res["prize_to_season"] and await sp(44) - s44 == 7 and await db.get_user_points(GID, 44) == 200
+         and await G.prize_unit(GID) == "🏆",
          "**시즌 중 경품 포인트 7 → 시즌 포인트로** (기본은 100 만 빠짐)",
          f"{await db.get_user_points(GID, 44)} / {await sp(44)}")
     await ev.save_season_only(GID, False)
+    ev._cache.clear()
+    note(await G.prize_unit(GID) == "P + 🏆", "패널 글자: '둘 다' → P + 🏆")
+    s_now = await ev.get_season(GID, fresh=True)
+    await set_period(-7200, -60)
+    await db.add_user_points(GID, 45, 300)
+    res = await G.perform_rolls(GUILD, Member(45, "시즌끝", False, guild=GUILD), gs, 1, 100)
+    note(not res["prize_to_season"] and await db.get_user_points(GID, 45) == 207,
+         "시즌이 아니면 경품은 기본 포인트로만")
+    note(await G.prize_unit(GID) == "P", "패널 글자: 시즌 아님 → P")
+    await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
     ev._cache.clear()
 
     v = G.GachaPlayView(settings=gs, season_active=False)

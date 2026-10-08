@@ -85,9 +85,10 @@ async def scenario(label, gid):
     view = sent.get("view")
     note(sent.get("ephemeral") and isinstance(view, FU.FuseView), "/합성: 본인에게만 · 합성 창")
     sel = next(c for c in view.children if isinstance(c, FU.FuseSelect))
-    opts = {o.value for o in sel.options}
-    note(opts == {str(R["불"].id), str(R["물"].id), str(R["흙"].id)},
-         "고를 수 있는 것은 재료로 쓰이는 내 역할만", str(opts))
+    opts = {o.value: o for o in sel.options}
+    note(set(opts) == {ev.recipe_key(10, 11)},
+         "**재료를 모두 가진 레시피(불+물)만 고를 수 있음** — 하나라도 없으면 목록에 없음", str(set(opts)))
+    note(opts[ev.recipe_key(10, 11)].description == "→ ???", "고르는 칸에서도 결과는 ???")
     note(view.go.disabled, "고르기 전엔 합성 버튼 잠김")
 
     print("--- 맞지 않는 조합 → 아무것도 안 잃음 ---")
@@ -97,10 +98,10 @@ async def scenario(label, gid):
     note((await FU.perform_fusion(g, m, R["불"].id, R["불"].id))["status"] == "same", "같은 역할 두 번은 거절")
 
     print("--- 공개 레시피 합성 (창으로) ---")
-    sel._values = [str(R["불"].id), str(R["물"].id)]
+    sel._values = [ev.recipe_key(10, 11)]
     it2 = inter_for(g, m)
     await sel.callback(it2)
-    note(not view.go.disabled and view.picked == [10, 11], "고르면 합성 버튼이 열림")
+    note(not view.go.disabled and view.picked == ev.recipe_key(10, 11), "레시피를 고르면 합성 버튼이 열림")
     it3 = inter_for(g, m)
     await view.go.callback(it3)
     ids = {r.id for r in m.roles}
@@ -168,7 +169,20 @@ async def scenario(label, gid):
     note((await FU.perform_fusion(g, m3r, five + [14]))["status"] == "count", "6개 고르면 거절")
     v = FU.FuseView(m5r.id, [discord.SelectOption(label=str(i), value=str(i)) for i in range(7)])
     sel5 = next(c for c in v.children if isinstance(c, FU.FuseSelect))
-    note(sel5.min_values == 2 and sel5.max_values == 5, "고르기 칸: 최소 2 · 최대 5")
+    note(sel5.min_values == 1 and sel5.max_values == 1, "고르기 칸: 레시피 하나")
+    four = Member(703, "넷만", False, roles=[g.get_role(i) for i in five[:4]], guild=g)
+    rec_map = (await ev.get_fusion(gid, fresh=True))["recipes"]
+    note(ev.recipe_key(five) not in dict(FU.craftable(rec_map, {r.id for r in four.roles})),
+         "**재료 5개 중 4개만 있으면 그 레시피는 못 고름**")
+    # 창을 연 뒤 재료 하나를 잃었다면 누르는 순간 다시 막힘
+    gone = Member(704, "잃음", False, roles=[R["불"], R["물"]], guild=g)
+    gv = FU.FuseView(gone.id, [])
+    gv.picked = ev.recipe_key(10, 11)
+    gone.roles.remove(R["물"])
+    git = inter_for(g, gone)
+    await gv.go.callback(git)
+    note("모두" in (git.followup.sent[-1].get("content") or "") and R["증기"] not in gone.roles,
+         "창을 연 뒤 재료를 잃으면 합성 안 됨 (누르는 순간 다시 확인)")
     b5 = FU.RecipeBuilder(FU.Fusion(None))
     ins_sel = next(c for c in b5.children if isinstance(c, FU.InputsSelect))
     note(ins_sel.max_values == 5 and len(ins_sel.placeholder) <= 12, "빌더 재료 칸: 최대 5 · 안내 문구가 짧음",
@@ -205,7 +219,7 @@ async def scenario(label, gid):
          "설정 저장은 레시피를 건드리지 않음", f"{before_n} → {len(s['recipes'])}")
     m5 = Member(505, "알림", False, roles=[R["불"], R["물"]], guild=g)
     v = FU.FuseView(m5.id, [])
-    v.picked = [10, 11]
+    v.picked = ev.recipe_key(10, 11)
     before = len(g.channels[0].sent)
     it5 = inter_for(g, m5)
     await v.go.callback(it5)

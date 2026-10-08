@@ -2,7 +2,7 @@
 
 가진 역할 2~5개를 합쳐 새 역할을 얻습니다(레시피마다 재료 개수가 다를 수 있습니다).
 
-  · /합성       누구나 — 레시피의 재료를 보고, 가진 역할을 골라 합성
+  · /합성       누구나 — 레시피의 재료를 보고, **재료를 모두 가진 레시피**를 골라 합성
   · /합성설정   관리자 — 레시피 추가(재료 2~5 + 결과 · 재료 소모) · 삭제 · 켜기 · 공개 알림
 
 ## 재료는 보이고, 결과는 누군가 처음 만들 때 공개됩니다
@@ -46,10 +46,6 @@ def _lock(guild_id: int, user_id: int) -> asyncio.Lock:
 def _role_text(guild, rid) -> str:
     role = guild.get_role(int(rid))
     return role.mention if role else f"`삭제된 역할 {rid}`"
-
-
-def ingredient_ids(recipes: dict) -> set[int]:
-    return {int(r) for rec in recipes.values() for r in rec.get("inputs", [])}
 
 
 def manage_problem(guild, roles) -> str | None:
@@ -143,7 +139,7 @@ FAIL_TEXT = {
     "same": "⚠️ 같은 역할을 두 번 고를 수 없습니다.",
     "count": f"⚠️ 역할을 {FUSION_MIN_INPUTS}~{FUSION_MAX_INPUTS}개 골라 주세요.",
     "no_recipe": "💨 아무 일도 일어나지 않았습니다…\n이 조합으로는 나오는 역할이 없습니다. **역할은 그대로입니다.**",
-    "missing": "⚠️ 고른 역할을 지금 가지고 있지 않습니다.",
+    "missing": "⚠️ 재료 역할을 **모두** 가지고 있어야 합성할 수 있습니다.",
     "result_gone": "⚠️ 이 레시피의 결과 역할이 서버에서 사라졌습니다. 관리자에게 알려 주세요.",
 }
 
@@ -175,7 +171,7 @@ def build_user_embed(guild, member, s: dict) -> discord.Embed:
     have = {r.id for r in getattr(member, "roles", [])}
     embed = discord.Embed(
         title="⚗️ 역할 합성",
-        description=(f"레시피의 재료 역할({FUSION_MIN_INPUTS}~{FUSION_MAX_INPUTS}개)을 **전부 정확히** 골라 합칩니다.\n"
+        description=("레시피의 재료 역할을 **모두** 가지고 있으면 합성할 수 있습니다.\n"
                      "-# 맞는 조합이면 새 역할을 얻고, 재료 역할은 레시피에 따라 사라집니다. "
                      "맞지 않으면 아무것도 잃지 않습니다."),
         color=discord.Color.purple())
@@ -189,18 +185,33 @@ def build_user_embed(guild, member, s: dict) -> discord.Embed:
     return embed
 
 
+def craftable(recipes: dict, have: set[int]) -> list[tuple[str, dict]]:
+    """재료를 **모두** 가진 레시피만 (이미 결과를 가진 것은 뺍니다). 요청: "모두 충족해야 합성"."""
+    out = [(rk, r) for rk, r in recipes.items()
+           if all(int(i) in have for i in r.get("inputs", []))
+           and int(r.get("result", 0)) not in have]
+    return sorted(out, key=lambda x: x[1].get("created", 0))
+
+
+def recipe_option(guild, rk: str, r: dict) -> discord.SelectOption:
+    def nm(rid):
+        role = guild.get_role(int(rid))
+        return role.name if role else str(rid)
+    # 결과는 최초 발견 전까지 ??? — 고르는 칸에서도 새면 안 됩니다
+    out = nm(r["result"]) if r.get("discovered_by") else "???"
+    return discord.SelectOption(label=f"{' + '.join(nm(i) for i in r['inputs'])}"[:100],
+                                description=f"→ {out}"[:100], value=rk)
+
+
 class FuseSelect(discord.ui.Select):
     def __init__(self, options):
-        super().__init__(placeholder=f"합칠 역할 ({FUSION_MIN_INPUTS}~{FUSION_MAX_INPUTS}개)",
-                         min_values=FUSION_MIN_INPUTS,
-                         max_values=min(FUSION_MAX_INPUTS, len(options)), options=options)
+        super().__init__(placeholder="합성할 레시피", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.picked = [int(v) for v in self.values]
-        names = " + ".join(_role_text(interaction.guild, v) for v in self.view.picked)
+        self.view.picked = self.values[0]
         self.view.go.disabled = False
         await interaction.response.edit_message(
-            content=f"⚗️ {names} 을(를) 합성할까요? 아래 **합성하기** 를 누르세요.", view=self.view)
+            content="⚗️ 이 레시피로 합성할까요? 아래 **합성하기** 를 누르세요.", view=self.view)
 
 
 class FuseView(discord.ui.View):
@@ -209,7 +220,7 @@ class FuseView(discord.ui.View):
     def __init__(self, owner_id: int, options):
         super().__init__(timeout=180)
         self.owner_id = owner_id
-        self.picked: list[int] = []
+        self.picked: str | None = None          # 고른 레시피 키
         if options:
             self.add_item(FuseSelect(options))
 
@@ -223,12 +234,18 @@ class FuseView(discord.ui.View):
     @discord.ui.button(label="합성하기", emoji="⚗️", style=discord.ButtonStyle.success,
                        disabled=True, row=1)
     async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if len(self.picked) < FUSION_MIN_INPUTS:
-            await interaction.response.send_message("⚠️ 합칠 역할을 먼저 고르세요.", ephemeral=True)
+        if not self.picked:
+            await interaction.response.send_message("⚠️ 합성할 레시피를 먼저 고르세요.", ephemeral=True)
             return
         # 이 창 자체를 고칠 수 있게 '창 갱신' 으로 미룹니다(성공하면 버튼을 거둡니다)
         await interaction.response.defer()
-        res = await perform_fusion(interaction.guild, interaction.user, self.picked)
+        rec = ((await get_fusion(interaction.guild.id, fresh=True)).get("recipes") or {}).get(self.picked)
+        if rec is None:
+            await interaction.followup.send("⚠️ 그 레시피가 방금 지워졌습니다. `/합성` 을 다시 열어 주세요.",
+                                            ephemeral=True)
+            return
+        # 재료 **전부**가 있는지는 perform_fusion 이 누르는 순간 다시 봅니다
+        res = await perform_fusion(interaction.guild, interaction.user, rec["inputs"])
         st = res["status"]
         if st == "ok":
             result, first = res["result"], res.get("first")
@@ -487,18 +504,17 @@ class Fusion(commands.Cog):
             return
         recipes = s.get("recipes") or {}
         embed = build_user_embed(interaction.guild, interaction.user, s)
-        # 고를 수 있는 것은 **레시피 재료로 쓰이는 역할 중 내가 가진 것**만입니다
-        usable = ingredient_ids(recipes)
-        mine = [r for r in sorted(getattr(interaction.user, "roles", []),
-                                  key=lambda r: getattr(r, "position", 0), reverse=True)
-                if r.id in usable][:25]
-        if len(mine) < 2:
-            embed.add_field(name="🧪 합성할 수 있는 역할",
-                            value="재료 역할을 **2개 이상** 가지고 있어야 합성할 수 있습니다.",
+        # 고를 수 있는 것은 **재료를 모두 가진 레시피**뿐입니다
+        have = {r.id for r in getattr(interaction.user, "roles", [])}
+        ready = craftable(recipes, have)[:25]
+        if not ready:
+            embed.add_field(name="🧪 합성할 수 있는 레시피",
+                            value="재료 역할을 **모두** 가진 레시피가 아직 없습니다.\n"
+                                  "-# 위 레시피의 재료를 전부 모으면 여기서 합성할 수 있습니다.",
                             inline=False)
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
-        options = [discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in mine]
+        options = [recipe_option(interaction.guild, rk, r) for rk, r in ready]
         await interaction.followup.send(embed=embed, view=FuseView(interaction.user.id, options),
                                         ephemeral=True)
 

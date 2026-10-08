@@ -18,9 +18,8 @@ import datetime
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 
-from utils import health
 from utils.database import deduct_user_points, add_user_points, get_user_points, add_activity_log
 from utils.event_db import (
     get_season, save_season, reset_season, season_state, get_season_points,
@@ -209,72 +208,9 @@ class AdminView(discord.ui.View):
             "-# 기본 포인트는 그대로입니다.", view=ConfirmResetView(self.cog), ephemeral=True)
 
 
-def desired_season_perms(any_active: bool) -> str | None:
-    """시즌 명령어의 기본 권한 — 시즌 중엔 None(모두), 아니면 "8"(관리자만)."""
-    return None if any_active else str(discord.Permissions(administrator=True).value)
-
-
-def _perm_value(perms) -> str | None:
-    return None if perms is None else str(perms.value)
-
-
 class Season(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self._applied: str | None | bool = False      # False = 아직 모름
-        self._ticks = 0
-
-    async def cog_load(self):
-        # __init__ 이 아니라 여기서 시작합니다 — 테스트가 Season(None) 을 직접 만듭니다
-        self.sync_season_commands.start()
-
-    async def cog_unload(self):
-        self.sync_season_commands.cancel()
-
-    # ── /시즌뽑기 · /시즌상점: 시즌이 아니면 관리자에게만 보이게 ─────────
-    # 요청(2026-10-05): "시즌 기간이 아니면 기존 유저들은 못 보고 관리자만".
-    # 명령어 자체를 숨기는 길은 **기본 권한(default_member_permissions)** 뿐이라,
-    # 시즌 상태가 바뀔 때 그 값을 고칩니다(봇 토큰으로 자기 명령어를 고칠 수 있습니다).
-    #   · 전역 명령어라 봇이 들어간 **모든 서버**에 함께 적용됩니다. 어느 서버든 시즌
-    #     중이면 보이고, 시즌이 없는 서버에서 치면 명령어 안에서 막습니다.
-    #   · 재시작 때 tree.sync() 가 돌면 데코레이터 값(관리자만)으로 돌아가므로,
-    #     처음 한 번은 반드시 실제 값을 확인합니다(_applied=False).
-    #   · 서버 설정 → 연동에서 명령어 권한을 따로 정해 두면 그쪽이 이깁니다.
-    SEASON_COMMANDS = ("시즌뽑기", "시즌상점")
-
-    @tasks.loop(minutes=1)
-    async def sync_season_commands(self):
-        await self.bot.wait_until_ready()
-        any_active = False
-        for g in self.bot.guilds:
-            if season_state(await get_season(g.id)) == "active":
-                any_active = True
-                break
-        want = desired_season_perms(any_active)
-        self._ticks += 1
-        # 바뀔 때만 디스코드에 묻습니다. 다만 30분마다 한 번은 실제 값을 확인합니다
-        # (재동기화 · 수동 변경으로 어긋났을 수 있습니다).
-        if want == self._applied and self._ticks % 30:
-            return
-        app_id = self.bot.application_id
-        if not app_id:
-            return
-        cmds = await self.bot.tree.fetch_commands()
-        for cmd in cmds:
-            if cmd.name not in self.SEASON_COMMANDS:
-                continue
-            if _perm_value(cmd.default_member_permissions) == want:
-                continue
-            await self.bot.http.edit_global_command(
-                app_id, cmd.id, {"default_member_permissions": want})
-            print(f"[Season] /{cmd.name} 표시 대상: {'모두' if want is None else '관리자만'}",
-                  flush=True)
-        self._applied = want
-
-    @sync_season_commands.error
-    async def sync_season_commands_error(self, error):
-        self._applied = False
-        await health.revive_loop(self.sync_season_commands, "season_command_sync", error)
 
     async def refresh_admin(self, interaction: discord.Interaction) -> None:
         s = await get_season(interaction.guild.id, fresh=True)

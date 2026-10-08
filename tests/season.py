@@ -254,27 +254,32 @@ async def main():
     await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
     ev._cache.clear()
 
-    v = G.GachaPlayView(settings=gs, season_active=False)
+    v = G.GachaPlayView(settings=gs, season_active=True)
     ids = {c.custom_id for c in v.children}
-    note("gacha_season_btn" not in ids and "gacha_roll_btn" in ids, "시즌이 아니면 시즌 버튼을 숨김")
+    note(ids == {"gacha_roll_btn", "gacha_roll10_btn"} and "🏆" in v.roll_gacha.label,
+         "새 패널: 버튼 두 개뿐 · 시즌 중이면 가격 단위 🏆", v.roll_gacha.label)
+    note("P" in G.GachaPlayView(settings=gs, season_active=False).roll_gacha.label,
+         "시즌이 아니면 단위 P")
     v2 = G.GachaPlayView()
     note({"gacha_season_btn", "gacha_season10_btn"} <= {c.custom_id for c in v2.children},
-         "등록용 영구 View 는 시즌 버튼까지 다 가짐 (재시작 뒤에도 동작)")
+         "등록용 영구 View 는 옛 시즌 버튼까지 다 가짐 (옛 패널도 동작)")
 
     print("\n=== 6. 시즌 포인트로 상점 ===")
     await db.save_shop_settings(GID, {"enabled": True, "title": "상점",
                                       "items": [{"id": 1, "name": "한정템", "price": 100, "stock": 3,
                                                  "reward_role_id": 0, "description": ""}]})
-    await ev.add_season_points(GID, 51, 250)
-    sel = SH.ShopSelect((await db.get_shop_settings(GID))["items"])
-    sel._values = ["1"]
-    it = Inter(uid=51, admin=False)
-    await sel.callback(it)
-    view = it.response.sent[-1].get("view")
-    note(isinstance(view, SH.CurrencyChoiceView), "시즌 중에는 '어떤 포인트로' 를 고르게 함")
-    its = [Inter(uid=51, admin=False) for _ in range(3)]
-    await asyncio.gather(*[view.with_season.callback(i) for i in its])
-    note(await sp(51) == 150, "**같은 창을 3번 동시에 눌러도 한 번만 삼**", str(await sp(51)))
+    await ev.add_season_points(GID, 51, 150)
+    p51 = await db.get_user_points(GID, 51)
+    items = (await db.get_shop_settings(GID))["items"]
+    sels = []
+    for _ in range(3):
+        sel = SH.ShopSelect(items, SH.SEASON)
+        sel._values = ["1"]
+        sels.append(sel)
+    await asyncio.gather(*[x.callback(Inter(uid=51, admin=False)) for x in sels])
+    note(await sp(51) == 50 and await db.get_user_points(GID, 51) == p51,
+         "**시즌 중 상점: 고르면 바로 시즌 포인트로 삼** · 3번 동시에 골라도 가진 만큼(1번)만",
+         f"{await sp(51)} / {await db.get_user_points(GID, 51)}")
     s = await db.get_shop_settings(GID)
     note(s["items"][0]["stock"] == 2, "재고도 한 번만 줄어듦")
 
@@ -298,100 +303,62 @@ async def main():
     finally:
         SH.consume_shop_stock = real
 
-    print("\n=== 6-2. /시즌상점 · /시즌뽑기 (시즌 포인트 전용 창) ===")
-    await db.save_shop_settings(GID, {"items": [{"id": 1, "name": "한정템", "price": 100, "stock": 5,
+    print("\n=== 6-2. /뽑기 · /상점 하나로 — 시즌이면 시즌 포인트, 끝나면 기본 포인트 (자동) ===")
+    await db.save_shop_settings(GID, {"items": [{"id": 1, "name": "한정템", "price": 100, "stock": 50,
                                                  "reward_role_id": 0, "description": ""}]})
     shop_cog, gacha_cog = SH.Shop(None), G.Gacha(None)
-    it = Inter(uid=53, admin=False)
-    await SH.Shop.season_shop.callback(shop_cog, it)
+    note(not hasattr(SH.Shop, "season_shop") and not hasattr(G.Gacha, "season_roll"),
+         "/시즌상점 · /시즌뽑기 는 없어짐")
+    u = 53
+    await ev.add_season_points(GID, u, 500)
+    await db.add_user_points(GID, u, 1000)
+
+    it = Inter(uid=u, admin=False)
+    await SH.Shop.point_shop.callback(shop_cog, it)
     sent = it.followup.sent[-1]
-    note(sent.get("ephemeral") is True and isinstance(sent.get("view"), SH.ShopView)
-         and "🏆" in sent["embed"].fields[0].value, "시즌 중 /시즌상점: 시즌 가격으로 보임")
-    await ev.add_season_points(GID, 53, 150)
-    p53 = await db.get_user_points(GID, 53)
+    note(sent.get("ephemeral") and "시즌 포인트로 삽니다" in sent["embed"].description
+         and "🏆" in sent["embed"].fields[0].value, "시즌 중 /상점: 시즌 포인트 가격 · 잔액")
     sel = sent["view"].children[0]
     sel._values = ["1"]
-    it2 = Inter(uid=53, admin=False)
-    await sel.callback(it2)
-    note(await sp(53) == 50 and await db.get_user_points(GID, 53) == p53
-         and "구매 완료" in (it2.response.sent[-1]["embed"].title or ""),
-         "**고르면 바로 시즌 포인트로 삼** (고르는 창 없음 · 기본 포인트 그대로)", str(await sp(53)))
+    p0, s0 = await db.get_user_points(GID, u), await sp(u)
+    await sel.callback(Inter(uid=u, admin=False))
+    note(await sp(u) == s0 - 100 and await db.get_user_points(GID, u) == p0,
+         "**시즌 중 /상점 구매 → 시즌 포인트에서 빠짐**")
 
-    it = Inter(uid=53, admin=False)
-    await G.Gacha.season_roll.callback(gacha_cog, it)
+    it = Inter(uid=u, admin=False)
+    await G.Gacha.roll.callback(gacha_cog, it)
     sent = it.followup.sent[-1]
-    ids = {getattr(c, "custom_id", None) for c in sent["view"].children}
-    note(ids == {"gacha_season_btn", "gacha_season10_btn"},
-         "/시즌뽑기: 시즌 버튼만 (기본 포인트 버튼 없음)", str(ids))
-    note(not any(c.disabled for c in sent["view"].children), "시즌 중이면 누를 수 있음")
+    view = sent["view"]
+    note("시즌 포인트로 뽑습니다" in sent["embed"].description
+         and {c.custom_id for c in view.children} == {"gacha_roll_btn", "gacha_roll10_btn"},
+         "시즌 중 /뽑기: 시즌 포인트 안내 · 버튼 두 개")
+    p0, s0 = await db.get_user_points(GID, u), await sp(u)
+    await view.roll_gacha.callback(Inter(uid=u, admin=False))
+    note(await sp(u) == s0 - 100 + 7 and await db.get_user_points(GID, u) == p0 + 7,
+         "**시즌 중 /뽑기 → 시즌 포인트에서 빠짐** ('둘 다' 방식 경품은 양쪽)",
+         f"{await sp(u) - s0} / {await db.get_user_points(GID, u) - p0}")
 
     s_now = await ev.get_season(GID, fresh=True)
     await set_period(-7200, -60)
-    for label, fn, cog_ in (("시즌상점", SH.Shop.season_shop, shop_cog),
-                            ("시즌뽑기", G.Gacha.season_roll, gacha_cog)):
-        it = Inter(uid=53, admin=False)
-        await fn.callback(cog_, it)
-        note("시즌 기간이 아닙니다" in (it.followup.sent[-1].get("content") or ""),
-             f"시즌 밖 /{label}: 일반 유저는 막힘")
-        it = Inter(uid=7, admin=True)
-        await fn.callback(cog_, it)
-        e = it.followup.sent[-1].get("embed")
-        note(e is not None and "관리자 미리보기" in e.description, f"시즌 밖 /{label}: 관리자는 미리보기")
-    v = it.followup.sent[-1]["view"]
-    note(all(c.disabled for c in v.children), "미리보기 뽑기 버튼은 잠김")
-    await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
-    ev._cache.clear()
-
-    print("\n=== 6-3. 시즌 명령어 표시 대상 (기본 권한) 전환 ===")
-    note(S.desired_season_perms(True) is None and S.desired_season_perms(False) == "8",
-         "시즌 중 → 모두 · 아니면 → 관리자만(8)")
-    for name in ("season_shop", "season_roll"):
-        cmd = getattr(SH.Shop if name == "season_shop" else G.Gacha, name)
-        note(cmd.default_permissions is not None and cmd.default_permissions.administrator,
-             f"/{cmd.name} 등록 기본값은 관리자만 (재시작 직후에도 새지 않게)")
-
-    class FakeCmd:
-        def __init__(self, name, cid, perms):
-            self.name, self.id, self.default_member_permissions = name, cid, perms
-
-    edits = []
-    remote = {1: "8", 2: "8", 3: None}       # 디스코드에 저장된 값 (재시작 직후 = 관리자만)
-
-    def as_perms(v):
-        return None if v is None else discord.Permissions(int(v))
-
-    class FakeTree:
-        async def fetch_commands(self):
-            return [FakeCmd("시즌뽑기", 1, as_perms(remote[1])),
-                    FakeCmd("시즌상점", 2, as_perms(remote[2])),
-                    FakeCmd("뽑기", 3, as_perms(remote[3]))]
-
-    class FakeHttp:
-        async def edit_global_command(self, app, cid, payload):
-            edits.append((cid, payload))
-            remote[cid] = payload["default_member_permissions"]
-
-    class FakeBot:
-        application_id = 99
-        guilds = [GUILD]
-        tree, http = FakeTree(), FakeHttp()
-
-        async def wait_until_ready(self):
-            return None
-
-    sc = S.Season(FakeBot())
-    await sc.sync_season_commands.coro(sc)
-    note(sorted(edits) == [(1, {"default_member_permissions": None}),
-                           (2, {"default_member_permissions": None})],
-         "**시즌 중이면 두 명령어만 '모두' 로** (/뽑기 는 건드리지 않음)", str(edits))
-    edits.clear()
-    await sc.sync_season_commands.coro(sc)
-    note(edits == [], "같은 상태면 다시 묻지 않음")
-    await set_period(-7200, -60)
-    await sc.sync_season_commands.coro(sc)
-    note(sorted(edits) == [(1, {"default_member_permissions": "8"}),
-                           (2, {"default_member_permissions": "8"})],
-         "시즌이 끝나면 다시 관리자만", str(edits))
+    # 시즌 중에 띄워 둔 패널의 버튼을 시즌이 끝난 뒤 눌러도 → 기본 포인트
+    p0 = await db.get_user_points(GID, u)
+    await view.roll_gacha.callback(Inter(uid=u, admin=False))
+    note(await db.get_user_points(GID, u) == p0 - 100 + 7,
+         "**시즌이 끝나면 같은 버튼도 기본 포인트로** (누르는 순간 기준)")
+    old_panel = G.GachaPlayView()
+    p0 = await db.get_user_points(GID, u)
+    await old_panel.season_1.callback(Inter(uid=u, admin=False))
+    note(await db.get_user_points(GID, u) == p0 - 100 + 7, "옛 패널의 '🏆 시즌' 버튼도 기본 포인트로 동작")
+    it = Inter(uid=u, admin=False)
+    await SH.Shop.point_shop.callback(shop_cog, it)
+    sent = it.followup.sent[-1]
+    note("시즌 포인트" not in sent["embed"].description and "P" in sent["embed"].fields[0].value,
+         "시즌이 끝나면 /상점 은 기본 포인트 화면")
+    sel = sent["view"].children[0]
+    sel._values = ["1"]
+    p0 = await db.get_user_points(GID, u)
+    await sel.callback(Inter(uid=u, admin=False))
+    note(await db.get_user_points(GID, u) == p0 - 100, "시즌이 끝나면 /상점 구매 → 기본 포인트")
     await ev.save_season(GID, s_now["name"], s_now["start"], s_now["end"])
     ev._cache.clear()
 

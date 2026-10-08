@@ -39,8 +39,8 @@ async def buy_item(interaction: discord.Interaction, settings: dict, item: dict,
     """상품 하나 구매. 기본 포인트도 시즌 포인트도 **이 함수 하나**로 삽니다.
 
     두 갈래로 두면 한쪽에만 검사가 들어가 다른 쪽으로 우회됩니다(뽑기에서 겪음).
-    `respond(embed)` 로 결과를 보냅니다 — 선택 메뉴는 새 메시지, 포인트 고르기
-    버튼은 그 창을 결과로 바꿉니다(다시 눌러 두 번 사지 않게).
+    `respond(embed)` 로 결과를 보냅니다. 어느 포인트로 낼지는 부르는 쪽이
+    정합니다(시즌 중이면 시즌 포인트 — `current_currency`).
     """
     guild_id = interaction.guild.id
     uid = interaction.user.id
@@ -125,49 +125,24 @@ async def buy_item(interaction: discord.Interaction, settings: dict, item: dict,
     await respond(embed)
 
 
-class CurrencyChoiceView(discord.ui.View):
-    """시즌 기간에 '기본 포인트로 / 시즌 포인트로' 를 고릅니다.
-
-    누르는 순간 상품을 **다시 읽습니다** — 고른 뒤 2분 사이 가격 · 재고가 바뀌었을
-    수 있습니다. 한 번 누르면 이 창은 결과로 바뀌고, 그 사이 또 눌러도 한 번만 삽니다.
-    """
-
-    def __init__(self, item_id):
-        super().__init__(timeout=120)
-        self.item_id = str(item_id)
-        self.used = False
-
-    async def _buy(self, interaction: discord.Interaction, currency: str):
-        if self.used:
-            await interaction.response.send_message("ℹ️ 이미 처리한 구매입니다.", ephemeral=True)
-            return
-        self.used = True
-        settings = await get_shop_settings(interaction.guild.id)
-        item = next((i for i in settings.get("items", []) if str(i.get("id")) == self.item_id), None)
-        if item is None or item.get("stock", -1) == 0:
-            await interaction.response.edit_message(
-                embed=discord.Embed(title="⚠️ 살 수 없는 상품입니다",
-                                    description="방금 품절됐거나 상점에서 빠졌습니다.",
-                                    color=discord.Color.red()), view=None)
-            return
-
-        async def respond(e):
-            await interaction.response.edit_message(embed=e, view=None)
-        await buy_item(interaction, settings, item, currency, respond)
-
-    @discord.ui.button(label="기본 포인트로", emoji="💰", style=discord.ButtonStyle.primary)
-    async def with_points(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._buy(interaction, POINTS)
-
-    @discord.ui.button(label="시즌 포인트로", emoji="🏆", style=discord.ButtonStyle.success)
-    async def with_season(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._buy(interaction, SEASON)
-
 # ── Shop Purchase View ────────────────────────────────────────────────
+
+async def current_currency(guild_id: int) -> str:
+    """지금 낼 포인트 — **시즌 중이면 시즌 포인트, 아니면 기본 포인트**(요청 2026-10-08).
+
+    고르는 순간에 정합니다. 상점 창을 띄운 뒤 시즌이 시작 · 종료돼도 그때 기준으로
+    맞는 포인트가 빠집니다.
+    """
+    try:
+        return SEASON if season_state(await get_season(guild_id)) == "active" else POINTS
+    except Exception as e:
+        print(f"[Shop] 시즌 확인 실패(기본 포인트로): {type(e).__name__}: {e}", flush=True)
+        return POINTS
+
 
 class ShopSelect(discord.ui.Select):
     def __init__(self, items: list[dict], currency: str | None = None):
-        # currency=SEASON 이면 /시즌상점 — 고르지 않고 **시즌 포인트로만** 삽니다
+        # currency 는 **화면 글자용**입니다. 실제로 낼 포인트는 고르는 순간 정합니다.
         self.currency = currency
         unit = "🏆" if currency == SEASON else "P"
         # 비싼 순으로 정렬 (내림차순)
@@ -207,8 +182,6 @@ class ShopSelect(discord.ui.Select):
 
         stock = selected_item.get("stock", -1)
         item_name = selected_item["name"]
-        price = selected_item["price"]
-        reward_role_id = selected_item.get("reward_role_id", 0)
 
         # 재고 검사 (0개면 품절)
         if stock == 0:
@@ -220,28 +193,12 @@ class ShopSelect(discord.ui.Select):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        if self.currency == SEASON:
-            # /시즌상점 — 시즌 포인트로만. 시즌이 끝났으면 buy_item 이 알립니다.
-            async def respond_season(e):
-                await interaction.response.send_message(embed=e, ephemeral=True)
-            await buy_item(interaction, settings, selected_item, SEASON, respond_season)
-            return
-
-        # 시즌 기간이면 어떤 포인트로 낼지 고르게 합니다
-        if season_state(await get_season(guild_id)) == "active":
-            sp = await get_season_points(guild_id, interaction.user.id)
-            embed = discord.Embed(
-                title=f"🛒 {item_name}",
-                description=(f"어떤 포인트로 살까요? (가격 **{price:,}**)\n"
-                             f"🏆 내 시즌 포인트 **{sp:,}**"),
-                color=discord.Color.blurple())
-            await interaction.response.send_message(
-                embed=embed, view=CurrencyChoiceView(selected_item["id"]), ephemeral=True)
-            return
+        # 시즌 중이면 시즌 포인트, 아니면 기본 포인트로 **바로** 삽니다(고르는 창 없음)
+        currency = await current_currency(guild_id)
 
         async def respond(e):
             await interaction.response.send_message(embed=e, ephemeral=True)
-        await buy_item(interaction, settings, selected_item, POINTS, respond)
+        await buy_item(interaction, settings, selected_item, currency, respond)
 
 class ShopView(discord.ui.View):
     def __init__(self, items: list[dict], currency: str | None = None):
@@ -599,14 +556,21 @@ class Shop(commands.Cog):
 
         shop_title = settings.get("title", "한바헌 포인트 상점")
         items = settings.get("items", [])
-        user_points = await get_user_points(interaction.guild.id, interaction.user.id)
+        # 시즌 중이면 **시즌 포인트로** 삽니다. 화면의 가격 · 잔액도 시즌 포인트입니다.
+        currency = await current_currency(interaction.guild.id)
+        if currency == SEASON:
+            user_points = await get_season_points(interaction.guild.id, interaction.user.id)
+            unit, mine = "🏆", "🏆 **현재 내 시즌 포인트**"
+        else:
+            user_points = await get_user_points(interaction.guild.id, interaction.user.id)
+            unit, mine = "P", "💰 **현재 내 보유 포인트**"
 
         title_str = f"🛒 [비활성화 상태] {shop_title}" if not is_enabled else f"🛒 {shop_title}"
 
         if not items:
             embed = discord.Embed(
                 title=title_str,
-                description=f"현재 준비된 상점 상품이 없습니다!\n\n💰 **내 보유 포인트**: **{user_points:,} P**",
+                description=f"현재 준비된 상점 상품이 없습니다!\n\n{mine}: **{user_points:,} {unit}**",
                 color=discord.Color.purple() if is_enabled else discord.Color.red()
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -614,7 +578,9 @@ class Shop(commands.Cog):
 
         embed = discord.Embed(
             title=title_str,
-            description=f"원하시는 상품을 아래 메뉴에서 선택하여 구매해 보세요!\n\n💰 **현재 내 보유 포인트**: **{user_points:,} P**",
+            description=("원하시는 상품을 아래 메뉴에서 선택하여 구매해 보세요!\n\n"
+                         + ("🏆 **시즌 기간이라 시즌 포인트로 삽니다.**\n" if currency == SEASON else "")
+                         + f"{mine}: **{user_points:,} {unit}**"),
             color=discord.Color.purple() if is_enabled else discord.Color.red()
         )
 
@@ -624,7 +590,7 @@ class Shop(commands.Cog):
             stock_str = format_stock_str(item.get('stock', -1))
             role_id = item.get('reward_role_id', 0)
 
-            info_lines = [f"• **가격**: `{item['price']:,} P` | **재고**: `{stock_str}`"]
+            info_lines = [f"• **가격**: `{item['price']:,} {unit}` | **재고**: `{stock_str}`"]
             if item.get('description'):
                 info_lines.append(f"• **설명**: {parse_role_mentions(item['description'])}")
             if role_id > 0:
@@ -637,61 +603,12 @@ class Shop(commands.Cog):
                 value="\n".join(info_lines),
                 inline=False
             )
-        embed.set_footer(text=f"선택 메뉴에서 항목을 고르면 포인트를 사용하여 즉시 구매하실 수 있습니다.")
+        embed.set_footer(text="선택 메뉴에서 항목을 고르면 "
+                              + ("시즌 포인트로" if currency == SEASON else "포인트로")
+                              + " 즉시 구매됩니다.")
 
-        view = ShopView(items)
+        view = ShopView(items, currency)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    @app_commands.command(name="시즌상점", description="시즌 포인트로 상점 상품을 삽니다. (시즌 기간에만)")
-    @app_commands.guild_only()
-    # 시즌이 아닐 때는 관리자에게만 보입니다. 시즌 중에는 cogs/season.py 의
-    # sync_season_commands 가 이 기본값을 '모두' 로 바꿉니다.
-    @app_commands.default_permissions(administrator=True)
-    async def season_shop(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        gid = interaction.guild.id
-        is_admin = interaction.user.guild_permissions.administrator
-        s = await get_season(gid)
-        active = season_state(s) == "active"
-        # 명령어 숨김은 디스코드 화면 쪽 장치라, 서버 설정으로 덮였거나 화면이 아직
-        # 안 바뀐 사람이 칠 수 있습니다 — 여기서도 막습니다.
-        if not active and not is_admin:
-            await interaction.followup.send("⚠️ 지금은 시즌 기간이 아닙니다.", ephemeral=True)
-            return
-        settings = await get_shop_settings(gid)
-        if not settings.get("enabled", True) and not is_admin:
-            await interaction.followup.send("⚠️ 현재 포인트 상점이 **비활성화** 상태입니다.",
-                                            ephemeral=True)
-            return
-        items = settings.get("items", [])
-        sp = await get_season_points(gid, interaction.user.id)
-        name = s.get("name") or "시즌"
-        embed = discord.Embed(
-            title=f"🏆 {name} 상점",
-            description=(f"상점 상품을 **시즌 포인트로** 삽니다.\n\n"
-                         f"🏆 **내 시즌 포인트**: **{sp:,}**"
-                         + (f"\n⏳ <t:{int(float(s['end']))}:R> 시즌이 끝나면 시즌 포인트는 소멸합니다"
-                            if active else "")),
-            color=discord.Color.gold())
-        if not active:
-            embed.description = ("👀 **관리자 미리보기** — 시즌 기간이 아니라 일반 유저에게는 이 "
-                                 "명령어가 보이지 않습니다.\n\n" + embed.description)
-        if not items:
-            embed.description += "\n\n현재 준비된 상점 상품이 없습니다!"
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-        for item in sorted(items, key=lambda x: x.get("price", 0), reverse=True):
-            lines = [f"• **가격**: `{item['price']:,} 🏆` | **재고**: "
-                     f"`{format_stock_str(item.get('stock', -1))}`"]
-            if item.get("description"):
-                lines.append(f"• **설명**: {parse_role_mentions(item['description'])}")
-            rid = item.get("reward_role_id", 0)
-            if rid > 0:
-                role = interaction.guild.get_role(rid)
-                lines.append(f"• **혜택**: {role.mention if role else f'ID: {rid}'} 역할 부여")
-            embed.add_field(name=f"📦 {item['name']}", value="\n".join(lines)[:1024], inline=False)
-        embed.set_footer(text="고르면 시즌 포인트로 바로 구매됩니다.")
-        await interaction.followup.send(embed=embed, view=ShopView(items, SEASON), ephemeral=True)
 
     @app_commands.command(name="상점설정", description="[관리자 전용] 포인트 상점의 이름, 상품, 가격, 재고, 역할을 관리합니다.")
     # DM 에서는 interaction.guild 가 None 이라 AttributeError 로 죽습니다.

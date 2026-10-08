@@ -20,6 +20,19 @@ from utils.event_db import (
 POINTS, SEASON = "points", "season"
 
 
+async def current_currency(guild_id: int) -> str:
+    """지금 낼 포인트 — **시즌 중이면 시즌 포인트, 아니면 기본 포인트**(요청 2026-10-08).
+
+    누르는 순간에 정합니다. 패널을 띄운 뒤 시즌이 시작 · 종료돼도 그때 기준으로
+    맞는 포인트가 빠집니다(패널 글자는 띄운 시점 기준이라 다를 수 있습니다).
+    """
+    try:
+        return SEASON if season_state(await get_season(guild_id)) == "active" else POINTS
+    except Exception as e:
+        print(f"[Gacha] 시즌 확인 실패(기본 포인트로): {type(e).__name__}: {e}", flush=True)
+        return POINTS
+
+
 async def prize_unit(guild_id: int) -> str:
     """경품 포인트가 어디로 들어가는지 — 패널 글자가 실제 적립과 같아야 합니다.
 
@@ -254,7 +267,7 @@ def summarize_results(results: list[dict]) -> list[tuple]:
 
 class GachaPlayView(discord.ui.View):
     def __init__(self, is_out_of_stock: bool = False, settings: dict | None = None,
-                 season_active: bool = True):
+                 season_active: bool = False):
         # ⚠️ **영구 View 입니다** (`timeout=None` + `setup()` 의 `bot.add_view`).
         # 예전에는 `timeout=180` 이라 유저가 확률표를 3분 넘게 읽고 누르면
         # 아무 핸들러에도 닿지 않아 "적시에 응답하지 않았어요" 만 떴습니다.
@@ -266,19 +279,17 @@ class GachaPlayView(discord.ui.View):
         super().__init__(timeout=None)
 
         if settings is not None:
+            # 시즌 중이면 가격 단위가 🏆(시즌 포인트)입니다 — 누를 때도 시즌 포인트가 빠집니다
+            unit = "🏆" if season_active else "P"
             saving = bulk_discount(settings)
-            self.roll_gacha.label = f"1회 뽑기 ({settings.get('price', 100):,} P)"
+            self.roll_gacha.label = f"1회 뽑기 ({settings.get('price', 100):,} {unit})"
             self.roll_gacha_10.label = (
-                f"{BULK_COUNT}회 뽑기 ({bulk_price(settings):,} P"
-                + (f" · {saving:,} P 할인)" if saving else ")")
+                f"{BULK_COUNT}회 뽑기 ({bulk_price(settings):,} {unit}"
+                + (f" · {saving:,} {unit} 할인)" if saving else ")")
             )
-
-            self.season_1.label = f"시즌 1회 ({settings.get('price', 100):,})"
-            self.season_10.label = f"시즌 {BULK_COUNT}회 ({bulk_price(settings):,})"
-
-        # 시즌이 아니면 화면에서 뺍니다. **등록된 영구 View(setup)는 그대로** 다 갖고
-        # 있어야 옛 패널의 버튼도 처리됩니다 — 그쪽은 기본값 True 로 만듭니다.
-        if not season_active:
+            # 예전 '🏆 시즌' 버튼은 화면에 두지 않습니다(버튼 두 개가 같은 일을 합니다).
+            # **등록용 영구 View(settings=None)는 그대로 갖고** 있어야, 그 버튼이
+            # 남아 있는 옛 패널을 눌러도 처리됩니다.
             self.remove_item(self.season_1)
             self.remove_item(self.season_10)
 
@@ -318,7 +329,8 @@ class GachaPlayView(discord.ui.View):
             # 화면에 반영된 적이 없고 로그도 남지 않았습니다.**
             # 컴포넌트 상호작용은 자기 메시지를 `response.edit_message` 로
             # 고칠 수 있으므로 그쪽을 씁니다.
-            locked = GachaPlayView(is_out_of_stock=True, settings=settings)
+            locked = GachaPlayView(is_out_of_stock=True, settings=settings,
+                                   season_active=await current_currency(interaction.guild.id) == SEASON)
             embed = discord.Embed(
                 title="⚠️ 모든 뽑기 상품 품절",
                 description="현재 남아있는 모든 뽑기 상품의 재고가 소진(품절)되었습니다.",
@@ -346,9 +358,9 @@ class GachaPlayView(discord.ui.View):
 
         return True
 
-    async def _run(self, interaction: discord.Interaction, count: int, total_price: int,
-                   currency: str = POINTS):
+    async def _run(self, interaction: discord.Interaction, count: int, total_price: int):
         settings = await get_gacha_settings(interaction.guild.id)
+        currency = await current_currency(interaction.guild.id)
         if not await self._precheck(interaction, settings):
             return
 
@@ -381,7 +393,8 @@ class GachaPlayView(discord.ui.View):
                 embed=discord.Embed(
                     title="⚠️ 방금 품절되었습니다",
                     description="뽑을 수 있는 상품의 재고가 방금 모두 소진되었습니다.\n\n"
-                                f"💰 차감된 **{total_price:,} P**는 **전액 환불**되었습니다.",
+                                f"💰 차감된 **{total_price:,} {'시즌 포인트' if currency == SEASON else 'P'}**는 "
+                                "**전액 환불**되었습니다.",
                     color=discord.Color.orange()),
                 ephemeral=True)
             return
@@ -496,18 +509,19 @@ class GachaPlayView(discord.ui.View):
         settings = await get_gacha_settings(interaction.guild.id)
         await self._run(interaction, BULK_COUNT, bulk_price(settings))
 
-    # 시즌 포인트로 — 값은 기본 포인트와 같습니다(시즌 기간에만 보입니다)
+    # 예전 패널에 남아 있는 '🏆 시즌' 버튼 — 이제 위 버튼과 똑같이 동작합니다
+    # (시즌 중이면 시즌 포인트, 아니면 기본 포인트). 새 패널에는 보이지 않습니다.
     @discord.ui.button(label="시즌 1회", style=discord.ButtonStyle.secondary,
                        emoji="🏆", custom_id="gacha_season_btn", row=1)
     async def season_1(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await get_gacha_settings(interaction.guild.id)
-        await self._run(interaction, 1, int(settings.get("price", 100) or 0), SEASON)
+        await self._run(interaction, 1, int(settings.get("price", 100) or 0))
 
     @discord.ui.button(label="시즌 10회", style=discord.ButtonStyle.secondary,
                        emoji="🏆", custom_id="gacha_season10_btn", row=1)
     async def season_10(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await get_gacha_settings(interaction.guild.id)
-        await self._run(interaction, BULK_COUNT, bulk_price(settings), SEASON)
+        await self._run(interaction, BULK_COUNT, bulk_price(settings))
 
 
 # ── Admin Gacha Settings Modals & Views ───────────────────────────────
@@ -1047,14 +1061,21 @@ class Gacha(commands.Cog):
         gacha_title = settings.get("title", "한바헌 럭키 뽑기")
         price = settings.get("price", 100)
         items = settings.get("items", [])
-        user_points = await get_user_points(interaction.guild.id, interaction.user.id)
+        # 시즌 중이면 **시즌 포인트로** 뽑습니다. 화면의 가격 · 잔액도 시즌 포인트입니다.
+        season_on = await current_currency(interaction.guild.id) == SEASON
+        if season_on:
+            user_points = await get_season_points(interaction.guild.id, interaction.user.id)
+            unit, mine = "🏆", "🏆 **현재 내 시즌 포인트**"
+        else:
+            user_points = await get_user_points(interaction.guild.id, interaction.user.id)
+            unit, mine = "P", "💰 **현재 내 보유 포인트**"
 
         title_str = f"[비활성화 상태] {gacha_title}" if not is_enabled else gacha_title
 
         if not items:
             embed = discord.Embed(
                 title=title_str,
-                description=f"현재 준비된 뽑기 항목이 없습니다!\n\n💰 **내 보유 포인트**: **{user_points:,} P**",
+                description=f"현재 준비된 뽑기 항목이 없습니다!\n\n{mine}: **{user_points:,} {unit}**",
                 color=discord.Color.gold() if is_enabled else discord.Color.red()
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1080,11 +1101,12 @@ class Gacha(commands.Cog):
         embed = discord.Embed(
             title=title_str,
             description=f"{desc_header}"
-                        f"💳 **1회 뽑기 가격**: **{price:,} P**\n"
-                        f"🎰 **{BULK_COUNT}회 뽑기 가격**: **{bulk_price(settings):,} P**"
-                        + (f" (**{bulk_discount(settings):,} P 할인**)\n"
+                        + (f"🏆 **시즌 기간이라 시즌 포인트로 뽑습니다.**\n" if season_on else "")
+                        + f"💳 **1회 뽑기 가격**: **{price:,} {unit}**\n"
+                        f"🎰 **{BULK_COUNT}회 뽑기 가격**: **{bulk_price(settings):,} {unit}**"
+                        + (f" (**{bulk_discount(settings):,} {unit} 할인**)\n"
                            if bulk_discount(settings) else "\n")
-                        + f"💰 **현재 내 보유 포인트**: **{user_points:,} P**\n\n"
+                        + f"{mine}: **{user_points:,} {unit}**\n\n"
                         f"{status_line}",
             color=discord.Color.gold() if (is_ready and not is_all_sold_out) else discord.Color.red()
         )
@@ -1111,85 +1133,8 @@ class Gacha(commands.Cog):
             )
         embed.set_footer(text="당첨된 역할이나 포인트는 계정에 즉시 지급됩니다.")
 
-        s = await get_season(interaction.guild.id)
-        season_on = season_state(s) == "active"
-        if season_on:
-            sp = await get_season_points(interaction.guild.id, interaction.user.id)
-            embed.description += (f"\n🏆 **시즌 포인트로도 뽑을 수 있습니다** (같은 값) — "
-                                  f"내 시즌 포인트 **{sp:,}**")
         view = GachaPlayView(is_out_of_stock=is_all_sold_out, settings=settings,
                              season_active=season_on)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    @app_commands.command(name="시즌뽑기", description="시즌 포인트로 럭키 뽑기를 돌립니다. (시즌 기간에만)")
-    @app_commands.guild_only()
-    # 시즌이 아닐 때는 관리자에게만 보입니다. 시즌 중에는 cogs/season.py 의
-    # sync_season_commands 가 이 기본값을 '모두' 로 바꿉니다.
-    @app_commands.default_permissions(administrator=True)
-    async def season_roll(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        gid = interaction.guild.id
-        is_admin = interaction.user.guild_permissions.administrator
-        s = await get_season(gid)
-        active = season_state(s) == "active"
-        # 명령어 숨김은 디스코드 화면 쪽 장치라, 서버 설정으로 덮였거나 화면이 아직
-        # 안 바뀐 사람이 칠 수 있습니다 — 여기서도 막습니다.
-        if not active and not is_admin:
-            await interaction.followup.send("⚠️ 지금은 시즌 기간이 아닙니다.", ephemeral=True)
-            return
-        settings = await get_gacha_settings(gid)
-        if not settings.get("enabled", True) and not is_admin:
-            await interaction.followup.send("⚠️ 현재 럭키 뽑기가 **비활성화** 상태입니다.",
-                                            ephemeral=True)
-            return
-        items = settings.get("items", [])
-        sp = await get_season_points(gid, interaction.user.id)
-        name = s.get("name") or "시즌"
-        sold_out = not [i for i in items if i.get("stock", -1) != 0]
-        ready = is_valid_100_percent(items) and not sold_out
-        if not items:
-            status = "현재 준비된 뽑기 항목이 없습니다!"
-        elif sold_out:
-            status = "⚠️ 현재 모든 뽑기 상품의 재고가 소진되었습니다."
-        elif not ready:
-            status = (f"⚠️ 전체 확률 합계가 **{pct_str(get_total_percent(items), exact=True)}%**"
-                      "로 100%가 아니라 뽑을 수 없습니다.")
-        else:
-            status = "✅ 지금 뽑을 수 있습니다."
-        embed = discord.Embed(
-            title=f"🏆 {name} 뽑기 — {settings.get('title', '럭키 뽑기')}",
-            description=(f"럭키 뽑기를 **시즌 포인트로** 돌립니다.\n\n"
-                         f"💳 **1회**: **{int(settings.get('price', 100) or 0):,} 🏆**\n"
-                         f"🎰 **{BULK_COUNT}회**: **{bulk_price(settings):,} 🏆**\n"
-                         f"🏆 **내 시즌 포인트**: **{sp:,}**\n\n{status}"),
-            color=discord.Color.gold() if ready else discord.Color.red())
-        if not active:
-            embed.description = ("👀 **관리자 미리보기** — 시즌 기간이 아니라 일반 유저에게는 이 "
-                                 "명령어가 보이지 않고, 지금은 뽑을 수 없습니다.\n\n"
-                                 + embed.description)
-        unit_label = await prize_unit(gid)
-        for item in sorted(items, key=lambda x: float(x.get("percent", x.get("weight", 0)))):
-            pct = float(item.get("percent", item.get("weight", 0)))
-            lines = [f"• **확률**: `{pct_str(pct)}%` | **재고**: "
-                     f"`{format_stock_str(item.get('stock', -1))}`"]
-            rid = item.get("reward_role_id", 0)
-            if rid > 0:
-                role = interaction.guild.get_role(rid)
-                lines.append(f"• **보상 혜택**: {role.mention if role else f'ID: {rid}'}")
-            elif item.get("reward_points", 0) > 0:
-                lines.append(f"• **보상 혜택**: `+{item['reward_points']:,} {unit_label}` 적립")
-            embed.add_field(name=f"🎁 {item['name']}", value="\n".join(lines), inline=False)
-        if not items:
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-        view = GachaPlayView(is_out_of_stock=sold_out or not active, settings=settings,
-                             season_active=True)
-        # 시즌 포인트 버튼만 남깁니다(같은 영구 View 의 custom_id 라 재시작 뒤에도 동작)
-        view.remove_item(view.roll_gacha)
-        view.remove_item(view.roll_gacha_10)
-        if not view.season_1.disabled:
-            view.season_1.style = discord.ButtonStyle.primary
-            view.season_10.style = discord.ButtonStyle.success
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="뽑기설정", description="[관리자 전용] 럭키 뽑기의 이름, 설명, 가격, 당첨 항목, 확률(총합 100%), 재고, 역할을 관리합니다.")

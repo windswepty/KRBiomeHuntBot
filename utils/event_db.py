@@ -5,6 +5,7 @@
   pumpkin_hits     하루 한 번 기록 (_id = 길드:회차:KST날짜:유저) — **삽입이 곧 판정**
   season_settings  길드별 시즌 (이름 · 시작 · 끝 · 시즌 ID)
   season_points    시즌 포인트 (_id = 길드:시즌ID:유저)
+  fusion_settings  역할 합성 레시피 (_id = 길드, recipes = {레시피키: {...}})
 
 utils/database.py 가 이 모듈을 부릅니다(배율 · 시즌 적립). **반대로 부르지
 마세요** — 순환 import 가 됩니다. 그래서 Mongo 연결도 따로 엽니다(mod_db 와 같음).
@@ -39,12 +40,14 @@ PUMPKIN_FILE = os.path.join(DATA_DIR, "pumpkin_event.json")
 PUMPKIN_HITS_FILE = os.path.join(DATA_DIR, "pumpkin_hits.json")
 SEASON_FILE = os.path.join(DATA_DIR, "season_settings.json")
 SEASON_PTS_FILE = os.path.join(DATA_DIR, "season_points.json")
+FUSION_FILE = os.path.join(DATA_DIR, "fusion_settings.json")
 MONGO_URI = os.getenv("MONGO_URI")
 
 KST = timezone(timedelta(hours=9))
 
 _pumpkin_lock = asyncio.Lock()
 _season_lock = asyncio.Lock()
+_fusion_lock = asyncio.Lock()
 
 _AFTER = None
 try:
@@ -57,6 +60,7 @@ pumpkin_col = None
 pumpkin_hits_col = None
 season_col = None
 season_pts_col = None
+fusion_col = None
 
 if MONGO_URI:
     try:
@@ -68,6 +72,7 @@ if MONGO_URI:
         pumpkin_hits_col = _edb["pumpkin_hits"]
         season_col = _edb["season_settings"]
         season_pts_col = _edb["season_points"]
+        fusion_col = _edb["fusion_settings"]
         _AFTER = _ReturnDocument.AFTER
         try:
             # '오늘 몇 명 쳤나' 를 셉니다. 한 달 지난 기록은 쓸 일이 없습니다.
@@ -83,7 +88,7 @@ if MONGO_URI:
     except Exception as e:
         print(f"MongoDB (event) connection warning: {e}. Falling back to local JSON storage.",
               flush=True)
-        pumpkin_col = pumpkin_hits_col = season_col = season_pts_col = None
+        pumpkin_col = pumpkin_hits_col = season_col = season_pts_col = fusion_col = None
 
 
 async def _db(fn, *args, **kwargs):
@@ -706,3 +711,152 @@ async def credit_earned(guild_id: int, user_id: int, base_points: int,
     except Exception as e:
         print(f"[EventDB] 시즌 적립 실패: {type(e).__name__}: {e}", flush=True)
         return 0
+
+
+# ── 역할 합성 ─────────────────────────────────────────────────────────
+#
+# 역할 두 개를 합쳐 히든 역할을 얻습니다(요청 2026-10-08). 레시피는 **배열이
+# 아니라 키로 찾는 사전**(`recipes.<키>`)에 둡니다 — 추가 · 삭제를 각각 한
+# 칸만 건드리는 원자 연산으로 할 수 있어서, 관리자 둘이 동시에 고쳐도 서로의
+# 레시피를 지우지 않습니다(뽑기 items 를 통째로 덮어써 재고가 되살아난 교훈).
+# 키는 재료 두 역할 ID 를 **정렬해서** 만듭니다 — A+B 와 B+A 는 같은 레시피입니다.
+
+DEFAULT_FUSION = {"enabled": True, "announce": False, "recipes": {}}
+
+
+def recipe_key(a, b) -> str:
+    x, y = sorted((int(a), int(b)))
+    return f"r{x}_{y}"
+
+
+async def get_fusion(guild_id: int, fresh: bool = False) -> dict:
+    if not fresh:
+        hit = _cached("fusion", guild_id)
+        if hit is not None:
+            return {**hit, "recipes": dict(hit.get("recipes") or {})}
+    key = str(guild_id)
+    doc = None
+    if fusion_col is not None:
+        try:
+            doc = await _db(fusion_col.find_one, {"_id": key})
+        except Exception as e:
+            print(f"MongoDB get_fusion error: {e}, using local file.", flush=True)
+            async with _fusion_lock:
+                doc = _read_json(FUSION_FILE).get(key)
+    else:
+        async with _fusion_lock:
+            doc = _read_json(FUSION_FILE).get(key)
+    out = {k: (doc or {}).get(k, v) for k, v in DEFAULT_FUSION.items()}
+    out["recipes"] = dict(out.get("recipes") or {})
+    _remember("fusion", guild_id, out)
+    return {**out, "recipes": dict(out["recipes"])}
+
+
+async def save_fusion_settings(guild_id: int, changes: dict) -> None:
+    """켜기 · 공개 알림 같은 설정. **레시피는 여기서 저장하지 않습니다**(통째 덮어쓰기 금지)."""
+    payload = {k: v for k, v in changes.items() if k in ("enabled", "announce")}
+    if not payload:
+        return
+    _forget("fusion", guild_id)
+    key = str(guild_id)
+    if fusion_col is not None:
+        try:
+            await _db(fusion_col.update_one, {"_id": key}, {"$set": payload}, upsert=True)
+            _forget("fusion", guild_id)
+            return
+        except Exception as e:
+            print(f"MongoDB save_fusion_settings error: {e}, using local file.", flush=True)
+    async with _fusion_lock:
+        rows = _read_json(FUSION_FILE)
+        rows.setdefault(key, {}).update(payload)
+        _write_json(FUSION_FILE, rows)
+    _forget("fusion", guild_id)
+
+
+async def add_fusion_recipe(guild_id: int, a: int, b: int, result: int,
+                            consume: bool = True) -> bool:
+    """레시피 추가. 같은 재료 조합이 이미 있으면 False (덮어쓰지 않습니다).
+
+    '없을 때만 넣기' 를 **필터**(`$exists: False`)로 판정합니다. 문서는 있는데
+    그 키가 이미 있으면 필터가 안 맞아 upsert 가 같은 _id 로 삽입을 시도하고,
+    그게 DuplicateKey 로 거절됩니다 — 동시에 같은 조합을 넣어도 하나만 남습니다.
+    """
+    rk = recipe_key(a, b)
+    entry = {"inputs": sorted([int(a), int(b)]), "result": int(result),
+             "consume": bool(consume), "created": time.time()}
+    key = str(guild_id)
+    _forget("fusion", guild_id)
+    if fusion_col is not None:
+        try:
+            await _db(fusion_col.update_one,
+                      {"_id": key, f"recipes.{rk}": {"$exists": False}},
+                      {"$set": {f"recipes.{rk}": entry}}, upsert=True)
+            _forget("fusion", guild_id)
+            return True
+        except _DuplicateKey:
+            return False
+        except Exception as e:
+            print(f"MongoDB add_fusion_recipe error: {e}, using local file.", flush=True)
+    async with _fusion_lock:
+        rows = _read_json(FUSION_FILE)
+        recipes = rows.setdefault(key, {}).setdefault("recipes", {})
+        if rk in recipes:
+            return False
+        recipes[rk] = entry
+        _write_json(FUSION_FILE, rows)
+    _forget("fusion", guild_id)
+    return True
+
+
+async def remove_fusion_recipe(guild_id: int, rk: str) -> bool:
+    """레시피 하나만 지웁니다. 없었으면 False."""
+    key = str(guild_id)
+    _forget("fusion", guild_id)
+    if fusion_col is not None:
+        try:
+            res = await _db(fusion_col.update_one,
+                            {"_id": key, f"recipes.{rk}": {"$exists": True}},
+                            {"$unset": {f"recipes.{rk}": ""}})
+            _forget("fusion", guild_id)
+            return bool(getattr(res, "matched_count", 0))
+        except Exception as e:
+            print(f"MongoDB remove_fusion_recipe error: {e}, using local file.", flush=True)
+    async with _fusion_lock:
+        rows = _read_json(FUSION_FILE)
+        gone = (rows.get(key, {}).get("recipes") or {}).pop(rk, None) is not None
+        if gone:
+            _write_json(FUSION_FILE, rows)
+    _forget("fusion", guild_id)
+    return gone
+
+
+async def mark_recipe_discovered(guild_id: int, rk: str, user_id: int) -> bool:
+    """처음 성공한 사람을 기록합니다. **이번 호출이 최초면 True.**
+
+    결과 역할은 이 기록이 생기는 순간 /합성 화면에서 모두에게 공개됩니다.
+    '아직 아무도 없을 때만' 을 필터로 판정해, 두 사람이 동시에 성공해도
+    최초는 한 명뿐입니다.
+    """
+    key = str(guild_id)
+    field = f"recipes.{rk}"
+    stamp = {f"{field}.discovered_by": str(user_id), f"{field}.discovered_at": time.time()}
+    _forget("fusion", guild_id)
+    if fusion_col is not None:
+        try:
+            res = await _db(fusion_col.update_one,
+                            {"_id": key, field: {"$exists": True},
+                             f"{field}.discovered_by": {"$exists": False}},
+                            {"$set": stamp})
+            _forget("fusion", guild_id)
+            return bool(getattr(res, "matched_count", 0))
+        except Exception as e:
+            print(f"MongoDB mark_recipe_discovered error: {e}, using local file.", flush=True)
+    async with _fusion_lock:
+        rows = _read_json(FUSION_FILE)
+        rec = (rows.get(key, {}).get("recipes") or {}).get(rk)
+        if rec is None or rec.get("discovered_by"):
+            return False
+        rec["discovered_by"], rec["discovered_at"] = str(user_id), time.time()
+        _write_json(FUSION_FILE, rows)
+    _forget("fusion", guild_id)
+    return True

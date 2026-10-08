@@ -117,7 +117,7 @@ asyncio.run(m())"
 
 | | 포인트 이코노미 | 인증 / 링크 보호 |
 | :--- | :--- | :--- |
-| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` `pumpkin` `season` | `verify` `link_guard` `roblox_link` |
+| Cog | `checkin` `chat_reward` `shop` `gacha` `report` `blacklist` `logs` `backup` `quest` `pumpkin` `season` `fusion` | `verify` `link_guard` `roblox_link` |
 | 데이터 계층 | `utils/database.py` | `utils/verify_db.py` |
 | 보조 모듈 | `utils/health.py`(공용) `utils/event_db.py` | `utils/link_tokens.py` `utils/oauth_gate.py` `utils/roblox_oauth.py` |
 | Mongo 컬렉션 | `users` `shop_items` `gacha_settings` `activity_logs` `blacklist` `channel_boosts` `point_snapshots` `backup_settings` `checkin_settings` `quest_settings` `quest_progress` `quest_state` `quest_events` | `verify_settings` `linkguard_settings` `protected_links` `link_clicks` `link_watermarks` `guarded_keys` `link_usage` `log_references` `roblox_links` `biome_events` `oauth_events` |

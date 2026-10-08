@@ -51,18 +51,18 @@ async def scenario(label, gid):
     ev._cache.clear()
 
     print("--- 레시피 저장 ---")
-    note(await ev.add_fusion_recipe(gid, R["불"].id, R["물"].id, R["증기"].id), "공개 레시피 불+물→증기")
-    note(not await ev.add_fusion_recipe(gid, R["물"].id, R["불"].id, R["흙"].id),
+    note(await ev.add_fusion_recipe(gid, [R["불"].id, R["물"].id], R["증기"].id), "공개 레시피 불+물→증기")
+    note(not await ev.add_fusion_recipe(gid, [R["물"].id, R["불"].id], R["흙"].id),
          "**같은 재료 조합(순서만 다름)은 거절** — 덮어쓰지 않음")
-    note(await ev.add_fusion_recipe(gid, R["증기"].id, R["흙"].id, R["히든"].id),
+    note(await ev.add_fusion_recipe(gid, [R["증기"].id, R["흙"].id], R["히든"].id),
          "레시피 증기+흙→히든")
-    note(await ev.add_fusion_recipe(gid, R["바람"].id, R["흙"].id, R["너무높음"].id, consume=False),
+    note(await ev.add_fusion_recipe(gid, [R["바람"].id, R["흙"].id], R["너무높음"].id, consume=False),
          "봇보다 높은 결과 역할 레시피도 저장은 됨")
     s = await ev.get_fusion(gid, fresh=True)
     note(len(s["recipes"]) == 3, "레시피 3개", str(len(s["recipes"])))
 
     # 동시에 같은 조합 추가 → 하나만
-    rs = await asyncio.gather(*[ev.add_fusion_recipe(gid, 20 + 0, 21, 22) for _ in range(5)])
+    rs = await asyncio.gather(*[ev.add_fusion_recipe(gid, [20 + 0, 21], 22) for _ in range(5)])
     note(sum(rs) == 1, "**같은 조합을 5번 동시에 추가해도 하나만**", str(rs))
     note(await ev.remove_fusion_recipe(gid, ev.recipe_key(20, 21)), "레시피 하나 삭제")
     note(len((await ev.get_fusion(gid, fresh=True))["recipes"]) == 3, "다른 레시피는 그대로")
@@ -133,11 +133,46 @@ async def scenario(label, gid):
     m6 = Member(506, "두번째성공", False, roles=[R["불"], R["물"]], guild=g)
     res = await FU.perform_fusion(g, m6, 10, 11)
     note(res["status"] == "ok" and not res["first"], "이미 발견된 레시피는 최초가 아님")
-    await ev.add_fusion_recipe(gid, R["바람"].id, R["물"].id, R["흙"].id)
+    await ev.add_fusion_recipe(gid, [R["바람"].id, R["물"].id], R["흙"].id)
     racers = [Member(600 + i, f"경쟁{i}", False, roles=[R["바람"], R["물"]], guild=g) for i in range(6)]
     rs = await asyncio.gather(*[FU.perform_fusion(g, mm, R["바람"].id, R["물"].id) for mm in racers])
     note(all(r["status"] == "ok" for r in rs) and sum(1 for r in rs if r["first"]) == 1,
          "**6명이 동시에 처음 성공해도 최초 발견은 한 명**", str([r["first"] for r in rs]))
+
+    print("--- 재료 3~5개 레시피 (2026-10-08: 최대 5개) ---")
+    five = [R["불"].id, R["물"].id, R["흙"].id, R["바람"].id, R["증기"].id]
+    note(await ev.add_fusion_recipe(gid, five, R["히든"].id), "재료 5개 레시피 저장")
+    note(await ev.add_fusion_recipe(gid, five[:3], R["증기"].id), "재료 3개 레시피 저장")
+    try:
+        await ev.add_fusion_recipe(gid, five + [R["히든"].id], R["너무높음"].id)
+        note(False, "재료 6개는 거절")
+    except ValueError:
+        note(True, "재료 6개는 거절")
+    rec5 = (await ev.get_fusion(gid, fresh=True))["recipes"][ev.recipe_key(five)]
+    note(sorted(rec5["inputs"]) == sorted(five), "다섯 재료가 그대로 저장됨")
+    e = FU.build_user_embed(g, Member(700, "보기", False, roles=[], guild=g), await ev.get_fusion(gid, fresh=True))
+    blob = " ".join(f.value for f in e.fields)
+    note(" + ".join(f"<@&{i}>" for i in sorted(five)) in blob, "유저 화면에 다섯 재료가 다 보임")
+    m5r = Member(701, "다섯", False, roles=[g.get_role(i) for i in five], guild=g)
+    res = await FU.perform_fusion(g, m5r, five[:2] + [R["바람"].id])
+    note(res["status"] == "no_recipe" and len(m5r.roles) == 5,
+         "레시피와 다른 조합(3개)은 아무것도 안 잃음")
+    res = await FU.perform_fusion(g, m5r, list(reversed(five)))
+    ids = {r.id for r in m5r.roles}
+    note(res["status"] == "ok" and R["히든"].id in ids and not (set(five) & ids),
+         "**다섯 개를 순서 상관없이 고르면 합성 · 재료 다섯 개 모두 소모**", str(ids))
+    m3r = Member(702, "셋", False, roles=[g.get_role(i) for i in five[:3]], guild=g)
+    res = await FU.perform_fusion(g, m3r, five[:3])
+    note(res["status"] == "ok" and R["증기"].id in {r.id for r in m3r.roles}, "재료 3개 레시피 합성")
+    note((await FU.perform_fusion(g, m3r, [10] * 2))["status"] == "same", "같은 역할 중복은 거절")
+    note((await FU.perform_fusion(g, m3r, five + [14]))["status"] == "count", "6개 고르면 거절")
+    v = FU.FuseView(m5r.id, [discord.SelectOption(label=str(i), value=str(i)) for i in range(7)])
+    sel5 = next(c for c in v.children if isinstance(c, FU.FuseSelect))
+    note(sel5.min_values == 2 and sel5.max_values == 5, "고르기 칸: 최소 2 · 최대 5")
+    b5 = FU.RecipeBuilder(FU.Fusion(None))
+    ins_sel = next(c for c in b5.children if isinstance(c, FU.InputsSelect))
+    note(ins_sel.max_values == 5 and len(ins_sel.placeholder) <= 12, "빌더 재료 칸: 최대 5 · 안내 문구가 짧음",
+         ins_sel.placeholder)
 
     print("--- 이미 결과를 가진 사람 · 재료 유지 · 권한 ---")
     m2 = Member(502, "두번째", False, roles=[R["불"], R["물"], R["증기"]], guild=g)
@@ -163,9 +198,11 @@ async def scenario(label, gid):
          "**10번 동시에 눌러도 한 번만**", str([r["status"] for r in rs]))
 
     print("--- 공개 알림 · 끄기 ---")
+    before_n = len((await ev.get_fusion(gid, fresh=True))["recipes"])
     await ev.save_fusion_settings(gid, {"announce": True, "recipes": {"x": 1}})
     s = await ev.get_fusion(gid, fresh=True)
-    note(s["announce"] and len(s["recipes"]) == 4, "설정 저장은 레시피를 건드리지 않음", str(len(s["recipes"])))
+    note(s["announce"] and len(s["recipes"]) == before_n and "x" not in s["recipes"],
+         "설정 저장은 레시피를 건드리지 않음", f"{before_n} → {len(s['recipes'])}")
     m5 = Member(505, "알림", False, roles=[R["불"], R["물"]], guild=g)
     v = FU.FuseView(m5.id, [])
     v.picked = [10, 11]

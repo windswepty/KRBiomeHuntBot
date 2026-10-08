@@ -719,14 +719,21 @@ async def credit_earned(guild_id: int, user_id: int, base_points: int,
 # 아니라 키로 찾는 사전**(`recipes.<키>`)에 둡니다 — 추가 · 삭제를 각각 한
 # 칸만 건드리는 원자 연산으로 할 수 있어서, 관리자 둘이 동시에 고쳐도 서로의
 # 레시피를 지우지 않습니다(뽑기 items 를 통째로 덮어써 재고가 되살아난 교훈).
-# 키는 재료 두 역할 ID 를 **정렬해서** 만듭니다 — A+B 와 B+A 는 같은 레시피입니다.
+# 키는 재료 역할 ID(2~5개)를 **정렬해서** 만듭니다 — A+B 와 B+A 는 같은 레시피입니다.
+# 두 개짜리는 예전 키(`r작은_큰`)와 같은 모양이라 기존 레시피가 그대로 맞습니다.
 
 DEFAULT_FUSION = {"enabled": True, "announce": False, "recipes": {}}
 
 
-def recipe_key(a, b) -> str:
-    x, y = sorted((int(a), int(b)))
-    return f"r{x}_{y}"
+FUSION_MIN_INPUTS, FUSION_MAX_INPUTS = 2, 5
+
+
+def recipe_key(*role_ids) -> str:
+    """재료 역할 ID 들 → 레시피 키. `recipe_key(a, b)` · `recipe_key([a, b, c])` 둘 다 됩니다."""
+    if len(role_ids) == 1 and isinstance(role_ids[0], (list, tuple, set)):
+        role_ids = tuple(role_ids[0])
+    ids = sorted({int(r) for r in role_ids})
+    return "r" + "_".join(str(i) for i in ids)
 
 
 async def get_fusion(guild_id: int, fresh: bool = False) -> dict:
@@ -773,7 +780,7 @@ async def save_fusion_settings(guild_id: int, changes: dict) -> None:
     _forget("fusion", guild_id)
 
 
-async def add_fusion_recipe(guild_id: int, a: int, b: int, result: int,
+async def add_fusion_recipe(guild_id: int, inputs: list[int], result: int,
                             consume: bool = True) -> bool:
     """레시피 추가. 같은 재료 조합이 이미 있으면 False (덮어쓰지 않습니다).
 
@@ -781,8 +788,11 @@ async def add_fusion_recipe(guild_id: int, a: int, b: int, result: int,
     그 키가 이미 있으면 필터가 안 맞아 upsert 가 같은 _id 로 삽입을 시도하고,
     그게 DuplicateKey 로 거절됩니다 — 동시에 같은 조합을 넣어도 하나만 남습니다.
     """
-    rk = recipe_key(a, b)
-    entry = {"inputs": sorted([int(a), int(b)]), "result": int(result),
+    ids = sorted({int(r) for r in inputs})
+    if not FUSION_MIN_INPUTS <= len(ids) <= FUSION_MAX_INPUTS:
+        raise ValueError(f"재료는 {FUSION_MIN_INPUTS}~{FUSION_MAX_INPUTS}개입니다")
+    rk = recipe_key(ids)
+    entry = {"inputs": ids, "result": int(result),
              "consume": bool(consume), "created": time.time()}
     key = str(guild_id)
     _forget("fusion", guild_id)

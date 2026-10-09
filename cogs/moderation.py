@@ -62,7 +62,12 @@ DM_STATUS = {
                "(Dyno 등 어떤 봇도 못 보냅니다)"),
     "failed": "⚠️ DM 전송 실패",
     "off": "— DM 꺼짐",
-    "absent": "— 서버에 없는 유저라 DM 을 보낼 수 없습니다",
+    # 서버를 이미 나간 유저 — 그래도 **보내 봅니다**(봇과 다른 서버를 함께 쓰면 갑니다).
+    # 디스코드가 거부하면 이 문구입니다. 봇과 같은 서버가 하나도 없으면 디스코드가
+    # DM 을 막습니다 — 어떤 봇도 못 보냅니다. 막으려면 **나가기 전에** 밴하세요.
+    "absent": ("— 이미 서버를 나간 유저라 DM 이 거부됐습니다\n"
+               "-# 봇과 같은 서버에 있지 않으면 디스코드가 막습니다(어떤 봇도 못 보냄). "
+               "DM 을 보내려면 나가기 전에 밴하세요"),
 }
 
 # 서포트 링크는 DM 의 **링크 버튼**이 됩니다. 형식이 틀리면 DM 전송
@@ -267,11 +272,17 @@ async def execute_ban(guild, moderator, user, reason: str, settings: dict,
     """DM → 밴 → 기록 → 로그. 밴이 실패하면 보낸 DM 을 지웁니다."""
     member = guild.get_member(user.id)
     dm_msg, dm_status = None, "off"
-    if member is None:
-        dm_status = "absent" if settings.get("ban_dm") else "off"
-    elif settings.get("ban_dm"):
+    if settings.get("ban_dm"):
         embed, view = build_ban_dm(guild, reason, settings)
-        dm_msg, dm_status = await safe_dm(member, embed, view)
+        # 서버를 나간 사람에게도 **먼저 보내 봅니다**(2026-10-09 요청). 밴한 뒤에는
+        # 같은 서버가 사라져 영영 못 보내므로 반드시 밴보다 앞입니다.
+        target = member if member is not None else user
+        if hasattr(target, "send"):
+            dm_msg, dm_status = await safe_dm(target, embed, view)
+            if member is None and dm_status == "closed":
+                dm_status = "absent"      # 나간 사람의 거부는 대개 '같은 서버 없음' 입니다
+        else:
+            dm_status = "absent"
 
     async def _undo_dm():
         if dm_msg is None:

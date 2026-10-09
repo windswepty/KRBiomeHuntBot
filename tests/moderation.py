@@ -232,12 +232,26 @@ async def test_ban():
     note(t2.dm_msgs and t2.dm_msgs[-1].deleted, "보낸 DM 을 회수함")
     note(not await mdb.get_user_cases(GUILD.id, t2.id), "실패한 밴은 기록하지 않음")
 
-    print("\n  서버에 없는 사람도 ID 로 밴 (DM 은 못 보냄)")
+    print("\n  서버에 없는 사람도 ID 로 밴")
     ghost = type("U", (), {"id": BASE + 8303999, "name": "나간사람", "__str__": lambda s: "나간사람"})()
     it = mod_inter()
     await M.Moderation.ban.callback(cog, it, ghost, "우회", 0)
-    note(ghost.id in GUILD.bans and "서버에 없는" in text_of(last_embed(it)),
+    note(ghost.id in GUILD.bans and "서버를 나간" in text_of(last_embed(it)),
          "나간 사람 밴 + DM 불가 안내")
+
+    # 2026-10-09: 나간 사람에게도 **밴 전에 DM 을 보내 봅니다** (봇과 다른 서버를 같이 쓰면 갑니다)
+    left_ok = F.Member(BASE + 8303998, "나갔지만DM됨", False)          # 길드 멤버 목록엔 없음
+    it = mod_inter()
+    await M.Moderation.ban.callback(cog, it, left_ok, "우회2", 0)
+    note(left_ok.id in GUILD.bans and left_ok.dms and "DM 전송됨" in text_of(last_embed(it)),
+         "**나간 사람이라도 DM 이 가면 보내고 밴**")
+    left_closed = F.Member(BASE + 8303997, "나갔고DM막힘", False)
+    left_closed.dm_closed = True
+    it = mod_inter()
+    await M.Moderation.ban.callback(cog, it, left_closed, "우회3", 0)
+    txt = text_of(last_embed(it))
+    note(left_closed.id in GUILD.bans and "서버를 나간" in txt and "나가기 전에" in txt,
+         "디스코드가 거부하면 '나간 유저라 거부' 로 안내 (DM 막음과 구분)")
 
     boss = member(8304, "높은사람2", [HIGH_ROLE])
     it = mod_inter()

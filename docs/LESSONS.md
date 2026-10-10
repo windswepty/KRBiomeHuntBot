@@ -673,3 +673,19 @@ note(G.read_state(st[:-1] + "Z") is None, "변조 거부")   # X
   자칭합니다. 'mobile' 판별을 통과해 302 를 받았고, 제보 화면이 바로 iPad
   였습니다. 서버에서는 맥과 구별이 안 되므로 페이지가 `maxTouchPoints` 로 가릅니다.
 - 안드로이드는 바꾸지 않았습니다(문제 제보 없음). 바꿀 거면 실기기로 먼저.
+
+## discord.py 의 `edit_global_command` 는 권한 값을 조용히 버립니다 (/합성 공개 안 됨)
+
+2026-10-10. `/합성설정` 에서 '유저에게 공개' 를 눌렀는데 유저에게 `/합성` 이 안
+보였습니다. 로그에는 10분마다 "표시 대상: 모두" 가 찍혔습니다 — **바꿨다는 로그만
+나오고 실제로는 아무것도 안 바뀐 것**입니다.
+
+- discord.py 2.7.1 의 `HTTPClient.edit_global_command` 는 payload 에서
+  `name` `description` `options` **외의 키를 버립니다.** `default_member_permissions`
+  가 빠져 빈 PATCH 가 나갔고, 디스코드는 200 을 돌려줬습니다(오류가 없음).
+- 테스트도 통과했습니다. 가짜 http 가 `edit_global_command(payload)` 를 **그대로
+  믿었기** 때문입니다. 지금은 그 함수에 discord.py **진짜 구현**을 붙이고, 요청이
+  나가는 `request()` 에서 본문을 봅니다(`tests/fusion.py`).
+- 교훈: **라이브러리 래퍼를 가짜로 바꿀 때는 그 래퍼가 무엇을 하는지까지 흉내 내야**
+  합니다. 우리 코드와 네트워크 사이에 있는 함수를 통째로 가짜로 바꾸면, 그 함수가
+  버리는 것을 영영 못 봅니다. 이 기능은 `Route` 로 API 를 직접 부릅니다.

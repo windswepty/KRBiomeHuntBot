@@ -566,8 +566,14 @@ class Fusion(commands.Cog):
                     continue
                 cur = cmd.default_member_permissions
                 if (None if cur is None else str(cur.value)) != want:
-                    await self.bot.http.edit_global_command(
-                        app_id, cmd.id, {"default_member_permissions": want})
+                    # ⚠️ `http.edit_global_command` 를 쓰면 안 됩니다 — discord.py 가 그 함수에서
+                    #    name · description · options 외의 키를 **조용히 버려** 빈 요청이 갑니다.
+                    #    그래서 '모두' 로 바꿨다는 로그만 10분마다 찍히고 명령어는 그대로
+                    #    관리자 전용이었습니다(2026-10-10 제보). API 를 직접 부릅니다.
+                    route = discord.http.Route(
+                        "PATCH", "/applications/{application_id}/commands/{command_id}",
+                        application_id=app_id, command_id=cmd.id)
+                    await self.bot.http.request(route, json={"default_member_permissions": want})
                     print(f"[Fusion] /합성 표시 대상: {'모두' if want is None else '관리자만'}",
                           flush=True)
             self._applied = want

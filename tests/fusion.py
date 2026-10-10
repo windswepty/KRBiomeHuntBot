@@ -261,9 +261,21 @@ async def scenario(label, gid):
             return [FakeCmd("합성", 1, as_perms(remote[1])), FakeCmd("뽑기", 2, as_perms(remote[2]))]
 
     class FakeHttp:
-        async def edit_global_command(self, app, cid, payload):
-            edits.append((cid, payload))
-            remote[cid] = payload["default_member_permissions"]
+        """디스코드에 **실제로 나가는 요청 본문**을 기록합니다.
+
+        예전 가짜는 `edit_global_command(payload)` 를 그대로 믿어 통과했는데, 진짜
+        discord.py 는 그 함수에서 `default_member_permissions` 를 버려 빈 요청을
+        보냈습니다(2026-10-10 실제 사고). 그래서 그 함수는 **진짜 구현**을 붙이고,
+        요청이 나가는 `request()` 에서만 가로챕니다.
+        """
+        edit_global_command = discord.http.HTTPClient.edit_global_command
+
+        async def request(self, route, json=None, **kw):
+            cid = int(route.url.rstrip("/").rsplit("/", 1)[1])
+            body = dict(json or {})
+            edits.append((cid, body))
+            if "default_member_permissions" in body:
+                remote[cid] = body["default_member_permissions"]
 
     class FakeBot:
         application_id = 99

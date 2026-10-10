@@ -31,7 +31,7 @@ from utils.database import is_user_blacklisted, add_activity_log
 from utils.event_db import (
     get_pumpkin, save_pumpkin, new_pumpkin_round, save_pumpkin_image,
     get_pumpkin_image, hit_pumpkin, pumpkin_hits_today, boost_active, KST,
-    MAX_IMAGE_BYTES,
+    MAX_IMAGE_BYTES, pumpkin_top, pumpkin_my_rank,
 )
 
 REFRESH_DEBOUNCE = 5
@@ -67,8 +67,22 @@ def image_name(p: dict) -> str:
 OFF_SEASON_NOTE = "시즌 기간이 아니면 기본 포인트에 대신 적용"
 
 
+RANK_SIZE = 10
+MEDALS = ("🥇", "🥈", "🥉")
+
+
+def rank_lines(top: list[dict]) -> str:
+    """누적 데미지 TOP. 임베드 안의 멘션은 알림이 가지 않아 이름 표시용으로만 씁니다."""
+    out = []
+    for i, r in enumerate(top):
+        mark = MEDALS[i] if i < len(MEDALS) else f"`{i + 1}.`"
+        out.append(f"{mark} <@{r['user_id']}> — **{int(r['damage']):,}** "
+                   f"({int(r.get('hits', 0)):,}번)")
+    return "\n".join(out)[:1024]
+
+
 def build_pumpkin_embed(p: dict, today_hits: int = 0, now: float | None = None,
-                        with_image: bool = False) -> discord.Embed:
+                        with_image: bool = False, top: list[dict] | None = None) -> discord.Embed:
     hp, hp_max = max(0, int(p["hp"])), int(p["hp_max"])
     broken = hp <= 0
     embed = discord.Embed(title=f"🎃 {p.get('title') or '호박 깨기 이벤트'}",
@@ -98,6 +112,10 @@ def build_pumpkin_embed(p: dict, today_hits: int = 0, now: float | None = None,
     if not p.get("enabled") and not broken:
         embed.add_field(name="⏸️ 지금은 쉬는 중", value="관리자가 다시 열면 칠 수 있습니다",
                         inline=False)
+    if top:
+        # 깨진 뒤에도 남겨 둡니다 — 이번 호박의 최종 순위입니다(새 호박이면 0 부터)
+        embed.add_field(name=f"🏆 데미지 랭킹 TOP {RANK_SIZE}" + (" (최종)" if broken else ""),
+                        value=rank_lines(top), inline=False)
     embed.set_footer(text=f"서버에 들어온 지 {int(p['min_member_hours'])}시간이 지난 계정만 · "
                           "매일 자정(KST)에 다시 칠 수 있습니다")
     if with_image:
@@ -161,6 +179,13 @@ async def handle_hit(interaction: discord.Interaction, cog=None) -> None:
     if res.get("broke"):
         embed.title = "🎉 호박을 깼습니다!"
         embed.description = f"마지막 한 방 **{damage:,}**! 지금부터 모두의 포인트가 늘어납니다."
+    try:
+        total, rank = await pumpkin_my_rank(guild.id, int(p["round"]), member.id)
+        if total:
+            embed.add_field(name="🏆 내 누적 데미지", value=f"**{total:,}** · **{rank:,}위**",
+                            inline=False)
+    except Exception as e:
+        print(f"[Pumpkin] 내 순위 조회 실패: {type(e).__name__}: {e}", flush=True)
     embed.set_footer(text="내일 자정(KST) 이후 다시 칠 수 있습니다")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -380,7 +405,8 @@ class Pumpkin(commands.Cog):
     async def render(self, guild) -> tuple[discord.Embed, discord.ui.View, dict]:
         p = await get_pumpkin(guild.id, fresh=True)
         today = await pumpkin_hits_today(guild.id, int(p["round"]))
-        embed = build_pumpkin_embed(p, today, with_image=bool(p.get("has_image")))
+        top = await pumpkin_top(guild.id, int(p["round"]), RANK_SIZE)
+        embed = build_pumpkin_embed(p, today, with_image=bool(p.get("has_image")), top=top)
         view = PumpkinView(disabled=int(p["hp"]) <= 0 or not p["enabled"])
         return embed, view, p
 

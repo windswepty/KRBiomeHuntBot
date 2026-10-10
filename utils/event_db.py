@@ -3,6 +3,7 @@
 
   pumpkin_event    길드별 호박 (체력 · 회차 · 깨진 시각 · 포인트 배율 기한 · 이미지)
   pumpkin_hits     하루 한 번 기록 (_id = 길드:회차:KST날짜:유저) — **삽입이 곧 판정**
+  pumpkin_damage   회차별 누적 데미지 랭킹 (_id = 길드:회차:유저, $inc)
   season_settings  길드별 시즌 (이름 · 시작 · 끝 · 시즌 ID)
   season_points    시즌 포인트 (_id = 길드:시즌ID:유저)
   fusion_settings  역할 합성 레시피 (_id = 길드, recipes = {레시피키: {...}})
@@ -38,6 +39,7 @@ load_dotenv()
 DATA_DIR = "data"
 PUMPKIN_FILE = os.path.join(DATA_DIR, "pumpkin_event.json")
 PUMPKIN_HITS_FILE = os.path.join(DATA_DIR, "pumpkin_hits.json")
+PUMPKIN_DMG_FILE = os.path.join(DATA_DIR, "pumpkin_damage.json")
 SEASON_FILE = os.path.join(DATA_DIR, "season_settings.json")
 SEASON_PTS_FILE = os.path.join(DATA_DIR, "season_points.json")
 FUSION_FILE = os.path.join(DATA_DIR, "fusion_settings.json")
@@ -58,6 +60,7 @@ except ImportError:              # pragma: no cover — pymongo 없는 환경
 
 pumpkin_col = None
 pumpkin_hits_col = None
+pumpkin_dmg_col = None
 season_col = None
 season_pts_col = None
 fusion_col = None
@@ -70,6 +73,7 @@ if MONGO_URI:
         _edb = _client["krbiomehuntbot"]
         pumpkin_col = _edb["pumpkin_event"]
         pumpkin_hits_col = _edb["pumpkin_hits"]
+        pumpkin_dmg_col = _edb["pumpkin_damage"]
         season_col = _edb["season_settings"]
         season_pts_col = _edb["season_points"]
         fusion_col = _edb["fusion_settings"]
@@ -82,6 +86,8 @@ if MONGO_URI:
                                           expireAfterSeconds=30 * 24 * 3600)
             season_pts_col.create_index([("guild_id", 1), ("season_id", 1), ("points", -1)],
                                         name="season_rank")
+            pumpkin_dmg_col.create_index([("guild_id", 1), ("round", 1), ("damage", -1)],
+                                         name="pumpkin_damage_rank")
         except Exception as e:
             print(f"MongoDB (event) index setup warning: {e}", flush=True)
         print("Connected to MongoDB successfully for event storage!", flush=True)
@@ -89,6 +95,7 @@ if MONGO_URI:
         print(f"MongoDB (event) connection warning: {e}. Falling back to local JSON storage.",
               flush=True)
         pumpkin_col = pumpkin_hits_col = season_col = season_pts_col = fusion_col = None
+        pumpkin_dmg_col = None
 
 
 async def _db(fn, *args, **kwargs):
@@ -331,7 +338,12 @@ async def hit_pumpkin(guild_id: int, user_id: int, damage: int,
                 cur = await get_pumpkin(guild_id, fresh=True)
                 return {"status": "dead" if cur["enabled"] else "off",
                         "hp": max(0, int(cur["hp"])), "hp_max": cur["hp_max"]}
-            return await _after_hit(guild_id, user_id, after, damage, now, p)
+            # 마지막 한 방은 남은 체력만큼만 셉니다(체력 100 에 1,000 을 쳐도 100)
+            applied = damage + min(0, int(after.get("hp", 0)))
+            await _add_damage(guild_id, rnd, user_id, applied)
+            res = await _after_hit(guild_id, user_id, after, damage, now, p)
+            res["applied"] = applied
+            return res
         except Exception as e:
             print(f"MongoDB hit_pumpkin error: {e}, using local file.", flush=True)
 
@@ -356,8 +368,10 @@ async def hit_pumpkin(guild_id: int, user_id: int, damage: int,
         _write_json(PUMPKIN_HITS_FILE, hits)
         _write_json(PUMPKIN_FILE, rows)
     _forget("pumpkin", guild_id)
+    applied = damage + min(0, int(row["hp"]))
+    await _add_damage(guild_id, rnd, user_id, applied)
     return {"status": "ok", "hp": max(0, row["hp"]), "hp_max": p["hp_max"],
-            "broke": broke, "boost_until": row.get("boost_until")}
+            "broke": broke, "boost_until": row.get("boost_until"), "applied": applied}
 
 
 async def _after_hit(guild_id, user_id, after: dict, damage: int, now: datetime,
@@ -377,6 +391,91 @@ async def _after_hit(guild_id, user_id, after: dict, damage: int, now: datetime,
     _forget("pumpkin", guild_id)
     return {"status": "ok", "hp": max(0, hp), "hp_max": after.get("hp_max") or p["hp_max"],
             "broke": broke, "boost_until": boost_until}
+
+
+# ── 데미지 랭킹 (요청 2026-10-10) ─────────────────────────────────────
+#
+# 타격 기록(pumpkin_hits)은 30일 TTL 이라 호박이 한 달 넘게 버티면 앞쪽 기록이
+# 사라집니다. 그래서 랭킹은 **회차별 누적 문서 하나**에 `$inc` 로 쌓습니다(TTL 없음).
+# 동시에 쳐도 $inc 라 서로 지우지 않습니다. 실패해도 타격 자체는 막지 않습니다.
+
+def _dmg_id(guild_id, rnd, user_id) -> str:
+    return f"{guild_id}:{rnd}:{user_id}"
+
+
+async def _add_damage(guild_id: int, rnd: int, user_id: int, applied: int) -> None:
+    if applied <= 0:
+        return
+    key = _dmg_id(guild_id, rnd, user_id)
+    try:
+        if pumpkin_dmg_col is not None:
+            try:
+                await _db(pumpkin_dmg_col.update_one, {"_id": key},
+                          {"$inc": {"damage": int(applied), "hits": 1},
+                           "$set": {"last": datetime.now(timezone.utc)},
+                           "$setOnInsert": {"guild_id": str(guild_id), "round": int(rnd),
+                                            "user_id": str(user_id)}},
+                          upsert=True)
+                return
+            except Exception as e:
+                print(f"MongoDB pumpkin damage error: {e}, using local file.", flush=True)
+        async with _pumpkin_lock:
+            rows = _read_json(PUMPKIN_DMG_FILE)
+            row = rows.setdefault(key, {"guild_id": str(guild_id), "round": int(rnd),
+                                        "user_id": str(user_id), "damage": 0, "hits": 0})
+            row["damage"] = int(row.get("damage", 0)) + int(applied)
+            row["hits"] = int(row.get("hits", 0)) + 1
+            _write_json(PUMPKIN_DMG_FILE, rows)
+    except Exception as e:
+        print(f"[EventDB] 호박 데미지 기록 실패: {type(e).__name__}: {e}", flush=True)
+
+
+async def pumpkin_top(guild_id: int, rnd: int, limit: int = 10) -> list[dict]:
+    """이번 회차 누적 데미지 TOP N — [{user_id, damage, hits}] (많은 순, 같으면 먼저 친 순 아님)."""
+    if pumpkin_dmg_col is not None:
+        try:
+            def _fetch():
+                return list(pumpkin_dmg_col.find(
+                    {"guild_id": str(guild_id), "round": int(rnd)},
+                    {"user_id": 1, "damage": 1, "hits": 1}).sort("damage", -1).limit(limit))
+            return [{"user_id": d["user_id"], "damage": int(d.get("damage", 0)),
+                     "hits": int(d.get("hits", 0))} for d in await _db(_fetch)]
+        except Exception as e:
+            print(f"MongoDB pumpkin_top error: {e}, using local file.", flush=True)
+    async with _pumpkin_lock:
+        rows = _read_json(PUMPKIN_DMG_FILE)
+    mine = [r for r in rows.values()
+            if r.get("guild_id") == str(guild_id) and int(r.get("round", 0)) == int(rnd)]
+    mine.sort(key=lambda r: -int(r.get("damage", 0)))
+    return [{"user_id": r["user_id"], "damage": int(r.get("damage", 0)),
+             "hits": int(r.get("hits", 0))} for r in mine[:limit]]
+
+
+async def pumpkin_my_rank(guild_id: int, rnd: int, user_id: int) -> tuple[int, int]:
+    """(내 누적 데미지, 순위). 기록이 없으면 (0, 0). 순위 = 나보다 많이 친 사람 수 + 1."""
+    key = _dmg_id(guild_id, rnd, user_id)
+    if pumpkin_dmg_col is not None:
+        try:
+            doc = await _db(pumpkin_dmg_col.find_one, {"_id": key})
+            if not doc:
+                return 0, 0
+            dmg = int(doc.get("damage", 0))
+            above = await _db(pumpkin_dmg_col.count_documents,
+                              {"guild_id": str(guild_id), "round": int(rnd),
+                               "damage": {"$gt": dmg}})
+            return dmg, int(above) + 1
+        except Exception as e:
+            print(f"MongoDB pumpkin_my_rank error: {e}, using local file.", flush=True)
+    async with _pumpkin_lock:
+        rows = _read_json(PUMPKIN_DMG_FILE)
+    row = rows.get(key)
+    if not row:
+        return 0, 0
+    dmg = int(row.get("damage", 0))
+    above = sum(1 for r in rows.values()
+                if r.get("guild_id") == str(guild_id) and int(r.get("round", 0)) == int(rnd)
+                and int(r.get("damage", 0)) > dmg)
+    return dmg, above + 1
 
 
 async def pumpkin_hits_today(guild_id: int, rnd: int, when: datetime | None = None) -> int:

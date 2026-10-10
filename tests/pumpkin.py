@@ -30,6 +30,7 @@ GID = GUILD.id
 def use_mongo():
     ev.pumpkin_col = FM.FakeCollection("pumpkin_event")
     ev.pumpkin_hits_col = FM.FakeCollection("pumpkin_hits")
+    ev.pumpkin_dmg_col = FM.FakeCollection("pumpkin_damage")
     ev._AFTER = FM.AFTER
     ev._cache.clear()
 
@@ -229,12 +230,66 @@ async def main():
     note(p2["hp"] == p["hp"] and p2["round"] == p["round"],
          "**설정 저장으로 체력 · 회차를 못 바꿈** (깎인 체력이 되돌아가지 않게)")
 
+    print("\n=== 10-2. 누적 데미지 랭킹 (2026-10-10) ===")
+    await ev.new_pumpkin_round(GID)
+    await ev.save_pumpkin(GID, {"enabled": True})
+    rnd = int((await ev.get_pumpkin(GID, fresh=True))["round"])
+    days = [datetime.datetime.now(KST) + datetime.timedelta(days=d) for d in range(3)]
+    # A: 3일 × 2,000 = 6,000 · B: 3일 × 1,000 = 3,000 · C: 1일 × 2,000
+    for d in days:
+        await ev.hit_pumpkin(GID, 8001, 2000, when=d)
+        await ev.hit_pumpkin(GID, 8002, 1000, when=d)
+    await ev.hit_pumpkin(GID, 8003, 2000, when=days[0])
+    top = await ev.pumpkin_top(GID, rnd, 10)
+    note([(r["user_id"], r["damage"], r["hits"]) for r in top]
+         == [("8001", 6000, 3), ("8002", 3000, 3), ("8003", 2000, 1)],
+         "**누적 데미지 많은 순** (여러 날 합산 · 타격 횟수)", str(top))
+    note(await ev.pumpkin_my_rank(GID, rnd, 8002) == (3000, 2), "내 누적 · 순위 (2위)")
+    note(await ev.pumpkin_my_rank(GID, rnd, 9999) == (0, 0), "안 친 사람은 기록 없음")
+    await asyncio.gather(*[ev.hit_pumpkin(GID, 8100 + i, 1000) for i in range(30)])
+    top = await ev.pumpkin_top(GID, rnd, 100)
+    note(sum(r["damage"] for r in top) == 6000 + 3000 + 2000 + 30_000,
+         "**30명이 동시에 쳐도 누적이 정확함** ($inc)")
+    set_hp(500)
+    res = await ev.hit_pumpkin(GID, 8200, 2000)
+    note(res.get("broke") and res.get("applied") == 500
+         and (await ev.pumpkin_my_rank(GID, rnd, 8200))[0] == 500,
+         "**마지막 한 방은 남은 체력만큼만** 셈 (500 남았는데 2,000 → 500)")
+    p = await ev.get_pumpkin(GID, fresh=True)
+    e = P.build_pumpkin_embed(p, 0, top=await ev.pumpkin_top(GID, rnd, 10))
+    f = next((x for x in e.fields if "랭킹" in x.name), None)
+    note(f is not None and "(최종)" in f.name and f.value.startswith("🥇 <@8001> — **6,000**"),
+         "패널에 TOP 10 · 깨진 뒤엔 '최종'", f.value[:40] if f else "")
+    note(f is not None and len(f.value.splitlines()) == 10
+         and all(len(x.value) <= 1024 for x in e.fields), "TOP 10 까지만 · 칸 규격 안")
+    await ev.new_pumpkin_round(GID)
+    await ev.save_pumpkin(GID, {"enabled": True})
+    rnd2 = int((await ev.get_pumpkin(GID, fresh=True))["round"])
+    note(await ev.pumpkin_top(GID, rnd2, 10) == [], "새 호박이면 랭킹 0 부터")
+    note(len(await ev.pumpkin_top(GID, rnd, 10)) == 10, "지난 호박 순위는 그대로 남음")
+    text, it = await press(member(8300), rng_crit=False)
+    e = it.followup.sent[-1]["embed"]
+    mine = next((x for x in e.fields if "내 누적" in x.name), None)
+    dmg = int((await ev.get_pumpkin(GID, fresh=True))["damage"])      # 10번에서 500 으로 바꿔 둠
+    note(mine is not None and f"**{dmg:,}**" in mine.value and "1위" in mine.value,
+         "때리면 내 누적 · 순위를 보여 줌", mine.value if mine else "")
+    cog2 = P.Pumpkin.__new__(P.Pumpkin)
+    emb, view, _ = await P.Pumpkin.render(cog2, GUILD)
+    note(any("랭킹" in x.name and "<@8300>" in x.value for x in emb.fields),
+         "실제 패널 그리기에 랭킹이 들어감")
+
     print("\n=== 11. JSON 폴백도 같은 규칙 ===")
-    ev.pumpkin_col = ev.pumpkin_hits_col = None
+    ev.pumpkin_col = ev.pumpkin_hits_col = ev.pumpkin_dmg_col = None
     ev._cache.clear()
     await ev.save_pumpkin(GID + 1, {"enabled": True})
     rs = await asyncio.gather(*[ev.hit_pumpkin(GID + 1, 9, 1000) for _ in range(5)])
     note([r["status"] for r in rs].count("ok") == 1, "JSON 에서도 하루 한 번")
+    rnd_j = int((await ev.get_pumpkin(GID + 1, fresh=True))["round"])
+    await ev.hit_pumpkin(GID + 1, 10, 2000)
+    top = await ev.pumpkin_top(GID + 1, rnd_j, 10)
+    note([(r["user_id"], r["damage"]) for r in top] == [("10", 2000), ("9", 1000)]
+         and await ev.pumpkin_my_rank(GID + 1, rnd_j, 9) == (1000, 2), "JSON 에서도 랭킹",
+         str(top))
 
 
 asyncio.run(main())

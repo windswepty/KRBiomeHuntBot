@@ -278,6 +278,42 @@ async def main():
     note(any("랭킹" in x.name and "<@8300>" in x.value for x in emb.fields),
          "실제 패널 그리기에 랭킹이 들어감")
 
+    print("\n=== 10-3. 지난 타격으로 채우기 · 이름 · 내 순위 버튼 ===")
+    await ev.new_pumpkin_round(GID)
+    await ev.save_pumpkin(GID, {"enabled": True})
+    rnd3 = int((await ev.get_pumpkin(GID, fresh=True))["round"])
+    # 랭킹이 생기기 '전' 처럼: 타격 기록만 있고 랭킹 문서는 없음
+    for uid, dmg in ((8401, 2000), (8402, 1000), (8403, 1000)):
+        await ev.hit_pumpkin(GID, uid, dmg)
+    ev.pumpkin_dmg_col.docs.clear()
+    await ev.hit_pumpkin(GID, 8401, 1000, when=datetime.datetime.now(KST) + datetime.timedelta(days=1))
+    note(len(await ev.pumpkin_top(GID, rnd3, 10)) == 1, "채우기 전: 랭킹 생긴 뒤 친 사람만 보임")
+    n = await ev.rebuild_pumpkin_damage(GID, rnd3)
+    top = await ev.pumpkin_top(GID, rnd3, 10)
+    note(n == 3 and [(r["user_id"], r["damage"], r["hits"]) for r in top]
+         == [("8401", 3000, 2), ("8402", 1000, 1), ("8403", 1000, 1)],
+         "**지난 타격 기록으로 채움** (이미 쌓인 것과 합쳐 3,000 · 2번)", str(top))
+    await ev.rebuild_pumpkin_damage(GID, rnd3)
+    note([r["damage"] for r in await ev.pumpkin_top(GID, rnd3, 10)] == [3000, 1000, 1000],
+         "두 번 돌려도 그대로 ($max)")
+    GUILD.members.append(member(8401, name="호박*장인"))
+    named = P.with_names(GUILD, await ev.pumpkin_top(GID, rnd3, 10))
+    lines = P.rank_lines(named)
+    note(lines.startswith("🥇 호박\\*장인 — **3,000**") and "<@8402>" in lines,
+         "**이름으로 보임** (마크다운 기호는 이스케이프) · 서버에 없는 사람은 멘션", lines[:40])
+    v = P.PumpkinView(disabled=True)
+    note(v.rank.custom_id == "pumpkin:rank" and not v.rank.disabled and v.hit.disabled,
+         "'내 순위' 버튼: 고정 ID · 깨진 뒤에도 누를 수 있음")
+    it = Inter(uid=8402, admin=False)
+    await P.show_rank(it)
+    e = it.followup.sent[-1]["embed"]
+    note(it.followup.sent[-1].get("ephemeral") and "**1,000** · **2위**" in e.description
+         and "TOP" in e.fields[0].name, "내 순위 버튼: 본인에게만 · 내 누적 · 순위 · TOP 10",
+         e.description)
+    it = Inter(uid=9999, admin=False)
+    await P.show_rank(it)
+    note("치지 않았습니다" in it.followup.sent[-1]["embed"].description, "안 친 사람은 안내")
+
     print("\n=== 11. JSON 폴백도 같은 규칙 ===")
     ev.pumpkin_col = ev.pumpkin_hits_col = ev.pumpkin_dmg_col = None
     ev._cache.clear()

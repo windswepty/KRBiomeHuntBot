@@ -430,6 +430,63 @@ async def _add_damage(guild_id: int, rnd: int, user_id: int, applied: int) -> No
         print(f"[EventDB] 호박 데미지 기록 실패: {type(e).__name__}: {e}", flush=True)
 
 
+async def rebuild_pumpkin_damage(guild_id: int, rnd: int) -> int:
+    """랭킹을 **타격 기록(pumpkin_hits)으로 다시 채웁니다.** 채운 사람 수를 돌려줍니다.
+
+    랭킹은 2026-10-10 에 생겨서, 그전에 친 사람들이 빠져 있었습니다(136명 중 3명만
+    보임). 타격 기록은 30일 보관이라 이번 호박의 기록이 아직 다 있습니다.
+    `$max` 로 넣습니다 — 다시 채우는 동안 들어온 타격($inc)을 덮어쓰지 않고, 몇 번을
+    돌려도 같은 값입니다. (마지막 한 방 보정은 깨진 회차에만 있고, 그 한 방은 이미
+    랭킹에 들어가 있어 $max 가 더 큰 쪽을 남깁니다.)
+    """
+    sums: dict[str, list[int]] = {}
+    if pumpkin_hits_col is not None:
+        try:
+            def _fetch():
+                return list(pumpkin_hits_col.find({"guild_id": str(guild_id), "round": int(rnd)},
+                                                  {"user_id": 1, "damage": 1}))
+            rows = await _db(_fetch)
+        except Exception as e:
+            print(f"MongoDB rebuild_pumpkin_damage error: {e}, using local file.", flush=True)
+            rows = None
+    else:
+        rows = None
+    if rows is None:
+        async with _pumpkin_lock:
+            rows = [r for r in _read_json(PUMPKIN_HITS_FILE).values()
+                    if r.get("guild_id") == str(guild_id) and int(r.get("round", 0)) == int(rnd)]
+    for r in rows:
+        acc = sums.setdefault(str(r.get("user_id")), [0, 0])
+        acc[0] += int(r.get("damage", 0) or 0)
+        acc[1] += 1
+    if not sums:
+        return 0
+    if pumpkin_dmg_col is not None:
+        try:
+            def _write():
+                for uid, (dmg, hits) in sums.items():
+                    pumpkin_dmg_col.update_one(
+                        {"_id": _dmg_id(guild_id, rnd, uid)},
+                        {"$max": {"damage": dmg, "hits": hits},
+                         "$setOnInsert": {"guild_id": str(guild_id), "round": int(rnd),
+                                          "user_id": uid}},
+                        upsert=True)
+            await _db(_write)
+            return len(sums)
+        except Exception as e:
+            print(f"MongoDB rebuild_pumpkin_damage write error: {e}, using local file.", flush=True)
+    async with _pumpkin_lock:
+        data = _read_json(PUMPKIN_DMG_FILE)
+        for uid, (dmg, hits) in sums.items():
+            row = data.setdefault(_dmg_id(guild_id, rnd, uid),
+                                  {"guild_id": str(guild_id), "round": int(rnd), "user_id": uid,
+                                   "damage": 0, "hits": 0})
+            row["damage"] = max(int(row.get("damage", 0)), dmg)
+            row["hits"] = max(int(row.get("hits", 0)), hits)
+        _write_json(PUMPKIN_DMG_FILE, data)
+    return len(sums)
+
+
 async def pumpkin_top(guild_id: int, rnd: int, limit: int = 10) -> list[dict]:
     """이번 회차 누적 데미지 TOP N — [{user_id, damage, hits}] (많은 순, 같으면 먼저 친 순 아님)."""
     if pumpkin_dmg_col is not None:

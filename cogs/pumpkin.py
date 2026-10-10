@@ -31,7 +31,7 @@ from utils.database import is_user_blacklisted, add_activity_log
 from utils.event_db import (
     get_pumpkin, save_pumpkin, new_pumpkin_round, save_pumpkin_image,
     get_pumpkin_image, hit_pumpkin, pumpkin_hits_today, boost_active, KST,
-    MAX_IMAGE_BYTES, pumpkin_top, pumpkin_my_rank,
+    MAX_IMAGE_BYTES, pumpkin_top, pumpkin_my_rank, rebuild_pumpkin_damage,
 )
 
 REFRESH_DEBOUNCE = 5
@@ -71,13 +71,24 @@ RANK_SIZE = 10
 MEDALS = ("🥇", "🥈", "🥉")
 
 
+def with_names(guild, top: list[dict]) -> list[dict]:
+    """랭킹에 **이름**을 붙입니다. 임베드 안의 멘션(`<@id>`)은 보는 사람의 앱이 그
+    유저를 모르면 숫자로 보입니다(2026-10-10 화면) — 봇이 아는 별명을 적어 둡니다."""
+    out = []
+    for r in top:
+        m = guild.get_member(int(r["user_id"])) if guild is not None else None
+        name = m.display_name if m is not None else None
+        out.append({**r, "name": discord.utils.escape_markdown(name)[:32] if name else None})
+    return out
+
+
 def rank_lines(top: list[dict]) -> str:
-    """누적 데미지 TOP. 임베드 안의 멘션은 알림이 가지 않아 이름 표시용으로만 씁니다."""
+    """누적 데미지 TOP. 이름이 없으면(서버를 나간 사람) 멘션으로 둡니다."""
     out = []
     for i, r in enumerate(top):
         mark = MEDALS[i] if i < len(MEDALS) else f"`{i + 1}.`"
-        out.append(f"{mark} <@{r['user_id']}> — **{int(r['damage']):,}** "
-                   f"({int(r.get('hits', 0)):,}번)")
+        who = r.get("name") or f"<@{r['user_id']}>"
+        out.append(f"{mark} {who} — **{int(r['damage']):,}** ({int(r.get('hits', 0)):,}번)")
     return "\n".join(out)[:1024]
 
 
@@ -129,13 +140,36 @@ class PumpkinView(discord.ui.View):
 
     def __init__(self, disabled: bool = False):
         super().__init__(timeout=None)
-        self.hit.disabled = disabled
+        self.hit.disabled = disabled          # '내 순위' 는 깨진 뒤에도 볼 수 있어야 합니다
 
     @discord.ui.button(label="호박 때리기", emoji="🔨", style=discord.ButtonStyle.primary,
                        custom_id="pumpkin:hit")
     async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog = interaction.client.get_cog("Pumpkin") if interaction.client else None
         await handle_hit(interaction, cog)
+
+    # 이미 올려 둔 패널에도 다음 갱신 때 이 버튼이 붙습니다(패널 수정이 view 까지 바꿈)
+    @discord.ui.button(label="내 순위", emoji="🏆", style=discord.ButtonStyle.secondary,
+                       custom_id="pumpkin:rank")
+    async def rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_rank(interaction)
+
+
+async def show_rank(interaction: discord.Interaction) -> None:
+    """내 누적 데미지 · 순위 + TOP 10 (본인에게만)."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    p = await get_pumpkin(guild.id)
+    rnd = int(p["round"])
+    total, rank = await pumpkin_my_rank(guild.id, rnd, interaction.user.id)
+    top = with_names(guild, await pumpkin_top(guild.id, rnd, RANK_SIZE))
+    embed = discord.Embed(title="🏆 호박 데미지 랭킹", color=discord.Color.orange())
+    embed.description = (f"내 누적 데미지 **{total:,}** · **{rank:,}위**" if total
+                         else "아직 이번 호박을 치지 않았습니다.")
+    if top:
+        embed.add_field(name=f"TOP {RANK_SIZE}", value=rank_lines(top), inline=False)
+    embed.set_footer(text="이번 호박 기준 · 새 호박이 오면 0 부터 다시 셉니다")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def handle_hit(interaction: discord.Interaction, cog=None) -> None:
@@ -405,7 +439,7 @@ class Pumpkin(commands.Cog):
     async def render(self, guild) -> tuple[discord.Embed, discord.ui.View, dict]:
         p = await get_pumpkin(guild.id, fresh=True)
         today = await pumpkin_hits_today(guild.id, int(p["round"]))
-        top = await pumpkin_top(guild.id, int(p["round"]), RANK_SIZE)
+        top = with_names(guild, await pumpkin_top(guild.id, int(p["round"]), RANK_SIZE))
         embed = build_pumpkin_embed(p, today, with_image=bool(p.get("has_image")), top=top)
         view = PumpkinView(disabled=int(p["hp"]) <= 0 or not p["enabled"])
         return embed, view, p
@@ -478,6 +512,16 @@ class Pumpkin(commands.Cog):
         for guild in self.bot.guilds:
             try:
                 p = await get_pumpkin(guild.id)
+                if not getattr(self, "_rebuilt", None):
+                    self._rebuilt = set()
+                if guild.id not in self._rebuilt and int(p["hp"]) > 0:
+                    # 랭킹이 생기기 전에 친 사람들을 채웁니다($max 라 몇 번 돌려도 같음).
+                    # **깨진 호박은 건너뜁니다** — 타격 기록에는 마지막 한 방이 남은 체력이
+                    # 아니라 친 데미지 그대로 있어, 다시 채우면 그 사람 점수가 부풀어 오릅니다.
+                    n = await rebuild_pumpkin_damage(guild.id, int(p["round"]))
+                    self._rebuilt.add(guild.id)
+                    if n:
+                        print(f"[Pumpkin] 랭킹 채움: {guild.id} · {n}명", flush=True)
                 if p.get("message_id"):
                     await self.refresh_panel(guild)
             except Exception as e:

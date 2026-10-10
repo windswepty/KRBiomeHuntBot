@@ -2572,8 +2572,15 @@ def _trim_quest_progress_local(allp: dict) -> None:
 
 async def get_quest_progress(guild_id: int, user_id: int,
                             periods: list[str] | None = None) -> dict:
-    """오늘/이번 주(+지정한 기간) 진행도와 수령 내역을 한 번에 돌려줍니다."""
-    out = {"p": {}, "claimed": []}
+    """오늘/이번 주(+지정한 기간) 진행도와 수령 내역을 한 번에 돌려줍니다.
+
+    `p` 는 전부 합친 것이고, **`by_period` 는 기간(문서)별 그대로**입니다.
+    ⚠️ 이벤트끼리는 필드 이름이 같습니다(`ev_chat` 등). 합친 `p` 에서 읽으면
+    **다른 이벤트의 값이 덮어씁니다** — 출석 이벤트 문서에 잘못 들어간 ev_chat=9 가
+    채팅 이벤트의 826 을 덮어 "9회에서 안 오른다" 가 됐습니다(2026-10-10).
+    이벤트는 반드시 `by_period` 에서 읽으세요(`event_progress_value`).
+    """
+    out = {"p": {}, "claimed": [], "by_period": {}}
     keys = [_quest_key(guild_id, user_id, quest_day()),
             _quest_key(guild_id, user_id, quest_week())]
     for extra in (periods or []):
@@ -2585,6 +2592,7 @@ async def get_quest_progress(guild_id: int, user_id: int,
             for doc in await _db(_fetch):
                 out["p"].update(doc.get("p", {}) or {})
                 out["claimed"] += list(doc.get("claimed", []) or [])
+                out["by_period"][str(doc["_id"]).rsplit(":", 1)[-1]] = dict(doc.get("p", {}) or {})
             return out
         except Exception as e:
             print(f"MongoDB get_quest_progress error: {e}, using local file.", flush=True)
@@ -2598,6 +2606,8 @@ async def get_quest_progress(guild_id: int, user_id: int,
         row = allp.get(k) or {}
         out["p"].update(row.get("p", {}) or {})
         out["claimed"] += list(row.get("claimed", []) or [])
+        if k in allp:
+            out["by_period"][k.rsplit(":", 1)[-1]] = dict(row.get("p", {}) or {})
     return out
 
 
@@ -3046,7 +3056,21 @@ async def get_event(guild_id: int, event_id: str) -> dict | None:
 
 
 async def save_event(guild_id: int, event_id: str, data: dict) -> None:
-    """이벤트를 저장합니다. 같은 id 면 덮어씁니다."""
+    """이벤트를 저장합니다. 같은 id 면 덮어씁니다.
+
+    저장한 뒤 **이벤트 기간 중 이미 한 활동을 채웁니다**(backfill_event_progress) —
+    시작일을 오늘로 적고 오후에 만들어도 오늘 아침 채팅부터 셉니다.
+    """
+    await _save_event_doc(guild_id, event_id, data)
+    try:
+        ev = await get_event(guild_id, event_id)
+        if ev:
+            await backfill_event_progress(guild_id, ev)
+    except Exception as e:
+        print(f"[Quest] 이벤트 진행도 채우기 실패 {event_id}: {type(e).__name__}: {e}", flush=True)
+
+
+async def _save_event_doc(guild_id: int, event_id: str, data: dict) -> None:
     _active_events_cache.pop(str(guild_id))   # 변경 즉시 반영
     key = f"{guild_id}:{event_id}"
     payload = dict(data)
@@ -3121,14 +3145,134 @@ async def bump_event_progress(guild_id: int, user_id: int, kind: str,
                                   period=event_period_key(ev["id"]))
 
 
+# 이벤트 조건 → 같은 활동을 세는 **일일 진행도 필드**. 둘은 같은 자리에서 같이
+# 올라갑니다(채팅: chat_reward · 출석: checkin · 뽑기: perform_rolls).
+EVENT_DAILY_FIELD = {"chat": "chat", "checkin": "checkin", "gacha": "gacha"}
+
+
+def _event_kinds(ev: dict) -> list[str]:
+    if ev.get("mode") == "tier":
+        return [ev.get("kind") or "chat"]
+    return sorted({o.get("kind", "chat") for o in (ev.get("objectives") or [])})
+
+
+async def backfill_event_progress(guild_id: int, ev: dict, today=None) -> int:
+    """이벤트 기간 중 **이벤트를 만들기 전에** 한 활동을 일일 기록으로 채웁니다.
+
+    2026-10-10: 시작일을 '오늘' 로 적은 이벤트를 17시에 만들자 그 전 채팅이 빠졌습니다
+    (오늘 48번 친 사람이 이벤트엔 2). 이벤트 기간의 일일 진행도 합은 이벤트 값보다
+    **항상 크거나 같습니다**(같은 활동을 이벤트가 생긴 뒤부터만 셌으므로). 그래서
+    `$max` 로 올리면 정확한 값이 되고, 몇 번 돌려도 같으며, 그 사이 들어온 `$inc` 를
+    덮어쓰지 않습니다. 일일 기록은 21일 보관이라 그보다 오래된 날은 채울 수 없습니다.
+    """
+    if not event_is_active(ev, today):
+        return 0
+    start = parse_event_day(ev.get("starts")) if ev.get("starts") else None
+    now_day = (today or datetime.now(KST)).date()
+    if start is None:
+        return 0
+    days = []
+    d = max(start, now_day - timedelta(days=QUEST_PROGRESS_TTL_DAYS - 1))
+    while d <= now_day:
+        days.append(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+    period = event_period_key(ev["id"])
+    totals: dict[tuple[str, str], int] = {}
+    kinds = [k for k in _event_kinds(ev) if k in EVENT_DAILY_FIELD]
+    if not kinds or not days:
+        return 0
+    str_gid = str(guild_id)
+
+    rows = None
+    if quest_prog_col is not None:
+        try:
+            def _fetch():
+                return list(quest_prog_col.find(
+                    {"guild_id": str_gid, "period": {"$in": days}},
+                    {"user_id": 1, "p": 1}))
+            rows = [(d.get("user_id"), d.get("p") or {}) for d in await _db(_fetch)]
+        except Exception as e:
+            print(f"MongoDB backfill_event_progress error: {e}, using local file.", flush=True)
+    if rows is None:
+        async with _quest_lock:
+            try:
+                with open(QUEST_PROG_FILE, "r", encoding="utf-8") as f:
+                    allp = json.load(f)
+            except Exception:
+                allp = {}
+        rows = []
+        for k, v in allp.items():
+            g, uid, per = (k.split(":") + ["", "", ""])[:3]
+            if g == str_gid and per in days:
+                rows.append((uid, v.get("p") or {}))
+    for uid, p in rows:
+        if not uid:
+            continue
+        for kind in kinds:
+            n = int(p.get(EVENT_DAILY_FIELD[kind], 0) or 0)
+            if n:
+                totals[(str(uid), kind)] = totals.get((str(uid), kind), 0) + n
+    if not totals:
+        return 0
+
+    if quest_prog_col is not None:
+        try:
+            def _write():
+                now = datetime.now(timezone.utc)
+                for (uid, kind), n in totals.items():
+                    quest_prog_col.update_one(
+                        {"_id": _quest_key(guild_id, uid, period)},
+                        {"$max": {f"p.ev_{kind}": n},
+                         "$set": {"created": now},
+                         "$setOnInsert": {"guild_id": str_gid, "user_id": uid, "period": period}},
+                        upsert=True)
+            await _db(_write)
+            return len(totals)
+        except Exception as e:
+            print(f"MongoDB backfill_event_progress write error: {e}, using local file.", flush=True)
+    async with _quest_lock:
+        _ensure_data_dir()
+        try:
+            with open(QUEST_PROG_FILE, "r", encoding="utf-8") as f:
+                allp = json.load(f)
+        except Exception:
+            allp = {}
+        for (uid, kind), n in totals.items():
+            row = allp.setdefault(_quest_key(guild_id, uid, period), {"p": {}, "claimed": []})
+            cur = int(row.setdefault("p", {}).get(f"ev_{kind}", 0) or 0)
+            row["p"][f"ev_{kind}"] = max(cur, n)
+        with open(QUEST_PROG_FILE, "w", encoding="utf-8") as f:
+            json.dump(allp, f, ensure_ascii=False)
+    return len(totals)
+
+
+async def backfill_active_events(guild_id: int) -> int:
+    """지금 진행 중인 이벤트 전부를 채웁니다(기동 때 · 이벤트 저장 때)."""
+    n = 0
+    for ev in await active_events(guild_id):
+        try:
+            n += await backfill_event_progress(guild_id, ev)
+        except Exception as e:
+            print(f"[Quest] 이벤트 진행도 채우기 실패 {ev.get('id')}: {type(e).__name__}: {e}",
+                  flush=True)
+    return n
+
+
 def invalidate_events(guild_id: int) -> None:
     """이벤트를 만들거나 고치면 즉시 반영되도록 캐시를 비웁니다."""
     _active_events_cache.pop(str(guild_id))
 
 
 def event_progress_value(ev: dict, progress: dict, kind: str | None = None) -> int:
-    """이벤트 진행도. 단계별이면 그 조건, 모두달성이면 지정한 조건."""
-    p = progress.get("p", {}) or {}
+    """이벤트 진행도. 단계별이면 그 조건, 모두달성이면 지정한 조건.
+
+    **그 이벤트의 문서에서만** 읽습니다(합친 `p` 는 다른 이벤트 값이 덮어씀).
+    """
+    by = progress.get("by_period")
+    if by is not None and ev.get("id"):
+        p = by.get(event_period_key(ev["id"]), {}) or {}
+    else:
+        p = progress.get("p", {}) or {}
     field = kind or ev.get("kind") or "chat"
     return int(p.get(f"ev_{field}", 0) or 0)
 

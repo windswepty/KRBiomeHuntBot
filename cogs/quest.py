@@ -29,7 +29,7 @@ from utils.database import (
     quest_channels, goal_min_chat, quest_goal_period,
     active_events, event_status, event_period_key, KST,
     list_events, get_event, save_event, delete_event, event_is_active,
-    parse_event_day,
+    parse_event_day, backfill_active_events,
     EVENT_KINDS, MAX_TIERS, MAX_OBJECTIVES,
     QUEST_KINDS,
 )
@@ -1415,6 +1415,16 @@ class Quest(commands.Cog):
         성공하면 백오프를 즉시 초기화합니다.
         """
         await self.bot.wait_until_ready()
+        # 기동 뒤 한 번: 진행 중인 이벤트에 '만들기 전 활동' 을 채웁니다($max 라 반복해도 같음)
+        if not getattr(self, "_events_backfilled", False):
+            self._events_backfilled = True
+            for guild in self.bot.guilds:
+                try:
+                    n = await backfill_active_events(guild.id)
+                    if n:
+                        print(f"[Quest] 이벤트 진행도 채움: {guild.id} · {n}건", flush=True)
+                except Exception as e:
+                    print(f"[Quest] 이벤트 진행도 채우기 실패: {type(e).__name__}: {e}", flush=True)
         if health.goal_backoff.active():
             return   # 429 백오프 중 — 시도하지 않습니다
         for guild in self.bot.guilds:

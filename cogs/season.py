@@ -246,9 +246,10 @@ class Season(commands.Cog):
         gid = interaction.guild.id
         s = await get_season(gid)
         state = season_state(s)
-        # 제목은 고정 · 시즌 이름은 본문 첫 줄로(요청 2026-10-10)
+        # 제목은 고정이고, 시즌 이름 줄은 두지 않습니다(요청 2026-10-10 — 제목만 남기기).
+        # 시즌 이름은 /시즌설정 화면에서만 보입니다.
         embed = discord.Embed(title=SEASON_POINTS_TITLE, color=discord.Color.gold())
-        name_line = f"📅 **{s.get('name') or '시즌'}**\n" if state != "none" else ""
+        name_line = ""
         if state == "none":
             embed.description = "지금은 진행 중인 시즌이 없습니다."
         elif state == "before":

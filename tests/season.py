@@ -484,8 +484,9 @@ async def main():
     note("500" in e.description and top.index("61") < top.index("62"), "내 시즌 포인트 · 순위")
     note(it.followup.sent[-1].get("ephemeral") is True, "본인에게만")
     s_name = (await ev.get_season(GID, fresh=True)).get("name")
-    note(e.title == "🏆 한바헌 시즌 포인트" and f"**{s_name}**" in e.description,
-         "제목은 '한바헌 시즌 포인트' · 시즌 이름은 본문에 (2026-10-10)", e.title)
+    note(e.title == "🏆 한바헌 시즌 포인트" and s_name not in e.description
+         and e.description.startswith("내 시즌 포인트"),
+         "제목은 '한바헌 시즌 포인트' · 아래 시즌 이름 줄 없음 (2026-10-10)", e.description[:30])
     GUILD.members.append(Member(61, "육일*님", False, guild=GUILD))
     it = Inter(uid=62, admin=False)
     await S.Season.season_points.callback(cog, it)

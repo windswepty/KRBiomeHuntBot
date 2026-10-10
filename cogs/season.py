@@ -27,6 +27,16 @@ from utils.event_db import (
 )
 
 EXCHANGE_RATE = 2           # 기본 2 → 시즌 1
+SEASON_POINTS_TITLE = "🏆 한바헌 시즌 포인트"
+
+
+def display_name(guild, user_id) -> str:
+    """순위 줄의 이름 — 임베드 안 멘션은 보는 사람의 앱이 그 유저를 모르면 `<@숫자>` 로
+    보입니다(2026-10-10 화면). 봇이 아는 별명을 적고, 서버를 나간 사람만 멘션으로 둡니다."""
+    m = guild.get_member(int(user_id)) if guild is not None else None
+    if m is None:
+        return f"<@{user_id}>"
+    return discord.utils.escape_markdown(m.display_name)[:32]
 MAX_EXCHANGE = 1_000_000
 
 
@@ -236,20 +246,21 @@ class Season(commands.Cog):
         gid = interaction.guild.id
         s = await get_season(gid)
         state = season_state(s)
-        embed = discord.Embed(title=f"🏆 {s.get('name') or '시즌'} 포인트",
-                              color=discord.Color.gold())
+        # 제목은 고정 · 시즌 이름은 본문 첫 줄로(요청 2026-10-10)
+        embed = discord.Embed(title=SEASON_POINTS_TITLE, color=discord.Color.gold())
+        name_line = f"📅 **{s.get('name') or '시즌'}**\n" if state != "none" else ""
         if state == "none":
             embed.description = "지금은 진행 중인 시즌이 없습니다."
         elif state == "before":
-            embed.description = (f"시즌이 <t:{int(float(s['start']))}:R> 시작합니다.\n"
+            embed.description = (name_line + f"시즌이 <t:{int(float(s['start']))}:R> 시작합니다.\n"
                                  f"기간: {season_period_text(s)}")
         elif state == "ended":
-            embed.description = ("🏁 시즌이 끝나 시즌 포인트가 **소멸**했습니다.\n"
+            embed.description = (name_line + "🏁 시즌이 끝나 시즌 포인트가 **소멸**했습니다.\n"
                                  f"기간: {season_period_text(s)}")
         else:
             mine = await get_season_points(gid, interaction.user.id)
             top = await season_top(gid, 10)
-            embed.description = (f"내 시즌 포인트 **{mine:,}**\n"
+            embed.description = (name_line + f"내 시즌 포인트 **{mine:,}**\n"
                                  f"⏳ <t:{int(float(s['end']))}:R> 끝나면 소멸합니다\n"
                                  + ("-# 시즌 중에는 기본 포인트 대신 **시즌 포인트로만** 쌓입니다 · "
                                     if s.get("season_only") else
@@ -257,7 +268,8 @@ class Season(commands.Cog):
                                  + f"`/시즌교환` 으로 기본 {EXCHANGE_RATE} → 시즌 1")
             if top:
                 medals = ["🥇", "🥈", "🥉"]
-                lines = [f"{medals[i] if i < 3 else f'`{i + 1}.`'} <@{r['user_id']}> — "
+                lines = [f"{medals[i] if i < 3 else f'`{i + 1}.`'} "
+                         f"{display_name(interaction.guild, r['user_id'])} — "
                          f"**{r['points']:,}**" for i, r in enumerate(top)]
                 embed.add_field(name="순위 TOP 10", value="\n".join(lines)[:1024], inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True,

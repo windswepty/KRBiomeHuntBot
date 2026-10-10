@@ -483,6 +483,15 @@ async def main():
     top = next(f.value for f in e.fields if "TOP" in f.name)
     note("500" in e.description and top.index("61") < top.index("62"), "내 시즌 포인트 · 순위")
     note(it.followup.sent[-1].get("ephemeral") is True, "본인에게만")
+    s_name = (await ev.get_season(GID, fresh=True)).get("name")
+    note(e.title == "🏆 한바헌 시즌 포인트" and f"**{s_name}**" in e.description,
+         "제목은 '한바헌 시즌 포인트' · 시즌 이름은 본문에 (2026-10-10)", e.title)
+    GUILD.members.append(Member(61, "육일*님", False, guild=GUILD))
+    it = Inter(uid=62, admin=False)
+    await S.Season.season_points.callback(cog, it)
+    top = next(f.value for f in it.followup.sent[-1]["embed"].fields if "TOP" in f.name)
+    note("육일\\*님" in top and "<@62>" in top,
+         "순위는 별명으로 (서버에 없는 사람만 멘션)", top[:60])
     it = Inter()
     await S.Season.season_settings.callback(cog, it)
     note("진행 중" in " ".join(f.value for f in it.followup.sent[-1]["embed"].fields), "설정 화면 상태")

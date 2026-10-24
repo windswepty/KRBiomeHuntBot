@@ -78,7 +78,7 @@ GitHub → windswepty/KRBiomeHuntBot
 
 | 이름 | 값 |
 | :--- | :--- |
-| `BOT_HEALTH_URL` | `http://161.33.140.214:8080/health` |
+| `BOT_HEALTH_URL` | `http://<서버 IP>:8080/health` |
 
 ---
 
@@ -112,7 +112,7 @@ https://uptimerobot.com  무료 가입 (카드 불필요)
   → Add New Monitor
   → Monitor Type : HTTP(s)
   → Friendly Name: 한바헌봇
-  → URL          : http://161.33.140.214:8080/health
+  → URL          : http://<서버 IP>:8080/health
   → Interval     : 5 minutes
   → 알림 이메일 지정 → Create Monitor
 ```
